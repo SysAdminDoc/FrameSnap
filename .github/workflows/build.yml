@@ -46,15 +46,33 @@ jobs:
       - name: Install Python dependencies
         run: pip install PyQt6 opencv-python numpy Pillow pyinstaller
 
+      - name: Build icon (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir icon.iconset
+          for size in 16 32 64 128 256 512; do
+            sips -z $size $size icon.png --out icon.iconset/icon_${size}x${size}.png
+          done
+          iconutil -c icns icon.iconset
+
       - name: Build (Windows)
         if: runner.os == 'Windows'
         run: >
           pyinstaller --onefile --noconsole --name FrameSnap
+          --icon icon.ico
           --add-data "icon.svg;."
           framesnap.py
 
-      - name: Build (macOS / Linux)
-        if: runner.os != 'Windows'
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: >
+          pyinstaller --onefile --noconsole --name FrameSnap
+          --icon icon.icns
+          --add-data "icon.svg:."
+          framesnap.py
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
         run: >
           pyinstaller --onefile --noconsole --name FrameSnap
           --add-data "icon.svg:."
