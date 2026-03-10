@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Background -->
+  <rect width="64" height="64" rx="14" fill="#1e1e2e"/>
+
+  <!-- Film strip body -->
+  <rect x="6" y="16" width="52" height="32" rx="5" fill="#313244"/>
+
+  <!-- Sprocket holes - left column -->
+  <rect x="8"  y="19" width="7" height="5" rx="1.5" fill="#11111b"/>
+  <rect x="8"  y="27" width="7" height="5" rx="1.5" fill="#11111b"/>
+  <rect x="8"  y="35" width="7" height="5" rx="1.5" fill="#11111b"/>
+
+  <!-- Sprocket holes - right column -->
+  <rect x="49" y="19" width="7" height="5" rx="1.5" fill="#11111b"/>
+  <rect x="49" y="27" width="7" height="5" rx="1.5" fill="#11111b"/>
+  <rect x="49" y="35" width="7" height="5" rx="1.5" fill="#11111b"/>
+
+  <!-- Frame window -->
+  <rect x="17" y="18" width="30" height="28" rx="3" fill="#45475a"/>
+
+  <!-- Camera lens outer ring -->
+  <circle cx="32" cy="32" r="10" fill="#1e1e2e" opacity="0.7"/>
+  <circle cx="32" cy="32" r="9"  fill="none" stroke="#cba6f7" stroke-width="1.5"/>
+
+  <!-- Camera lens inner -->
+  <circle cx="32" cy="32" r="6.5" fill="#181825"/>
+  <circle cx="32" cy="32" r="5"   fill="#cba6f7" opacity="0.15"/>
+
+  <!-- Iris blades suggestion -->
+  <circle cx="32" cy="32" r="3.5" fill="#cba6f7"/>
+  <circle cx="32" cy="32" r="2"   fill="#11111b"/>
+
+  <!-- Highlight glint -->
+  <circle cx="34.5" cy="29.5" r="1.5" fill="white" opacity="0.55"/>
+
+  <!-- Mark tick indicator at bottom of strip -->
+  <rect x="24" y="47" width="3" height="8" rx="1.5" fill="#cba6f7" opacity="0.9"/>
+  <rect x="32" y="47" width="3" height="8" rx="1.5" fill="#cba6f7" opacity="0.6"/>
+  <rect x="42" y="47" width="3" height="8" rx="1.5" fill="#cba6f7" opacity="0.4"/>
+</svg>
