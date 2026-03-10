@@ -81,6 +81,7 @@ RED      = "#f38ba8"
 PEACH    = "#fab387"
 YELLOW   = "#f9e2af"
 TEAL     = "#94e2d5"
+SAPPHIRE = "#74c7ec"
 
 MARK_COLORS: dict[str, str] = {
     "Default": MAUVE,
