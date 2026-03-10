@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-FrameSnap v2.0.0
-Browse videos, mark frames, and export screenshots.
+FrameSnap v2.1.0
+Browse any video, mark frames, and export screenshots — all formats, all features.
 """
 
 import sys
 import os
 import json
 import subprocess
+import math
 from pathlib import Path
 
 
@@ -16,7 +17,11 @@ from pathlib import Path
 def _bootstrap():
     import importlib
     to_install = []
-    for mod, pkg in [("cv2", "opencv-python"), ("numpy", "numpy")]:
+    for mod, pkg in [
+        ("cv2",   "opencv-python"),
+        ("numpy", "numpy"),
+        ("PIL",   "Pillow"),
+    ]:
         try:
             importlib.import_module(mod)
         except ImportError:
@@ -28,8 +33,10 @@ def _bootstrap():
     if to_install:
         print(f"Installing: {', '.join(to_install)}")
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install"] + to_install,
+            [sys.executable, "-m", "pip", "install",
+             "--break-system-packages"] + to_install,
             stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
 
 
@@ -37,11 +44,12 @@ _bootstrap()
 
 import cv2
 import numpy as np
+from PIL import Image as PilImage
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QListWidget, QListWidgetItem,
     QFileDialog, QLineEdit, QGroupBox, QSizePolicy, QFrame, QSplitter,
-    QMenu, QMenuBar, QComboBox, QSpinBox, QInputDialog, QMessageBox,
+    QMenu, QComboBox, QSpinBox, QInputDialog, QMessageBox,
     QStyle, QStyleOptionSlider, QTabWidget, QAbstractItemView,
 )
 from PyQt6.QtCore import (
@@ -49,7 +57,7 @@ from PyQt6.QtCore import (
     QPoint, QSize, QRect,
 )
 from PyQt6.QtGui import (
-    QPixmap, QImage, QIcon, QPainter, QColor, QFont, QPen, QAction,
+    QPixmap, QImage, QIcon, QPainter, QColor, QFont, QAction,
     QDragEnterEvent, QDropEvent,
 )
 
@@ -72,6 +80,29 @@ GREEN    = "#a6e3a1"
 RED      = "#f38ba8"
 PEACH    = "#fab387"
 YELLOW   = "#f9e2af"
+TEAL     = "#94e2d5"
+
+MARK_COLORS: dict[str, str] = {
+    "Default": MAUVE,
+    "Red":     RED,
+    "Green":   GREEN,
+    "Blue":    BLUE,
+    "Orange":  PEACH,
+    "Yellow":  YELLOW,
+    "Teal":    TEAL,
+}
+
+# All extensions cv2 / FFmpeg can typically handle
+SUPPORTED_EXTS = (
+    ".mp4", ".m4v", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm",
+    ".ts",  ".mts", ".m2ts", ".m2t", ".m2v", ".mpg", ".mpeg", ".mpe",
+    ".mxf", ".ogv", ".ogg", ".3gp", ".3g2", ".asf", ".vob", ".divx",
+    ".rm",  ".rmvb", ".f4v", ".dv",  ".y4m", ".yuv", ".hevc", ".h264",
+    ".h265",".bik",  ".smk", ".nut", ".roq", ".rv",  ".swf",  ".gif",
+    ".amv", ".mpv",  ".mj2", ".mjpeg",
+)
+_ext_glob = " ".join(f"*{e}" for e in SUPPORTED_EXTS)
+VIDEO_FILTER = f"Video Files ({_ext_glob});;All Files (*)"
 
 STYLESHEET = f"""
 QMainWindow, QDialog, QWidget {{
@@ -121,6 +152,13 @@ QPushButton#exportBtn {{
 }}
 QPushButton#exportBtn:hover {{ background-color: #b9f1b5; }}
 QPushButton#exportBtn:disabled {{ background-color: {SURFACE1}; color: {OVERLAY0}; }}
+QPushButton#sheetBtn {{
+    background-color: {TEAL}; color: {CRUST};
+    font-weight: bold; border: none;
+    padding: 8px 16px; border-radius: 8px;
+}}
+QPushButton#sheetBtn:hover {{ background-color: #a7f0e8; }}
+QPushButton#sheetBtn:disabled {{ background-color: {SURFACE1}; color: {OVERLAY0}; }}
 QPushButton#copyBtn {{
     background-color: {BLUE}; color: {CRUST};
     font-weight: bold; border: none;
@@ -128,6 +166,14 @@ QPushButton#copyBtn {{
 }}
 QPushButton#copyBtn:hover {{ background-color: {LAVENDER}; }}
 QPushButton#copyBtn:disabled {{ background-color: {SURFACE1}; color: {OVERLAY0}; }}
+QPushButton#loopBtn {{
+    background-color: {SURFACE0}; color: {TEXT};
+    border: 1px solid {SURFACE1}; border-radius: 6px; padding: 6px 12px;
+}}
+QPushButton#loopBtn[active="true"] {{
+    background-color: {SAPPHIRE}; color: {CRUST};
+    border: none; font-weight: bold;
+}}
 QPushButton#dangerBtn {{
     background-color: {SURFACE0}; color: {RED};
     border: 1px solid {SURFACE1}; border-radius: 6px; padding: 6px 12px;
@@ -163,11 +209,10 @@ QLineEdit:focus {{ border-color: {MAUVE}; }}
 QComboBox {{
     background-color: {SURFACE0}; color: {TEXT};
     border: 1px solid {SURFACE1}; border-radius: 6px;
-    padding: 5px 10px; min-width: 80px;
+    padding: 5px 10px; min-width: 72px;
 }}
 QComboBox:hover {{ border-color: {MAUVE}; }}
-QComboBox::drop-down {{ border: none; width: 24px; }}
-QComboBox::down-arrow {{ width: 10px; height: 10px; }}
+QComboBox::drop-down {{ border: none; width: 20px; }}
 QComboBox QAbstractItemView {{
     background-color: {MANTLE}; color: {TEXT};
     border: 1px solid {SURFACE1}; border-radius: 6px;
@@ -202,8 +247,11 @@ QSplitter::handle {{ background-color: {SURFACE0}; width: 2px; }}
 QFrame[frameShape="4"] {{ color: {SURFACE1}; }}
 """
 
-CONFIG_PATH = Path.home() / ".framesnap_config.json"
-MAX_RECENT = 8
+# ── define after STYLESHEET so it can use the color ──────────────────────────
+SAPPHIRE = "#74c7ec"
+
+CONFIG_PATH     = Path.home() / ".framesnap_config.json"
+MAX_RECENT      = 10
 DEFAULT_TEMPLATE = "{stem}_{frame}_{ts}"
 
 
@@ -223,10 +271,12 @@ def frame_to_ms(idx: int, fps: float) -> float:
 
 
 def bgr_to_pixmap(bgr: np.ndarray) -> QPixmap:
+    """Convert a BGR numpy frame to QPixmap safely (copies buffer)."""
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     h, w, ch = rgb.shape
+    # Use bytes() to own the data — avoids QImage holding a dangling pointer
     return QPixmap.fromImage(
-        QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+        QImage(bytes(rgb), w, h, ch * w, QImage.Format.Format_RGB888)
     )
 
 
@@ -249,7 +299,7 @@ def sizeof_fmt(num: float) -> str:
 def safe_filename(name: str) -> str:
     for ch in r'\/:*?"<>|':
         name = name.replace(ch, "_")
-    return name
+    return name.strip(". ") or "frame"
 
 
 def apply_template(template: str, stem: str, frame_idx: int,
@@ -258,15 +308,22 @@ def apply_template(template: str, stem: str, frame_idx: int,
     lbl = label.strip() or "mark"
     try:
         result = template.format(
-            stem=stem,
-            frame=f"{frame_idx:06d}",
-            ts=ts,
-            label=lbl,
-            n=f"{n:03d}",
+            stem=stem, frame=f"{frame_idx:06d}",
+            ts=ts, label=lbl, n=f"{n:03d}",
         )
     except (KeyError, ValueError):
         result = f"{stem}_{frame_idx:06d}_{ts}"
     return safe_filename(result)
+
+
+def open_cap(path: str) -> cv2.VideoCapture | None:
+    """Try FFmpeg backend first, fall back to OS default."""
+    for backend in (cv2.CAP_FFMPEG, cv2.CAP_ANY):
+        cap = cv2.VideoCapture(path, backend)
+        if cap.isOpened():
+            return cap
+        cap.release()
+    return None
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -280,19 +337,20 @@ def load_config() -> dict:
         "export_scale": "100%",
         "naming_template": DEFAULT_TEMPLATE,
         "show_overlay": True,
+        "speed": "1x",
     }
     if CONFIG_PATH.exists():
         try:
-            data = json.loads(CONFIG_PATH.read_text())
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             defaults.update(data)
         except Exception:
             pass
     return defaults
 
 
-def save_config(cfg: dict):
+def save_config(cfg: dict) -> None:
     try:
-        CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     except Exception:
         pass
 
@@ -300,15 +358,15 @@ def save_config(cfg: dict):
 # ── Frame Cache ───────────────────────────────────────────────────────────────
 
 class FrameCache:
-    def __init__(self, maxsize: int = 30):
+    def __init__(self, maxsize: int = 40):
         self._cache: dict[int, np.ndarray] = {}
         self._order: list[int] = []
         self._maxsize = maxsize
 
-    def get(self, idx: int):
+    def get(self, idx: int) -> np.ndarray | None:
         return self._cache.get(idx)
 
-    def put(self, idx: int, frame: np.ndarray):
+    def put(self, idx: int, frame: np.ndarray) -> None:
         if idx in self._cache:
             self._order.remove(idx)
         elif len(self._order) >= self._maxsize:
@@ -316,7 +374,7 @@ class FrameCache:
         self._cache[idx] = frame
         self._order.append(idx)
 
-    def clear(self):
+    def clear(self) -> None:
         self._cache.clear()
         self._order.clear()
 
@@ -324,38 +382,38 @@ class FrameCache:
 # ── Preview Thread ────────────────────────────────────────────────────────────
 
 class PreviewThread(QThread):
-    """Decodes single frames in background for hover scrubber preview."""
+    """Decodes single frames in background for hover-scrubber preview."""
     preview_ready = pyqtSignal(int, object)   # frame_idx, ndarray
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._cap = None
+        self._cap   = None
         self._mutex = QMutex()
         self._cond  = QWaitCondition()
         self._pending_frame: int = -1
         self._pending_path: str | None = None
         self._running = True
 
-    def open_video(self, path: str):
+    def open_video(self, path: str) -> None:
         self._mutex.lock()
         self._pending_path = path
         self._mutex.unlock()
         self._cond.wakeOne()
 
-    def request(self, frame_idx: int):
+    def request(self, frame_idx: int) -> None:
         self._mutex.lock()
-        self._pending_frame = frame_idx
+        self._pending_frame = frame_idx   # overwrites previous; only latest matters
         self._mutex.unlock()
         self._cond.wakeOne()
 
-    def stop(self):
+    def stop(self) -> None:
         self._mutex.lock()
         self._running = False
         self._mutex.unlock()
         self._cond.wakeOne()
         self.wait(3000)
 
-    def run(self):
+    def run(self) -> None:
         while True:
             self._mutex.lock()
             while (self._running
@@ -374,7 +432,7 @@ class PreviewThread(QThread):
             if path is not None:
                 if self._cap:
                     self._cap.release()
-                self._cap = cv2.VideoCapture(path)
+                self._cap = open_cap(path)
 
             if idx >= 0 and self._cap and self._cap.isOpened():
                 self._cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -389,16 +447,16 @@ class PreviewThread(QThread):
 # ── Mark Slider ───────────────────────────────────────────────────────────────
 
 class MarkSlider(QSlider):
-    """QSlider that draws mark ticks and emits hover frame index."""
+    """QSlider that paints mark ticks and emits hover frame index."""
     hovered_frame = pyqtSignal(int, QPoint)
     hover_left    = pyqtSignal()
 
     def __init__(self, orientation=Qt.Orientation.Horizontal, parent=None):
         super().__init__(orientation, parent)
-        self._marks: set[int] = set()
+        self._marks: dict[int, str] = {}   # frame_idx -> color hex
         self.setMouseTracking(True)
 
-    def set_marks(self, marks: set[int]):
+    def set_marks(self, marks: dict[int, str]) -> None:
         self._marks = marks
         self.update()
 
@@ -443,11 +501,11 @@ class MarkSlider(QSlider):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         cy = self.height() // 2
-        col = QColor(MAUVE)
-        col.setAlpha(210)
-        painter.setBrush(col)
         painter.setPen(Qt.PenStyle.NoPen)
-        for idx in self._marks:
+        for idx, color_hex in self._marks.items():
+            col = QColor(color_hex)
+            col.setAlpha(215)
+            painter.setBrush(col)
             x = self._frame_to_x(idx)
             painter.drawRoundedRect(x - 1, cy - 7, 3, 14, 1, 1)
 
@@ -455,7 +513,7 @@ class MarkSlider(QSlider):
 # ── Video Display ─────────────────────────────────────────────────────────────
 
 class VideoDisplay(QLabel):
-    wheel_delta  = pyqtSignal(int)   # +1 / -1
+    wheel_delta  = pyqtSignal(int)
     file_dropped = pyqtSignal(str)
 
     def __init__(self, parent=None):
@@ -492,12 +550,13 @@ class VideoDisplay(QLabel):
     def _refresh(self):
         if self._bgr is None:
             return
-        px = bgr_to_pixmap(self._bgr).scaled(
-            self.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+        self.setPixmap(
+            bgr_to_pixmap(self._bgr).scaled(
+                self.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
         )
-        self.setPixmap(px)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -509,15 +568,13 @@ class VideoDisplay(QLabel):
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        font = QFont("Consolas", 10)
-        painter.setFont(font)
+        painter.setFont(QFont("Consolas", 10))
         fm  = painter.fontMetrics()
         tw  = fm.horizontalAdvance(self._overlay_text)
         th  = fm.height()
-        pad = 6
-        mg  = 8
-        rx  = self.width()  - tw - mg - pad * 2
-        ry  = self.height() - th - mg - pad * 2
+        pad, mg = 6, 8
+        rx = self.width()  - tw - mg - pad * 2
+        ry = self.height() - th - mg - pad * 2
         bg = QColor(CRUST)
         bg.setAlpha(185)
         painter.setBrush(bg)
@@ -528,18 +585,13 @@ class VideoDisplay(QLabel):
 
     def wheelEvent(self, event):
         d = event.angleDelta().y()
-        if d > 0:
-            self.wheel_delta.emit(-1)
-        elif d < 0:
-            self.wheel_delta.emit(1)
+        if d > 0:   self.wheel_delta.emit(-1)
+        elif d < 0: self.wheel_delta.emit(1)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
+        # Accept any file — let cv2 decide if it's valid
         if event.mimeData().hasUrls():
-            url = event.mimeData().urls()
-            if url and url[0].toLocalFile().lower().endswith(
-                ('.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm')
-            ):
-                event.acceptProposedAction()
+            event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent):
         urls = event.mimeData().urls()
@@ -554,15 +606,26 @@ class FrameItemWidget(QWidget):
     jump_requested   = pyqtSignal(int)
 
     def __init__(self, frame_idx: int, fps: float,
-                 thumb: QPixmap | None, label: str = "", parent=None):
+                 thumb: QPixmap | None, label: str = "",
+                 color: str = MAUVE, parent=None):
         super().__init__(parent)
         self.frame_idx = frame_idx
         self.fps       = fps
         self.setFixedHeight(72)
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(6, 4, 6, 4)
-        layout.setSpacing(10)
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 6, 0)
+        root.setSpacing(0)
+
+        # Color bar
+        self._color_bar = QFrame()
+        self._color_bar.setFixedWidth(4)
+        root.addWidget(self._color_bar)
+
+        inner = QHBoxLayout()
+        inner.setContentsMargins(8, 4, 0, 4)
+        inner.setSpacing(10)
+        root.addLayout(inner)
 
         # Thumbnail
         thumb_lbl = QLabel()
@@ -573,40 +636,31 @@ class FrameItemWidget(QWidget):
         )
         if thumb:
             thumb_lbl.setPixmap(thumb)
-        layout.addWidget(thumb_lbl)
+        inner.addWidget(thumb_lbl)
 
         # Info
         info = QVBoxLayout()
         info.setSpacing(1)
         ms = frame_to_ms(frame_idx, fps)
-
-        self._ts_lbl = QLabel(ms_to_ts(ms))
-        self._ts_lbl.setStyleSheet(
-            f"color: {TEXT}; font-weight: bold; font-size: 13px;"
-        )
+        self._ts_lbl    = QLabel(ms_to_ts(ms))
+        self._ts_lbl.setStyleSheet(f"color: {TEXT}; font-weight: bold; font-size: 13px;")
         self._frame_lbl = QLabel(f"Frame {frame_idx:,}")
         self._frame_lbl.setStyleSheet(f"color: {SUBTEXT0}; font-size: 11px;")
-
         self._label_lbl = QLabel(label)
-        self._label_lbl.setStyleSheet(
-            f"color: {PEACH}; font-size: 11px; font-style: italic;"
-        )
+        self._label_lbl.setStyleSheet(f"color: {PEACH}; font-size: 11px; font-style: italic;")
         self._label_lbl.setVisible(bool(label))
-
         info.addWidget(self._ts_lbl)
         info.addWidget(self._frame_lbl)
         info.addWidget(self._label_lbl)
-        layout.addLayout(info)
-        layout.addStretch()
+        inner.addLayout(info)
+        inner.addStretch()
 
-        # Buttons
         jump_btn = QPushButton("Go")
         jump_btn.setFixedSize(36, 28)
         jump_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: {BLUE}; color: {CRUST};
-                border: none; border-radius: 5px;
-                font-size: 11px; font-weight: bold;
+                border: none; border-radius: 5px; font-size: 11px; font-weight: bold;
             }}
             QPushButton:hover {{ background-color: {LAVENDER}; }}
         """)
@@ -620,14 +674,19 @@ class FrameItemWidget(QWidget):
                 border: 1px solid {SURFACE1}; border-radius: 14px;
                 font-size: 12px; font-weight: bold;
             }}
-            QPushButton:hover {{
-                background-color: {RED}; color: {CRUST}; border-color: {RED};
-            }}
+            QPushButton:hover {{ background-color: {RED}; color: {CRUST}; border-color: {RED}; }}
         """)
         del_btn.clicked.connect(lambda: self.remove_requested.emit(self.frame_idx))
 
-        layout.addWidget(jump_btn)
-        layout.addWidget(del_btn)
+        inner.addWidget(jump_btn)
+        inner.addWidget(del_btn)
+
+        self.set_color(color)
+
+    def set_color(self, color_hex: str):
+        self._color_bar.setStyleSheet(
+            f"background: {color_hex}; border-radius: 2px;"
+        )
 
     def update_label(self, label: str):
         self._label_lbl.setText(label)
@@ -639,25 +698,27 @@ class FrameItemWidget(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("FrameSnap v2.0.0")
+        self.setWindowTitle("FrameSnap v2.1.0")
         self.setMinimumSize(1100, 680)
-        self.resize(1360, 840)
+        self.resize(1380, 860)
         self.setAcceptDrops(True)
 
         self._cfg = load_config()
 
         # Video state
         self.cap: cv2.VideoCapture | None = None
-        self._video_path: str = ""
-        self.total_frames = 0
+        self._video_path = ""
+        self.total_frames = 0       # 0 means unknown
         self.fps          = 30.0
         self.current_frame = 0
         self.is_playing   = False
+        self._loop_mode   = False
+        self._speed       = 1.0
         self._slider_held = False
         self._last_bgr: np.ndarray | None = None
-        self._cache = FrameCache(30)
+        self._cache = FrameCache(40)
 
-        # Marks: frame_idx -> {"item": QListWidgetItem, "widget": FrameItemWidget, "label": str}
+        # Marks: frame_idx -> {item, widget, label, color}
         self.marked: dict[int, dict] = {}
 
         self._preview_thread = PreviewThread(self)
@@ -676,50 +737,41 @@ class MainWindow(QMainWindow):
     def _build_menu(self):
         mb = self.menuBar()
 
-        # File
         file_menu = mb.addMenu("File")
-        self._act_open    = QAction("Open Video...", self)
-        self._act_open.triggered.connect(self.open_video)
-        self._act_session_save = QAction("Save Session...", self)
-        self._act_session_save.triggered.connect(self.save_session)
-        self._act_session_load = QAction("Load Session...", self)
-        self._act_session_load.triggered.connect(self.load_session)
         self._recent_menu = QMenu("Recent Files", self)
-
-        file_menu.addAction(self._act_open)
+        file_menu.addAction(self._make_act("Open Video...", self.open_video))
         file_menu.addSeparator()
         file_menu.addMenu(self._recent_menu)
         file_menu.addSeparator()
-        file_menu.addAction(self._act_session_save)
-        file_menu.addAction(self._act_session_load)
+        file_menu.addAction(self._make_act("Save Session...", self.save_session))
+        file_menu.addAction(self._make_act("Load Session...", self.load_session))
         file_menu.addSeparator()
-        quit_act = QAction("Exit", self)
-        quit_act.triggered.connect(self.close)
-        file_menu.addAction(quit_act)
+        file_menu.addAction(self._make_act("Exit", self.close))
 
-        # Edit
         edit_menu = mb.addMenu("Edit")
-        act_mark = QAction("Mark Current Frame", self)
-        act_mark.triggered.connect(self.mark_frame)
-        act_clear = QAction("Clear All Marks", self)
-        act_clear.triggered.connect(self.clear_marks)
-        act_copy  = QAction("Copy Current Frame to Clipboard", self)
-        act_copy.triggered.connect(self.copy_frame_clipboard)
-
-        edit_menu.addAction(act_mark)
-        edit_menu.addAction(act_clear)
+        edit_menu.addAction(self._make_act("Mark Current Frame", self.mark_frame))
+        edit_menu.addAction(self._make_act("Clear All Marks",    self.clear_marks))
         edit_menu.addSeparator()
-        edit_menu.addAction(act_copy)
+        edit_menu.addAction(self._make_act("Copy Current Frame to Clipboard",
+                                            self.copy_frame_clipboard))
 
-        # View
         view_menu = mb.addMenu("View")
-        self._act_overlay = QAction("Frame Overlay", self)
-        self._act_overlay.setCheckable(True)
-        self._act_overlay.setChecked(self._cfg.get("show_overlay", True))
-        self._act_overlay.triggered.connect(self._toggle_overlay)
+        self._act_overlay = self._make_act("Frame Overlay", self._toggle_overlay,
+                                            checkable=True,
+                                            checked=self._cfg.get("show_overlay", True))
         view_menu.addAction(self._act_overlay)
 
         self._refresh_recent_menu()
+
+    def _make_act(self, label: str, slot, checkable=False, checked=False) -> QAction:
+        act = QAction(label, self)
+        if checkable:
+            act.setCheckable(True)
+            act.setChecked(checked)
+            act.triggered.connect(slot)
+        else:
+            act.triggered.connect(slot)
+        return act
 
     def _refresh_recent_menu(self):
         self._recent_menu.clear()
@@ -731,7 +783,6 @@ class MainWindow(QMainWindow):
             return
         for path in recents:
             act = QAction(Path(path).name, self)
-            act.setData(path)
             act.setToolTip(path)
             act.triggered.connect(lambda _, p=path: self._open_path(p))
             self._recent_menu.addAction(act)
@@ -757,45 +808,37 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
 
-        # ── Left: video panel ─────────────────────────────────────────────────
+        # ── Left ──────────────────────────────────────────────────────────────
         left_w = QWidget()
         left   = QVBoxLayout(left_w)
         left.setContentsMargins(0, 0, 0, 0)
         left.setSpacing(8)
 
-        # Top bar: open + info
         top_bar = QHBoxLayout()
         open_btn = QPushButton("Open Video...")
         open_btn.setFixedHeight(34)
         open_btn.clicked.connect(self.open_video)
-
         self._file_lbl = QLabel("No file loaded")
         self._file_lbl.setStyleSheet(f"color: {SUBTEXT0}; font-size: 12px;")
-
         top_bar.addWidget(open_btn)
         top_bar.addWidget(self._file_lbl, 1)
         left.addLayout(top_bar)
 
-        # Video info strip
         self._info_bar = QLabel("")
-        self._info_bar.setStyleSheet(
-            f"color: {OVERLAY0}; font-size: 11px; padding: 2px 0;"
-        )
+        self._info_bar.setStyleSheet(f"color: {OVERLAY0}; font-size: 11px; padding: 2px 0;")
         self._info_bar.hide()
         left.addWidget(self._info_bar)
 
-        # Video display
         self.display = VideoDisplay()
         self.display.wheel_delta.connect(self.step)
         self.display.file_dropped.connect(self._open_path)
         left.addWidget(self.display, 1)
 
-        # Divider
         div = QFrame()
         div.setFrameShape(QFrame.Shape.HLine)
         left.addWidget(div)
 
-        # Scrubber row
+        # Scrubber
         scrub = QHBoxLayout()
         self._pos_lbl = QLabel("00:00:00.000")
         self._pos_lbl.setStyleSheet(
@@ -809,21 +852,18 @@ class MainWindow(QMainWindow):
         self.slider.valueChanged.connect(self._slider_changed)
         self.slider.hovered_frame.connect(self._slider_hovered)
         self.slider.hover_left.connect(self._slider_hover_left)
-
         self._dur_lbl = QLabel("00:00:00.000")
         self._dur_lbl.setStyleSheet(
             f"color: {SUBTEXT0}; font-family: Consolas, monospace; "
             f"font-size: 13px; min-width: 105px;"
         )
-        self._dur_lbl.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        )
+        self._dur_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         scrub.addWidget(self._pos_lbl)
         scrub.addWidget(self.slider, 1)
         scrub.addWidget(self._dur_lbl)
         left.addLayout(scrub)
 
-        # Controls row
+        # Controls
         ctrl = QHBoxLayout()
         ctrl.setSpacing(6)
 
@@ -832,31 +872,42 @@ class MainWindow(QMainWindow):
         self._btn_play = QPushButton("Play")
         self._btn_n1   = QPushButton("+1")
         self._btn_n10  = QPushButton("+10")
-
-        for b in (self._btn_p10, self._btn_p1, self._btn_play,
-                  self._btn_n1, self._btn_n10):
+        for b in (self._btn_p10, self._btn_p1, self._btn_play, self._btn_n1, self._btn_n10):
             b.setEnabled(False)
-            b.setFixedHeight(34)
+            b.setFixedHeight(32)
             ctrl.addWidget(b)
-
         self._btn_p10.clicked.connect(lambda: self.step(-10))
         self._btn_p1.clicked.connect(lambda: self.step(-1))
         self._btn_play.clicked.connect(self.toggle_play)
         self._btn_n1.clicked.connect(lambda: self.step(1))
         self._btn_n10.clicked.connect(lambda: self.step(10))
 
+        # Speed combo
+        self._speed_combo = QComboBox()
+        self._speed_combo.addItems(["0.25x", "0.5x", "1x", "2x", "4x"])
+        self._speed_combo.setCurrentText("1x")
+        self._speed_combo.setFixedHeight(32)
+        self._speed_combo.currentTextChanged.connect(self._speed_changed)
+        ctrl.addWidget(self._speed_combo)
+
+        # Loop button
+        self._loop_btn = QPushButton("Loop")
+        self._loop_btn.setObjectName("loopBtn")
+        self._loop_btn.setFixedHeight(32)
+        self._loop_btn.setCheckable(True)
+        self._loop_btn.toggled.connect(self._loop_toggled)
+        ctrl.addWidget(self._loop_btn)
+
         ctrl.addStretch()
 
         self._btn_prev_mark = QPushButton("< Prev")
         self._btn_prev_mark.setEnabled(False)
-        self._btn_prev_mark.setFixedHeight(34)
-        self._btn_prev_mark.setToolTip("Jump to previous mark")
+        self._btn_prev_mark.setFixedHeight(32)
         self._btn_prev_mark.clicked.connect(self.jump_prev_mark)
 
         self._btn_next_mark = QPushButton("Next >")
         self._btn_next_mark.setEnabled(False)
-        self._btn_next_mark.setFixedHeight(34)
-        self._btn_next_mark.setToolTip("Jump to next mark")
+        self._btn_next_mark.setFixedHeight(32)
         self._btn_next_mark.clicked.connect(self.jump_next_mark)
 
         self._copy_btn = QPushButton("Copy Frame")
@@ -878,10 +929,10 @@ class MainWindow(QMainWindow):
         ctrl.addWidget(self._mark_btn)
         left.addLayout(ctrl)
 
-        # ── Right: tab panel ──────────────────────────────────────────────────
+        # ── Right ─────────────────────────────────────────────────────────────
         right_w = QWidget()
         right_w.setMinimumWidth(320)
-        right_w.setMaximumWidth(420)
+        right_w.setMaximumWidth(430)
         right = QVBoxLayout(right_w)
         right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(0)
@@ -891,74 +942,62 @@ class MainWindow(QMainWindow):
 
         # Tab 1: Marks
         marks_tab = QWidget()
-        marks_layout = QVBoxLayout(marks_tab)
-        marks_layout.setContentsMargins(8, 8, 8, 8)
-        marks_layout.setSpacing(6)
+        ml = QVBoxLayout(marks_tab)
+        ml.setContentsMargins(8, 8, 8, 8)
+        ml.setSpacing(6)
 
         self._marks_list = QListWidget()
         self._marks_list.setSpacing(2)
-        self._marks_list.setSelectionMode(
-            QAbstractItemView.SelectionMode.ExtendedSelection
+        self._marks_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._marks_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._marks_list.customContextMenuRequested.connect(self._marks_context_menu)
+        self._marks_list.itemDoubleClicked.connect(
+            lambda item: self._jump_to(item.data(Qt.ItemDataRole.UserRole))
         )
-        self._marks_list.setContextMenuPolicy(
-            Qt.ContextMenuPolicy.CustomContextMenu
-        )
-        self._marks_list.customContextMenuRequested.connect(
-            self._marks_context_menu
-        )
-        marks_layout.addWidget(self._marks_list, 1)
+        ml.addWidget(self._marks_list, 1)
 
-        # Mark nav + bulk actions row
         nav_row = QHBoxLayout()
         self._count_lbl = QLabel("0 frames marked")
         self._count_lbl.setStyleSheet(f"color: {SUBTEXT0}; font-size: 11px;")
-
-        sel_all_btn = QPushButton("All")
-        sel_all_btn.setFixedHeight(28)
-        sel_all_btn.setToolTip("Select all marks")
-        sel_all_btn.clicked.connect(self._marks_list.selectAll)
-
+        sel_all = QPushButton("All")
+        sel_all.setFixedHeight(28)
+        sel_all.clicked.connect(self._marks_list.selectAll)
         self._del_sel_btn = QPushButton("Del Sel")
         self._del_sel_btn.setObjectName("dangerBtn")
         self._del_sel_btn.setFixedHeight(28)
         self._del_sel_btn.setEnabled(False)
         self._del_sel_btn.clicked.connect(self._delete_selected)
-
         self._clear_btn = QPushButton("Clear All")
         self._clear_btn.setObjectName("dangerBtn")
         self._clear_btn.setFixedHeight(28)
         self._clear_btn.setEnabled(False)
         self._clear_btn.clicked.connect(self.clear_marks)
-
         nav_row.addWidget(self._count_lbl)
         nav_row.addStretch()
-        nav_row.addWidget(sel_all_btn)
+        nav_row.addWidget(sel_all)
         nav_row.addWidget(self._del_sel_btn)
         nav_row.addWidget(self._clear_btn)
-        marks_layout.addLayout(nav_row)
-
+        ml.addLayout(nav_row)
         self._tabs.addTab(marks_tab, "Marks (0)")
 
         # Tab 2: Export
         export_tab = QWidget()
-        export_layout = QVBoxLayout(export_tab)
-        export_layout.setContentsMargins(10, 10, 10, 10)
-        export_layout.setSpacing(10)
+        el = QVBoxLayout(export_tab)
+        el.setContentsMargins(10, 10, 10, 10)
+        el.setSpacing(10)
 
-        # Format + quality
-        fmt_group = QGroupBox("Format")
-        fmt_inner = QVBoxLayout(fmt_group)
-        fmt_inner.setSpacing(6)
-
+        # Format
+        fmt_g = QGroupBox("Format")
+        fi = QVBoxLayout(fmt_g)
+        fi.setSpacing(6)
         fmt_row = QHBoxLayout()
         fmt_row.addWidget(QLabel("Format:"))
         self._fmt_combo = QComboBox()
-        self._fmt_combo.addItems(["PNG", "JPEG", "WebP"])
+        self._fmt_combo.addItems(["PNG", "JPEG", "WebP", "TIFF", "BMP", "GIF"])
         self._fmt_combo.currentTextChanged.connect(self._fmt_changed)
         fmt_row.addWidget(self._fmt_combo)
         fmt_row.addStretch()
-        fmt_inner.addLayout(fmt_row)
-
+        fi.addLayout(fmt_row)
         qual_row = QHBoxLayout()
         self._qual_lbl_l = QLabel("Quality:")
         self._qual_spin  = QSpinBox()
@@ -971,14 +1010,13 @@ class MainWindow(QMainWindow):
         qual_row.addWidget(self._qual_lbl_l)
         qual_row.addWidget(self._qual_spin)
         qual_row.addStretch()
-        fmt_inner.addLayout(qual_row)
-        export_layout.addWidget(fmt_group)
+        fi.addLayout(qual_row)
+        el.addWidget(fmt_g)
 
         # Scale
-        scale_group = QGroupBox("Scale")
-        scale_inner = QVBoxLayout(scale_group)
-        scale_inner.setSpacing(6)
-
+        scale_g = QGroupBox("Scale")
+        si = QVBoxLayout(scale_g)
+        si.setSpacing(6)
         scale_row = QHBoxLayout()
         scale_row.addWidget(QLabel("Scale:"))
         self._scale_combo = QComboBox()
@@ -986,41 +1024,37 @@ class MainWindow(QMainWindow):
         self._scale_combo.currentTextChanged.connect(self._scale_changed)
         scale_row.addWidget(self._scale_combo)
         scale_row.addStretch()
-        scale_inner.addLayout(scale_row)
-
-        custom_row = QHBoxLayout()
-        self._cust_lbl = QLabel("Width px:")
+        si.addLayout(scale_row)
+        cust_row = QHBoxLayout()
+        self._cust_lbl  = QLabel("Width px:")
         self._cust_spin = QSpinBox()
         self._cust_spin.setRange(1, 7680)
         self._cust_spin.setValue(1280)
         self._cust_spin.setSingleStep(10)
         self._cust_lbl.setVisible(False)
         self._cust_spin.setVisible(False)
-        custom_row.addWidget(self._cust_lbl)
-        custom_row.addWidget(self._cust_spin)
-        custom_row.addStretch()
-        scale_inner.addLayout(custom_row)
-        export_layout.addWidget(scale_group)
+        cust_row.addWidget(self._cust_lbl)
+        cust_row.addWidget(self._cust_spin)
+        cust_row.addStretch()
+        si.addLayout(cust_row)
+        el.addWidget(scale_g)
 
         # Naming
-        name_group = QGroupBox("Filename Template")
-        name_inner = QVBoxLayout(name_group)
-        name_inner.setSpacing(4)
+        name_g = QGroupBox("Filename Template")
+        ni = QVBoxLayout(name_g)
+        ni.setSpacing(4)
         self._name_edit = QLineEdit(DEFAULT_TEMPLATE)
         self._name_edit.setPlaceholderText("{stem}_{frame}_{ts}")
-        name_inner.addWidget(self._name_edit)
-        hint = QLabel(
-            "Variables: {stem} {frame} {ts} {label} {n}"
-        )
+        ni.addWidget(self._name_edit)
+        hint = QLabel("Variables: {stem}  {frame}  {ts}  {label}  {n}")
         hint.setStyleSheet(f"color: {OVERLAY0}; font-size: 10px;")
-        name_inner.addWidget(hint)
-        export_layout.addWidget(name_group)
+        ni.addWidget(hint)
+        el.addWidget(name_g)
 
-        # Output folder
-        out_group = QGroupBox("Output Folder")
-        out_inner = QVBoxLayout(out_group)
-        out_inner.setSpacing(6)
-
+        # Output
+        out_g = QGroupBox("Output Folder")
+        oi = QVBoxLayout(out_g)
+        oi.setSpacing(6)
         dir_row = QHBoxLayout()
         self._dir_edit = QLineEdit(self._cfg.get("last_output_dir", ""))
         browse_btn = QPushButton("Browse...")
@@ -1028,31 +1062,35 @@ class MainWindow(QMainWindow):
         browse_btn.clicked.connect(self.browse_dir)
         dir_row.addWidget(self._dir_edit, 1)
         dir_row.addWidget(browse_btn)
-        out_inner.addLayout(dir_row)
+        oi.addLayout(dir_row)
 
-        btn_row = QHBoxLayout()
+        export_row = QHBoxLayout()
         self._export_btn = QPushButton("Export All Frames")
         self._export_btn.setObjectName("exportBtn")
         self._export_btn.setEnabled(False)
         self._export_btn.setFixedHeight(38)
         self._export_btn.clicked.connect(self.export_frames)
-
         self._open_dir_btn = QPushButton("Open Folder")
         self._open_dir_btn.setFixedHeight(38)
         self._open_dir_btn.clicked.connect(self.open_export_dir)
+        export_row.addWidget(self._export_btn, 1)
+        export_row.addWidget(self._open_dir_btn)
+        oi.addLayout(export_row)
 
-        btn_row.addWidget(self._export_btn, 1)
-        btn_row.addWidget(self._open_dir_btn)
-        out_inner.addLayout(btn_row)
-        export_layout.addWidget(out_group)
+        self._sheet_btn = QPushButton("Contact Sheet...")
+        self._sheet_btn.setObjectName("sheetBtn")
+        self._sheet_btn.setEnabled(False)
+        self._sheet_btn.setFixedHeight(34)
+        self._sheet_btn.clicked.connect(self.export_contact_sheet)
+        oi.addWidget(self._sheet_btn)
+        el.addWidget(out_g)
 
         self._status_lbl = QLabel("")
         self._status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._status_lbl.setStyleSheet(f"color: {GREEN}; font-size: 12px;")
         self._status_lbl.setWordWrap(True)
-        export_layout.addWidget(self._status_lbl)
-        export_layout.addStretch()
-
+        el.addWidget(self._status_lbl)
+        el.addStretch()
         self._tabs.addTab(export_tab, "Export")
 
         splitter.addWidget(left_w)
@@ -1076,23 +1114,20 @@ class MainWindow(QMainWindow):
         self._hover_popup.setStyleSheet(
             f"background: {CRUST}; border: 1px solid {SURFACE1}; border-radius: 6px;"
         )
-        popup_layout = QVBoxLayout(self._hover_popup)
-        popup_layout.setContentsMargins(4, 4, 4, 4)
-        popup_layout.setSpacing(3)
-
+        pl = QVBoxLayout(self._hover_popup)
+        pl.setContentsMargins(4, 4, 4, 4)
+        pl.setSpacing(3)
         self._hover_thumb_lbl = QLabel()
         self._hover_thumb_lbl.setFixedSize(184, 104)
         self._hover_thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._hover_thumb_lbl.setStyleSheet(
-            f"background: {MANTLE}; border-radius: 4px;"
-        )
+        self._hover_thumb_lbl.setStyleSheet(f"background: {MANTLE}; border-radius: 4px;")
         self._hover_ts_lbl = QLabel("")
         self._hover_ts_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._hover_ts_lbl.setStyleSheet(
             f"color: {MAUVE}; font-family: Consolas, monospace; font-size: 11px;"
         )
-        popup_layout.addWidget(self._hover_thumb_lbl)
-        popup_layout.addWidget(self._hover_ts_lbl)
+        pl.addWidget(self._hover_thumb_lbl)
+        pl.addWidget(self._hover_ts_lbl)
         self._hover_popup.hide()
 
     def _apply_config(self):
@@ -1101,6 +1136,7 @@ class MainWindow(QMainWindow):
         self._qual_spin.setValue(cfg.get("export_quality", 90))
         self._scale_combo.setCurrentText(cfg.get("export_scale", "100%"))
         self._name_edit.setText(cfg.get("naming_template", DEFAULT_TEMPLATE))
+        self._speed_combo.setCurrentText(cfg.get("speed", "1x"))
         overlay_on = cfg.get("show_overlay", True)
         self._act_overlay.setChecked(overlay_on)
         self.display.set_show_overlay(overlay_on)
@@ -1109,8 +1145,7 @@ class MainWindow(QMainWindow):
 
     def open_video(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open Video", "",
-            "Video Files (*.mp4 *.avi *.mov *.mkv *.wmv *.flv *.webm);;All Files (*)"
+            self, "Open Video", "", VIDEO_FILTER
         )
         if path:
             self._open_path(path)
@@ -1119,41 +1154,63 @@ class MainWindow(QMainWindow):
         if not os.path.isfile(path):
             QMessageBox.warning(self, "Not Found", f"File not found:\n{path}")
             return
+
+        # BUG FIX: stop timer BEFORE releasing old cap
+        self._timer.stop()
+        self.is_playing = False
+        self._btn_play.setText("Play")
+
         if self.cap:
             self.cap.release()
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            QMessageBox.critical(self, "Error", f"Cannot open video:\n{path}")
+            self.cap = None
+
+        cap = open_cap(path)
+        if cap is None or not cap.isOpened():
+            QMessageBox.critical(self, "Error",
+                                 f"Cannot open video:\n{path}\n\n"
+                                 "File may be unsupported or missing codec.")
             return
 
-        self.cap         = cap
+        self.cap = cap
         self._video_path = path
-        self.total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+        # BUG FIX: handle formats where FRAME_COUNT is 0 or -1
+        raw_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.fps   = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        if raw_count > 0:
+            self.total_frames = raw_count
+        else:
+            # Estimate from duration property (seconds)
+            dur_s = cap.get(cv2.CAP_PROP_POS_AVI_RATIO)
+            self.total_frames = 0   # unknown; slider will be disabled
+
         self.current_frame = 0
-        self.is_playing   = False
-        self._btn_play.setText("Play")
-        self._timer.stop()
         self._cache.clear()
+
+        # BUG FIX: clear stale marks from previous video
+        self.clear_marks()
 
         self.slider.blockSignals(True)
         self.slider.setRange(0, max(0, self.total_frames - 1))
         self.slider.setValue(0)
+        self.slider.setEnabled(self.total_frames > 0)
         self.slider.blockSignals(False)
 
-        dur_ms = frame_to_ms(self.total_frames, self.fps)
-        self._dur_lbl.setText(ms_to_ts(dur_ms))
+        if self.total_frames > 0:
+            self._dur_lbl.setText(ms_to_ts(frame_to_ms(self.total_frames, self.fps)))
+        else:
+            self._dur_lbl.setText("--:--:--.---")
 
-        stem = Path(path).name
-        self._file_lbl.setText(stem)
+        self._file_lbl.setText(Path(path).name)
 
-        # Video info
         vw  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         vh  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         sz  = os.path.getsize(path)
+        tf  = f"{self.total_frames:,}" if self.total_frames else "unknown"
         self._info_bar.setText(
-            f"  {vw}x{vh}  |  {self.fps:.2f} fps  |  "
-            f"{ms_to_ts(dur_ms)}  |  {self.total_frames:,} frames  |  {sizeof_fmt(sz)}"
+            f"  {vw}x{vh}  |  {self.fps:.3f} fps  |  "
+            f"{ms_to_ts(frame_to_ms(self.total_frames or 0, self.fps))}  |  "
+            f"{tf} frames  |  {sizeof_fmt(sz)}"
         )
         self._info_bar.show()
 
@@ -1171,12 +1228,17 @@ class MainWindow(QMainWindow):
     def _show(self, idx: int):
         if not self.cap:
             return
-        idx = max(0, min(idx, self.total_frames - 1))
+        if self.total_frames > 0:
+            idx = max(0, min(idx, self.total_frames - 1))
+        else:
+            idx = max(0, idx)
 
         cached = self._cache.get(idx)
         if cached is not None:
             frame = cached
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx + 1)  # keep cap in sync
+            # Only sync cap position when playing so _advance reads correctly
+            if self.is_playing:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx + 1)
         else:
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ret, frame = self.cap.read()
@@ -1189,10 +1251,10 @@ class MainWindow(QMainWindow):
         self.display.show_frame(frame)
         ms = frame_to_ms(idx, self.fps)
         self._pos_lbl.setText(ms_to_ts(ms))
-        overlay = f"Frame {idx:,} / {self.total_frames:,}  |  {ms_to_ts(ms)}"
-        self.display.set_overlay(overlay)
+        tf  = f" / {self.total_frames:,}" if self.total_frames else ""
+        self.display.set_overlay(f"Frame {idx:,}{tf}  |  {ms_to_ts(ms)}")
 
-        if not self._slider_held:
+        if not self._slider_held and self.total_frames > 0:
             self.slider.blockSignals(True)
             self.slider.setValue(idx)
             self.slider.blockSignals(False)
@@ -1201,22 +1263,36 @@ class MainWindow(QMainWindow):
         if not self.cap:
             return
         nxt = self.current_frame + 1
-        if nxt >= self.total_frames:
-            self.toggle_play()
+
+        # BUG FIX: total_frames == 0 means unknown — don't stop based on it
+        if self.total_frames > 0 and nxt >= self.total_frames:
+            if self._loop_mode:
+                self._show(0)
+                # Restart timer so cap position is correct
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 1)
+            else:
+                self.toggle_play()
             return
+
         ret, frame = self.cap.read()
         if not ret:
-            return
+            # BUG FIX: resync cap on failure rather than silently drifting
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, nxt)
+            ret, frame = self.cap.read()
+            if not ret:
+                self.toggle_play()
+                return
+
         self._cache.put(nxt, frame)
         self.current_frame = nxt
         self._last_bgr     = frame
         self.display.show_frame(frame)
         ms = frame_to_ms(nxt, self.fps)
         self._pos_lbl.setText(ms_to_ts(ms))
-        self.display.set_overlay(
-            f"Frame {nxt:,} / {self.total_frames:,}  |  {ms_to_ts(ms)}"
-        )
-        if not self._slider_held:
+        tf = f" / {self.total_frames:,}" if self.total_frames else ""
+        self.display.set_overlay(f"Frame {nxt:,}{tf}  |  {ms_to_ts(ms)}")
+
+        if not self._slider_held and self.total_frames > 0:
             self.slider.blockSignals(True)
             self.slider.setValue(nxt)
             self.slider.blockSignals(False)
@@ -1227,7 +1303,8 @@ class MainWindow(QMainWindow):
         self.is_playing = not self.is_playing
         if self.is_playing:
             self._btn_play.setText("Pause")
-            self._timer.start(max(1, int(1000.0 / self.fps)))
+            interval = max(1, int(1000.0 / (self.fps * self._speed)))
+            self._timer.start(interval)
         else:
             self._btn_play.setText("Play")
             self._timer.stop()
@@ -1248,11 +1325,29 @@ class MainWindow(QMainWindow):
         self._slider_held = False
         self._show(self.slider.value())
         if self.is_playing:
-            self._timer.start(max(1, int(1000.0 / self.fps)))
+            interval = max(1, int(1000.0 / (self.fps * self._speed)))
+            self._timer.start(interval)
 
     def _slider_changed(self, val: int):
         if self._slider_held:
             self._show(val)
+
+    def _speed_changed(self, text: str):
+        try:
+            self._speed = float(text.rstrip("x"))
+        except ValueError:
+            self._speed = 1.0
+        if self.is_playing:
+            interval = max(1, int(1000.0 / (self.fps * self._speed)))
+            self._timer.setInterval(interval)
+        self._cfg["speed"] = text
+        save_config(self._cfg)
+
+    def _loop_toggled(self, checked: bool):
+        self._loop_mode = checked
+        self._loop_btn.setProperty("active", "true" if checked else "false")
+        self._loop_btn.style().unpolish(self._loop_btn)
+        self._loop_btn.style().polish(self._loop_btn)
 
     # ── Hover preview ─────────────────────────────────────────────────────────
 
@@ -1273,16 +1368,11 @@ class MainWindow(QMainWindow):
         )
         self._hover_thumb_lbl.setPixmap(px)
         self._hover_ts_lbl.setText(ms_to_ts(frame_to_ms(frame_idx, self.fps)))
-
         gp = self._pending_hover_pos
-        x  = gp.x() - 96
-        y  = gp.y() - 145
-
-        # Clamp to screen
+        x, y = gp.x() - 96, gp.y() - 148
         screen = QApplication.primaryScreen().availableGeometry()
         x = max(screen.left(), min(x, screen.right()  - 192))
         y = max(screen.top(),  min(y, screen.bottom() - 130))
-
         self._hover_popup.move(x, y)
         self._hover_popup.show()
 
@@ -1295,14 +1385,13 @@ class MainWindow(QMainWindow):
             self.toggle_play()
         idx = self.current_frame
         if idx in self.marked:
-            # Flash the existing item
-            item = self.marked[idx]["item"]
-            self._marks_list.setCurrentItem(item)
+            self._marks_list.setCurrentItem(self.marked[idx]["item"])
             self._set_status(f"Already marked: {ms_to_ts(frame_to_ms(idx, self.fps))}", YELLOW)
             return
 
-        thumb = make_thumb(self._last_bgr) if self._last_bgr is not None else None
-        widget = FrameItemWidget(idx, self.fps, thumb)
+        thumb  = make_thumb(self._last_bgr) if self._last_bgr is not None else None
+        color  = MAUVE
+        widget = FrameItemWidget(idx, self.fps, thumb, color=color)
         widget.remove_requested.connect(self._remove_mark)
         widget.jump_requested.connect(self._jump_to)
 
@@ -1310,7 +1399,6 @@ class MainWindow(QMainWindow):
         list_item.setSizeHint(QSize(0, 72))
         list_item.setData(Qt.ItemDataRole.UserRole, idx)
 
-        # Insert sorted
         pos = self._marks_list.count()
         for i in range(self._marks_list.count()):
             if self._marks_list.item(i).data(Qt.ItemDataRole.UserRole) > idx:
@@ -1318,11 +1406,10 @@ class MainWindow(QMainWindow):
                 break
         self._marks_list.insertItem(pos, list_item)
         self._marks_list.setItemWidget(list_item, widget)
+        self.marked[idx] = {"item": list_item, "widget": widget, "label": "", "color": color}
 
-        self.marked[idx] = {"item": list_item, "widget": widget, "label": ""}
-        self.slider.set_marks(set(self.marked.keys()))
+        self.slider.set_marks({k: v["color"] for k, v in self.marked.items()})
         self._update_marks_ui()
-
         self._set_status(f"Marked: {ms_to_ts(frame_to_ms(idx, self.fps))}", GREEN)
         self._tabs.setCurrentIndex(0)
 
@@ -1331,32 +1418,31 @@ class MainWindow(QMainWindow):
             return
         item = self.marked.pop(idx)["item"]
         self._marks_list.takeItem(self._marks_list.row(item))
-        self.slider.set_marks(set(self.marked.keys()))
+        self.slider.set_marks({k: v["color"] for k, v in self.marked.items()})
         self._update_marks_ui()
 
     def _delete_selected(self):
-        selected = self._marks_list.selectedItems()
-        for item in selected:
+        for item in list(self._marks_list.selectedItems()):
             idx = item.data(Qt.ItemDataRole.UserRole)
             if idx in self.marked:
                 self.marked.pop(idx)
                 self._marks_list.takeItem(self._marks_list.row(item))
-        self.slider.set_marks(set(self.marked.keys()))
+        self.slider.set_marks({k: v["color"] for k, v in self.marked.items()})
         self._update_marks_ui()
 
     def clear_marks(self):
         self._marks_list.clear()
         self.marked.clear()
-        self.slider.set_marks(set())
+        self.slider.set_marks({})
         self._update_marks_ui()
 
     def _update_marks_ui(self):
         n   = len(self.marked)
-        txt = f"{n} frame{'s' if n != 1 else ''} marked"
-        self._count_lbl.setText(txt)
+        self._count_lbl.setText(f"{n} frame{'s' if n != 1 else ''} marked")
         self._tabs.setTabText(0, f"Marks ({n})")
         has = n > 0
         self._export_btn.setEnabled(has)
+        self._sheet_btn.setEnabled(has)
         self._clear_btn.setEnabled(has)
         self._del_sel_btn.setEnabled(has)
         self._btn_prev_mark.setEnabled(has)
@@ -1366,16 +1452,24 @@ class MainWindow(QMainWindow):
         item = self._marks_list.itemAt(pos)
         if not item:
             return
-        idx = item.data(Qt.ItemDataRole.UserRole)
+        idx  = item.data(Qt.ItemDataRole.UserRole)
         menu = QMenu(self)
         act_jump  = menu.addAction("Jump to Frame")
         act_copy  = menu.addAction("Copy Frame to Clipboard")
         menu.addSeparator()
         act_label = menu.addAction("Edit Label...")
+        # Color submenu
+        color_menu = menu.addMenu("Set Color")
+        color_acts = {}
+        for name, hex_val in MARK_COLORS.items():
+            ca = color_menu.addAction(name)
+            color_acts[ca] = (name, hex_val)
         menu.addSeparator()
-        act_del   = menu.addAction("Remove")
+        act_del = menu.addAction("Remove")
 
         chosen = menu.exec(self._marks_list.mapToGlobal(pos))
+        if chosen is None:
+            return
         if chosen == act_jump:
             self._jump_to(idx)
         elif chosen == act_copy:
@@ -1384,6 +1478,16 @@ class MainWindow(QMainWindow):
             self._edit_label(idx)
         elif chosen == act_del:
             self._remove_mark(idx)
+        elif chosen in color_acts:
+            _, hex_val = color_acts[chosen]
+            self._set_mark_color(idx, hex_val)
+
+    def _set_mark_color(self, idx: int, color_hex: str):
+        if idx not in self.marked:
+            return
+        self.marked[idx]["color"] = color_hex
+        self.marked[idx]["widget"].set_color(color_hex)
+        self.slider.set_marks({k: v["color"] for k, v in self.marked.items()})
 
     def _jump_to(self, idx: int):
         if self.is_playing:
@@ -1403,9 +1507,9 @@ class MainWindow(QMainWindow):
     def _edit_label(self, idx: int):
         if idx not in self.marked:
             return
-        current = self.marked[idx]["label"]
         text, ok = QInputDialog.getText(
-            self, "Edit Label", "Label for this mark:", text=current
+            self, "Edit Label", "Label for this mark:",
+            text=self.marked[idx]["label"],
         )
         if ok:
             self.marked[idx]["label"] = text
@@ -1416,8 +1520,7 @@ class MainWindow(QMainWindow):
     def copy_frame_clipboard(self):
         if self._last_bgr is None:
             return
-        px = bgr_to_pixmap(self._last_bgr)
-        QApplication.clipboard().setPixmap(px)
+        QApplication.clipboard().setPixmap(bgr_to_pixmap(self._last_bgr))
         self._set_status("Frame copied to clipboard.", BLUE)
 
     def _copy_mark_frame(self, idx: int):
@@ -1425,10 +1528,11 @@ class MainWindow(QMainWindow):
             return
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = self.cap.read()
+        # BUG FIX: restore cap position regardless of read success
+        self._show(self.current_frame)
         if ret:
             QApplication.clipboard().setPixmap(bgr_to_pixmap(frame))
             self._set_status("Mark frame copied to clipboard.", BLUE)
-            self._show(self.current_frame)
 
     # ── Export ────────────────────────────────────────────────────────────────
 
@@ -1450,10 +1554,34 @@ class MainWindow(QMainWindow):
         else:
             subprocess.Popen(["xdg-open", d])
 
+    def _collect_frames(self) -> list[tuple[int, np.ndarray, str]]:
+        """Seek and read each marked frame. Returns [(idx, bgr, label), ...]."""
+        results = []
+        for idx in sorted(self.marked):
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = self.cap.read()
+            if ret:
+                results.append((idx, frame, self.marked[idx]["label"]))
+        self._show(self.current_frame)
+        return results
+
+    def _apply_scale(self, frame: np.ndarray, scale: str) -> np.ndarray:
+        scale_map = {"100%": 1.0, "75%": 0.75, "50%": 0.5, "25%": 0.25}
+        f = scale_map.get(scale)
+        if f and f != 1.0:
+            h, w = frame.shape[:2]
+            return cv2.resize(frame, (int(w * f), int(h * f)),
+                              interpolation=cv2.INTER_LANCZOS4)
+        if scale == "Custom":
+            cw = self._cust_spin.value()
+            h, w = frame.shape[:2]
+            return cv2.resize(frame, (cw, int(h * cw / w)),
+                              interpolation=cv2.INTER_LANCZOS4)
+        return frame
+
     def export_frames(self):
         if not self.cap or not self.marked:
             return
-
         out_dir  = self._dir_edit.text().strip() or str(Path.home() / "Desktop")
         fmt      = self._fmt_combo.currentText()
         quality  = self._qual_spin.value()
@@ -1462,71 +1590,112 @@ class MainWindow(QMainWindow):
         stem     = Path(self._video_path).stem
         os.makedirs(out_dir, exist_ok=True)
 
-        # Extension + encode params
-        ext_map   = {"PNG": ".png", "JPEG": ".jpg", "WebP": ".webp"}
-        ext       = ext_map.get(fmt, ".png")
+        ext_map  = {"PNG": ".png", "JPEG": ".jpg", "WebP": ".webp",
+                    "TIFF": ".tif", "BMP": ".bmp", "GIF": ".gif"}
+        ext      = ext_map.get(fmt, ".png")
         enc_flags: list = []
         if fmt == "JPEG":
             enc_flags = [cv2.IMWRITE_JPEG_QUALITY, quality]
         elif fmt == "WebP":
             enc_flags = [cv2.IMWRITE_WEBP_QUALITY, quality]
 
-        # Scale factor
-        scale_map   = {"100%": 1.0, "75%": 0.75, "50%": 0.5, "25%": 0.25}
-        scale_factor = scale_map.get(scale, None)
-        custom_w     = self._cust_spin.value() if scale == "Custom" else None
+        frames_data = self._collect_frames()
+        exported, errors = 0, 0
 
-        exported = 0
-        errors   = 0
+        if fmt == "GIF":
+            # Export all marks as separate GIFs (one frame each) or an animated GIF
+            self._export_gif(frames_data, out_dir, stem, scale, quality)
+            self._update_export_config(out_dir, fmt, quality, scale, template)
+            return
 
-        for n, idx in enumerate(sorted(self.marked), start=1):
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ret, frame = self.cap.read()
-            if not ret:
+        for n, (idx, frame, label) in enumerate(frames_data, start=1):
+            frame = self._apply_scale(frame, scale)
+            fname = apply_template(template, stem, idx, self.fps, label, n) + ext
+            ok = cv2.imwrite(os.path.join(out_dir, fname), frame, enc_flags)
+            if ok:
+                exported += 1
+            else:
                 errors += 1
-                continue
 
-            # Resize if needed
-            if scale_factor and scale_factor != 1.0:
-                h, w = frame.shape[:2]
-                frame = cv2.resize(
-                    frame,
-                    (int(w * scale_factor), int(h * scale_factor)),
-                    interpolation=cv2.INTER_LANCZOS4,
-                )
-            elif custom_w:
-                h, w = frame.shape[:2]
-                new_h = int(h * custom_w / w)
-                frame = cv2.resize(
-                    frame, (custom_w, new_h),
-                    interpolation=cv2.INTER_LANCZOS4,
-                )
-
-            label  = self.marked[idx]["label"]
-            fname  = apply_template(template, stem, idx, self.fps, label, n) + ext
-            fpath  = os.path.join(out_dir, fname)
-            cv2.imwrite(fpath, frame, enc_flags)
-            exported += 1
-
-        self._show(self.current_frame)
-
-        # Save config
-        self._cfg["last_output_dir"] = out_dir
-        self._cfg["export_format"]   = fmt
-        self._cfg["export_quality"]  = quality
-        self._cfg["export_scale"]    = scale
-        self._cfg["naming_template"] = template
-        save_config(self._cfg)
-
-        if errors:
-            self._set_status(
-                f"Exported {exported} frames ({errors} failed)\n{out_dir}", YELLOW
-            )
-        else:
-            self._set_status(
-                f"Exported {exported} frame{'s' if exported != 1 else ''}\n{out_dir}", GREEN
-            )
+        self._update_export_config(out_dir, fmt, quality, scale, template)
+        color = YELLOW if errors else GREEN
+        self._set_status(
+            f"Exported {exported} frame{'s' if exported != 1 else ''}"
+            + (f" ({errors} failed)" if errors else "") + f"\n{out_dir}", color
+        )
         self._tabs.setCurrentIndex(1)
+
+    def _export_gif(self, frames_data: list, out_dir: str, stem: str,
+                    scale: str, quality: int):
+        if not frames_data:
+            return
+        pil_frames = []
+        for _, bgr, _ in frames_data:
+            bgr = self._apply_scale(bgr, scale)
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            pil_frames.append(PilImage.fromarray(rgb).convert("P", palette=PilImage.ADAPTIVE,
+                                                               dither=0))
+        out_path = os.path.join(out_dir, f"{safe_filename(stem)}_marks.gif")
+        pil_frames[0].save(
+            out_path, save_all=True,
+            append_images=pil_frames[1:],
+            duration=500, loop=0, optimize=True,
+        )
+        self._set_status(f"Exported animated GIF ({len(pil_frames)} frames)\n{out_dir}", GREEN)
+        self._tabs.setCurrentIndex(1)
+
+    def export_contact_sheet(self):
+        if not self.cap or not self.marked:
+            return
+        out_dir = self._dir_edit.text().strip() or str(Path.home() / "Desktop")
+        os.makedirs(out_dir, exist_ok=True)
+
+        n    = len(self.marked)
+        cols = max(2, min(6, math.ceil(math.sqrt(n))))
+        rows = math.ceil(n / cols)
+
+        cell_w, cell_h, label_h = 320, 180, 26
+        pad_c = [int(c * 0.9) for c in [30, 30, 46]]   # BASE in BGR
+
+        sheet_w = cols * cell_w
+        sheet_h = rows * (cell_h + label_h)
+        sheet   = np.full((sheet_h, sheet_w, 3), pad_c, dtype=np.uint8)
+
+        frames_data = self._collect_frames()
+        for i, (idx, frame, label) in enumerate(frames_data):
+            r, c = divmod(i, cols)
+            x = c * cell_w
+            y = r * (cell_h + label_h)
+            # Fit frame into cell
+            fh, fw = frame.shape[:2]
+            scale_f = min(cell_w / fw, cell_h / fh)
+            nw, nh  = int(fw * scale_f), int(fh * scale_f)
+            resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+            ox = (cell_w - nw) // 2
+            oy = (cell_h - nh) // 2
+            sheet[y + oy:y + oy + nh, x + ox:x + ox + nw] = resized
+            # Timestamp + label
+            ts  = ms_to_ts(frame_to_ms(idx, self.fps))
+            txt = f"{ts}" + (f"  {label}" if label else "")
+            cv2.putText(sheet, txt, (x + 4, y + cell_h + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                        (203, 166, 247), 1, cv2.LINE_AA)
+
+        stem     = Path(self._video_path).stem
+        out_path = os.path.join(out_dir, f"{safe_filename(stem)}_contact_sheet.png")
+        cv2.imwrite(out_path, sheet)
+        self._set_status(f"Contact sheet saved ({n} frames)\n{out_path}", TEAL)
+        self._tabs.setCurrentIndex(1)
+
+    def _update_export_config(self, out_dir, fmt, quality, scale, template):
+        self._cfg.update({
+            "last_output_dir": out_dir,
+            "export_format":   fmt,
+            "export_quality":  quality,
+            "export_scale":    scale,
+            "naming_template": template,
+        })
+        save_config(self._cfg)
 
     # ── Session ───────────────────────────────────────────────────────────────
 
@@ -1542,13 +1711,15 @@ class MainWindow(QMainWindow):
         if not path.endswith(".fsnap"):
             path += ".fsnap"
         data = {
-            "video_path": self._video_path,
+            "version":     "2.1",
+            "video_path":  self._video_path,
+            "position":    self.current_frame,
             "marks": [
-                {"frame": idx, "label": m["label"]}
+                {"frame": idx, "label": m["label"], "color": m["color"]}
                 for idx, m in sorted(self.marked.items())
             ],
         }
-        Path(path).write_text(json.dumps(data, indent=2))
+        Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
         self._set_status(f"Session saved: {Path(path).name}", GREEN)
 
     def load_session(self):
@@ -1558,7 +1729,7 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            data = json.loads(Path(path).read_text())
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not read session:\n{e}")
             return
@@ -1566,22 +1737,35 @@ class MainWindow(QMainWindow):
         video = data.get("video_path", "")
         if video and video != self._video_path:
             self._open_path(video)
+            if not self.cap:
+                return
 
         self.clear_marks()
         for entry in data.get("marks", []):
             fidx  = entry.get("frame", 0)
             label = entry.get("label", "")
-            if 0 <= fidx < self.total_frames:
-                self._show(fidx)
+            color = entry.get("color", MAUVE)
+            if 0 <= fidx < max(self.total_frames, fidx + 1):
+                # Temporarily set current_frame so mark_frame() uses it
+                self.current_frame = fidx
+                cached = self._cache.get(fidx)
+                if cached is None:
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+                    ret, frame = self.cap.read()
+                    if ret:
+                        self._last_bgr = frame
+                        self._cache.put(fidx, frame)
+                else:
+                    self._last_bgr = cached
                 self.mark_frame()
-                if label and fidx in self.marked:
-                    self.marked[fidx]["label"] = label
-                    self.marked[fidx]["widget"].update_label(label)
+                if fidx in self.marked:
+                    if label:
+                        self.marked[fidx]["label"] = label
+                        self.marked[fidx]["widget"].update_label(label)
+                    self._set_mark_color(fidx, color)
 
-        if self.marked:
-            first = min(self.marked)
-            self._show(first)
-
+        pos = data.get("position", 0)
+        self._show(min(pos, max(0, self.total_frames - 1)) if self.total_frames else pos)
         self._set_status(f"Session loaded: {len(self.marked)} marks.", GREEN)
 
     # ── View toggles ──────────────────────────────────────────────────────────
@@ -1606,9 +1790,9 @@ class MainWindow(QMainWindow):
     def _set_status(self, msg: str, color: str = GREEN):
         self._status_lbl.setStyleSheet(f"color: {color}; font-size: 12px;")
         self._status_lbl.setText(msg)
-        QTimer.singleShot(5000, lambda: self._status_lbl.setText(""))
+        QTimer.singleShot(6000, lambda: self._status_lbl.setText(""))
 
-    # ── Drag-drop on window ───────────────────────────────────────────────────
+    # ── Window drag-drop ──────────────────────────────────────────────────────
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -1635,7 +1819,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("FrameSnap")
-    app.setApplicationVersion("2.0.0")
+    app.setApplicationVersion("2.1.0")
     app.setStyleSheet(STYLESHEET)
 
     icon_path = Path(__file__).parent / "icon.svg"
