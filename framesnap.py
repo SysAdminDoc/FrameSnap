@@ -248,9 +248,6 @@ QSplitter::handle {{ background-color: {SURFACE0}; width: 2px; }}
 QFrame[frameShape="4"] {{ color: {SURFACE1}; }}
 """
 
-# ── define after STYLESHEET so it can use the color ──────────────────────────
-SAPPHIRE = "#74c7ec"
-
 CONFIG_PATH     = Path.home() / ".framesnap_config.json"
 MAX_RECENT      = 10
 DEFAULT_TEMPLATE = "{stem}_{frame}_{ts}"
