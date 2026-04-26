@@ -12,6 +12,24 @@ import math
 from pathlib import Path
 
 
+# codex-branding:start
+def _branding_icon_path() -> Path:
+    candidates = []
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates.append(exe_dir / "icon.png")
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "icon.png")
+    current = Path(__file__).resolve()
+    candidates.extend([current.parent / "icon.png", current.parent.parent / "icon.png", current.parent.parent.parent / "icon.png"])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return Path("icon.png")
+# codex-branding:end
+
+
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
 def _bootstrap():
@@ -56,7 +74,7 @@ from PyQt6.QtCore import (
     Qt, QTimer, QThread, QMutex, QWaitCondition, pyqtSignal,
     QPoint, QSize, QRect,
 )
-from PyQt6.QtGui import (
+from PyQt6.QtGui import (, QIcon
     QPixmap, QImage, QIcon, QPainter, QColor, QFont, QAction,
     QDragEnterEvent, QDropEvent,
 )
@@ -1816,6 +1834,8 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    branding_icon = QIcon(str(_branding_icon_path()))
+    app.setWindowIcon(branding_icon)
     app.setApplicationName("FrameSnap")
     app.setApplicationVersion("2.1.0")
     app.setStyleSheet(STYLESHEET)
@@ -1825,6 +1845,8 @@ def main():
         app.setWindowIcon(QIcon(str(icon_path)))
 
     win = MainWindow()
+
+    win.setWindowIcon(branding_icon)
     win.show()
     sys.exit(app.exec())
 
