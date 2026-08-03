@@ -7,10 +7,12 @@ import wave
 from framesnap import av as pyav
 from framesnap import (
     apply_template,
+    build_video_proxy,
     extract_audio_waveform,
     frame_to_ms,
     ms_to_ts,
     open_cap,
+    proxy_cache_path,
 )
 
 
@@ -104,3 +106,17 @@ def test_waveform_extracts_audio_levels(tmp_path):
     assert len(samples) == 32
     assert 0.45 < duration < 0.55
     assert max(samples) > 0.8
+
+
+def test_proxy_generation_is_cached_and_downscaled(tmp_path):
+    source = tmp_path / "source.mp4"
+    output = tmp_path / "cache" / "proxy.mp4"
+    _write_test_video(source)
+    width, height = build_video_proxy(source, output, max_width=16)
+    assert (width, height) == (16, 12)
+    assert output.is_file() and output.stat().st_size > 0
+    reader = cv2.VideoCapture(str(output))
+    assert int(reader.get(cv2.CAP_PROP_FRAME_WIDTH)) == 16
+    assert int(reader.get(cv2.CAP_PROP_FRAME_HEIGHT)) == 12
+    reader.release()
+    assert proxy_cache_path(source) == proxy_cache_path(source)

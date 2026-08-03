@@ -9,6 +9,7 @@ import os
 import json
 import subprocess
 import math
+import hashlib
 from pathlib import Path
 
 
@@ -277,6 +278,9 @@ QFrame[frameShape="4"] {{ color: {SURFACE1}; }}
 CONFIG_PATH     = Path.home() / ".framesnap_config.json"
 MAX_RECENT      = 10
 DEFAULT_TEMPLATE = "{stem}_{frame}_{ts}"
+PROXY_CACHE_DIR  = Path.home() / ".framesnap_proxy_cache"
+PROXY_MAX_WIDTH  = 1280
+PROXY_MIN_BYTES  = 1_000_000_000
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -620,6 +624,75 @@ def extract_audio_waveform(path: str, bucket_count: int = 1200) -> tuple[list[fl
         return [], 0.0
 
 
+def proxy_cache_path(path: str, max_width: int = PROXY_MAX_WIDTH) -> Path:
+    """Return a content-aware cache location for a generated playback proxy."""
+    source = Path(path).resolve()
+    try:
+        stat = source.stat()
+        stamp = f"{source}|{stat.st_size}|{stat.st_mtime_ns}|{max_width}"
+    except OSError:
+        stamp = f"{source}|{max_width}"
+    digest = hashlib.sha256(stamp.encode("utf-8")).hexdigest()[:24]
+    return PROXY_CACHE_DIR / f"{digest}.mp4"
+
+
+def build_video_proxy(source_path: str, output_path: str | Path,
+                      max_width: int = PROXY_MAX_WIDTH) -> tuple[int, int]:
+    """Create a silent, low-resolution MP4 proxy and return its dimensions."""
+    if max_width <= 0:
+        raise ValueError("max_width must be positive")
+    source = cv2.VideoCapture(source_path, cv2.CAP_FFMPEG)
+    if not source.isOpened():
+        source.release()
+        source = cv2.VideoCapture(source_path)
+    if not source.isOpened():
+        raise RuntimeError("could not open source video for proxy generation")
+
+    width = int(source.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(source.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = source.get(cv2.CAP_PROP_FPS) or 30.0
+    if width <= 0 or height <= 0:
+        source.release()
+        raise RuntimeError("source video has no usable dimensions")
+    scale = min(1.0, max_width / width)
+    proxy_width = max(2, int(round(width * scale / 2) * 2))
+    proxy_height = max(2, int(round(height * scale / 2) * 2))
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.stem}.partial.mp4")
+    writer = cv2.VideoWriter(
+        str(temporary), cv2.VideoWriter_fourcc(*"mp4v"), fps,
+        (proxy_width, proxy_height),
+    )
+    if not writer.isOpened():
+        source.release()
+        writer.release()
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError("could not create proxy video")
+
+    frames = 0
+    try:
+        while True:
+            ok, frame = source.read()
+            if not ok:
+                break
+            if frame.shape[1] != proxy_width or frame.shape[0] != proxy_height:
+                frame = cv2.resize(frame, (proxy_width, proxy_height),
+                                   interpolation=cv2.INTER_AREA)
+            writer.write(frame)
+            frames += 1
+    finally:
+        source.release()
+        writer.release()
+
+    if frames == 0:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError("source video contained no decodable frames")
+    os.replace(temporary, output)
+    return proxy_width, proxy_height
+
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
@@ -635,6 +708,7 @@ def load_config() -> dict:
         "backend": "Auto",
         "hardware_accel": False,
         "seek_mode": "Exact frame",
+        "proxy_enabled": False,
     }
     if CONFIG_PATH.exists():
         try:
@@ -791,6 +865,59 @@ class WaveformThread(QThread):
             if path is not None:
                 samples, duration = extract_audio_waveform(path)
                 self.waveform_ready.emit(path, samples, duration)
+
+
+class ProxyThread(QThread):
+    """Generate one playback proxy at a time outside the GUI thread."""
+    proxy_ready = pyqtSignal(str, str, int, int)
+    proxy_failed = pyqtSignal(str, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._mutex = QMutex()
+        self._cond = QWaitCondition()
+        self._pending: tuple[str, str, int] | None = None
+        self._running = True
+
+    def request(self, source_path: str, output_path: str,
+                max_width: int = PROXY_MAX_WIDTH) -> None:
+        self._mutex.lock()
+        self._pending = (source_path, output_path, max_width)
+        self._mutex.unlock()
+        self._cond.wakeOne()
+
+    def stop(self) -> None:
+        self._mutex.lock()
+        self._running = False
+        self._mutex.unlock()
+        self._cond.wakeOne()
+        self.wait(3000)
+
+    def run(self) -> None:
+        while True:
+            self._mutex.lock()
+            while self._running and self._pending is None:
+                self._cond.wait(self._mutex)
+            if not self._running:
+                self._mutex.unlock()
+                break
+            pending = self._pending
+            self._pending = None
+            self._mutex.unlock()
+
+            if pending is None:
+                continue
+            source_path, output_path, max_width = pending
+            try:
+                width, height = build_video_proxy(
+                    source_path, output_path, max_width
+                )
+                self.proxy_ready.emit(source_path, output_path, width, height)
+            except Exception as exc:
+                Path(output_path).with_name(
+                    f".{Path(output_path).stem}.partial.mp4"
+                ).unlink(missing_ok=True)
+                self.proxy_failed.emit(source_path, str(exc))
 
 
 # ── Mark Slider ───────────────────────────────────────────────────────────────
@@ -1133,10 +1260,12 @@ class MainWindow(QMainWindow):
         self._seek_mode = self._cfg.get("seek_mode", "Exact frame")
         if self._seek_mode not in SEEK_OPTIONS:
             self._seek_mode = "Exact frame"
+        self._proxy_enabled = bool(self._cfg.get("proxy_enabled", False))
 
         # Video state
         self.cap: VideoReader | None = None
         self._video_path = ""
+        self._playback_path = ""
         self.total_frames = 0       # 0 means unknown
         self.fps          = 30.0
         self.current_frame = 0
@@ -1156,6 +1285,10 @@ class MainWindow(QMainWindow):
         self._waveform_thread = WaveformThread(self)
         self._waveform_thread.waveform_ready.connect(self._on_waveform_ready)
         self._waveform_thread.start()
+        self._proxy_thread = ProxyThread(self)
+        self._proxy_thread.proxy_ready.connect(self._on_proxy_ready)
+        self._proxy_thread.proxy_failed.connect(self._on_proxy_failed)
+        self._proxy_thread.start()
         self._pending_hover_pos = QPoint()
 
         self._build_menu()
@@ -1280,6 +1413,13 @@ class MainWindow(QMainWindow):
         )
         self._seek_combo.currentTextChanged.connect(self._seek_changed)
         top_bar.addWidget(self._seek_combo)
+        self._proxy_check = QCheckBox("Proxy")
+        self._proxy_check.setFixedHeight(30)
+        self._proxy_check.setToolTip(
+            "Generate a cached 1280px playback proxy for videos over 1 GB."
+        )
+        self._proxy_check.toggled.connect(self._proxy_toggled)
+        top_bar.addWidget(self._proxy_check)
         left.addLayout(top_bar)
 
         self._info_bar = QLabel("")
@@ -1606,6 +1746,9 @@ class MainWindow(QMainWindow):
         self._seek_combo.blockSignals(True)
         self._seek_combo.setCurrentText(self._seek_mode)
         self._seek_combo.blockSignals(False)
+        self._proxy_check.blockSignals(True)
+        self._proxy_check.setChecked(self._proxy_enabled)
+        self._proxy_check.blockSignals(False)
         overlay_on = cfg.get("show_overlay", True)
         self._act_overlay.setChecked(overlay_on)
         self.display.set_show_overlay(overlay_on)
@@ -1671,6 +1814,16 @@ class MainWindow(QMainWindow):
             else:
                 self._set_status(f"Seek mode: {self._seek_mode}", BLUE)
 
+    def _proxy_toggled(self, enabled: bool):
+        self._proxy_enabled = enabled
+        self._cfg["proxy_enabled"] = enabled
+        save_config(self._cfg)
+        if self._video_path and self.cap:
+            self._open_path(self._video_path,
+                            start_frame=self.current_frame,
+                            preserve_marks=True,
+                            record_recent=False)
+
     # ── Video loading ─────────────────────────────────────────────────────────
 
     def open_video(self):
@@ -1698,6 +1851,25 @@ class MainWindow(QMainWindow):
                                  "File may be unsupported or missing codec.")
             return False
 
+        source_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        source_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        proxy_candidate: Path | None = None
+        playback_path = path
+        if (self._proxy_enabled
+                and os.path.getsize(path) >= PROXY_MIN_BYTES
+                and source_width > PROXY_MAX_WIDTH):
+            proxy_candidate = proxy_cache_path(path)
+            if proxy_candidate.is_file() and proxy_candidate.stat().st_size > 0:
+                proxy_cap = open_cap(
+                    str(proxy_candidate), self._backend,
+                    self._hardware_accel,
+                    self._seek_mode == "Exact frame",
+                )
+                if proxy_cap is not None and proxy_cap.isOpened():
+                    cap.release()
+                    cap = proxy_cap
+                    playback_path = str(proxy_candidate)
+
         # BUG FIX: stop timer BEFORE releasing old cap
         self._timer.stop()
         self.is_playing = False
@@ -1709,6 +1881,7 @@ class MainWindow(QMainWindow):
 
         self.cap = cap
         self._video_path = path
+        self._playback_path = playback_path
 
         # BUG FIX: handle formats where FRAME_COUNT is 0 or -1
         raw_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -1741,8 +1914,8 @@ class MainWindow(QMainWindow):
 
         self._file_lbl.setText(Path(path).name)
 
-        vw  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        vh  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        vw  = source_width
+        vh  = source_height
         sz  = os.path.getsize(path)
         tf  = f"{self.total_frames:,}" if self.total_frames else "unknown"
         audio = (f"{cap.audio_tracks} audio track"
@@ -1751,6 +1924,8 @@ class MainWindow(QMainWindow):
         decoder = cap.backend_name
         if cap.hardware_fallback:
             decoder += " (software fallback)"
+        if playback_path != path:
+            decoder += f" + proxy {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}"
         self._info_bar.setText(
             f"  {vw}x{vh}  |  {self.fps:.3f} fps  |  "
             f"{ms_to_ts(frame_to_ms(self.total_frames or 0, self.fps))}  |  "
@@ -1764,12 +1939,17 @@ class MainWindow(QMainWindow):
             b.setEnabled(True)
 
         self._preview_thread.open_video(
-            path, self._backend, self._hardware_accel,
+            playback_path, self._backend, self._hardware_accel,
             self._seek_mode == "Exact frame",
         )
         self._waveform.set_loading()
         self._waveform_thread.request(path)
         self._show(target_frame)
+        if proxy_candidate is not None and playback_path == path:
+            self._set_status("Building playback proxy...", BLUE)
+            self._proxy_thread.request(path, str(proxy_candidate))
+        elif playback_path != path:
+            self._set_status("Using cached playback proxy; exports remain full resolution.", BLUE)
         if record_recent:
             self._push_recent(path)
         return True
@@ -1918,6 +2098,25 @@ class MainWindow(QMainWindow):
             return
         self._waveform.set_waveform(samples, duration)
         self._waveform.set_position(frame_to_ms(self.current_frame, self.fps) / 1000.0)
+
+    def _on_proxy_ready(self, source_path: str, output_path: str,
+                        width: int, height: int):
+        if (not self._proxy_enabled or source_path != self._video_path
+                or not os.path.isfile(output_path)):
+            return
+        position = self.current_frame
+        if self._open_path(source_path,
+                           start_frame=position,
+                           preserve_marks=True,
+                           record_recent=False):
+            self._set_status(
+                f"Playback proxy ready: {width}x{height}; exports remain full resolution.",
+                BLUE,
+            )
+
+    def _on_proxy_failed(self, source_path: str, error: str):
+        if source_path == self._video_path and self._proxy_enabled:
+            self._set_status(f"Proxy unavailable; using full-resolution playback. {error}", YELLOW)
 
     def _on_preview_ready(self, frame_idx: int, bgr: np.ndarray):
         px = bgr_to_pixmap(bgr).scaled(
@@ -2116,11 +2315,20 @@ class MainWindow(QMainWindow):
     def _collect_frames(self) -> list[tuple[int, np.ndarray, str]]:
         """Seek and read each marked frame. Returns [(idx, bgr, label), ...]."""
         results = []
-        for idx in sorted(self.marked):
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ret, frame = self.cap.read()
-            if ret:
-                results.append((idx, frame, self.marked[idx]["label"]))
+        reader = open_cap(
+            self._video_path, self._backend, self._hardware_accel,
+            self._seek_mode == "Exact frame",
+        )
+        if reader is None or not reader.isOpened():
+            return results
+        try:
+            for idx in sorted(self.marked):
+                reader.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ret, frame = reader.read()
+                if ret:
+                    results.append((idx, frame, self.marked[idx]["label"]))
+        finally:
+            reader.release()
         self._show(self.current_frame)
         return results
 
@@ -2369,6 +2577,7 @@ class MainWindow(QMainWindow):
         self._hover_popup.hide()
         self._preview_thread.stop()
         self._waveform_thread.stop()
+        self._proxy_thread.stop()
         if self.cap:
             self.cap.release()
         super().closeEvent(event)

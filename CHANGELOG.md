@@ -7,6 +7,7 @@ All notable changes to FrameSnap will be documented in this file.
 - Added: optional PyAV decoding with OpenCV fallback, hardware-decode requests, and audio-track metadata.
 - Added: background audio waveform analysis and a timeline waveform track under the scrubber.
 - Added: persisted Exact frame and Fast keyframe seek modes for PyAV playback.
+- Added: opt-in cached 1280px proxy playback for large videos while exports read the source.
 - Fixed: frozen PyInstaller builds no longer recursively invoke the dependency bootstrapper.
 
 ## [v2.1.0] - %Y->- (HEAD -> main, origin/main)
