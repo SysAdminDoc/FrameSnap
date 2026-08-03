@@ -1,16 +1,23 @@
-import cv2
+import os
 import math
 import numpy as np
 import pytest
 import wave
+from PIL import Image
+
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+import cv2  # noqa: E402
 
 from framesnap import av as pyav
 from framesnap import (
     apply_template,
+    burn_in_overlay,
     build_video_proxy,
+    crop_frame,
     detect_scene_cuts,
     extract_audio_waveform,
     extract_chapters,
+    ffmpeg_extract_command,
     frame_to_ms,
     ms_to_ts,
     open_cap,
@@ -19,6 +26,7 @@ from framesnap import (
     export_sequence,
     ordered_mark_indices,
     thumbnail_frame_indices,
+    to_uint16_frame,
 )
 
 
@@ -45,6 +53,48 @@ def test_timestamp_and_template_helpers():
     }
     assert ordered_mark_indices(marked, "hero") == [2, 15]
     assert export_sequence(marked, "hero") == {2: 1, 15: 2}
+
+
+def test_export_transforms_preserve_expected_dimensions_and_metadata():
+    frame = np.zeros((40, 60, 3), dtype=np.uint8)
+    cropped = crop_frame(frame, 10, 8, 20, 16)
+    burned = burn_in_overlay(cropped, 12, 25, "hero")
+    assert cropped.shape == (16, 20, 3)
+    assert burned.shape == cropped.shape
+    assert np.any(burned != cropped)
+    assert to_uint16_frame(cropped).dtype == np.uint16
+    assert int(to_uint16_frame(cropped).max()) == 0
+
+
+def test_ffmpeg_command_echo_is_replayable():
+    command = ffmpeg_extract_command(
+        r"C:\Videos\sample clip.mp4", 25, 25.0,
+        r"C:\Exports\sample_000025.png",
+    )
+    assert command == (
+        'ffmpeg -ss 1.000 -i "C:\\Videos\\sample clip.mp4" '
+        '-frames:v 1 -y "C:\\Exports\\sample_000025.png"'
+    )
+
+
+def test_export_codecs_write_avif_tiff16_and_exr(tmp_path):
+    frame = np.full((12, 16, 3), 128, dtype=np.uint8)
+    avif = tmp_path / "frame.avif"
+    Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).save(
+        avif, format="AVIF", quality=80
+    )
+    assert avif.is_file()
+
+    tiff = tmp_path / "frame16.tif"
+    assert cv2.imwrite(str(tiff), to_uint16_frame(frame))
+    assert cv2.imread(str(tiff), cv2.IMREAD_UNCHANGED).dtype == np.uint16
+
+    exr = tmp_path / "frame.exr"
+    assert cv2.imwrite(
+        str(exr), frame.astype(np.float32) / 255.0,
+        [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT],
+    )
+    assert exr.is_file()
 
 
 @pytest.mark.parametrize("backend", ["OpenCV", "PyAV"])

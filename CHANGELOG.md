@@ -14,6 +14,10 @@ All notable changes to FrameSnap will be documented in this file.
 - Added: comma-separated marker tags with persisted group-filtered exports.
 - Added: timestamped mark comments with visible shot-note metadata and session persistence.
 - Added: Ripple Delete action with compact export numbering after mark removal.
+- Added: opt-in burn-in overlays, reusable crop rectangles, and 16-bit TIFF/EXR export.
+- Added: animated WebP export, AVIF still export, and configurable contact-sheet title,
+  watermark, columns, and PDF output.
+- Added: per-mark FFmpeg extraction command echo for scripted replay.
 - Fixed: frozen PyInstaller builds no longer recursively invoke the dependency bootstrapper.
 
 ## [v2.1.0] - %Y->- (HEAD -> main, origin/main)

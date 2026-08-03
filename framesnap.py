@@ -65,9 +65,13 @@ def _bootstrap():
 
 _bootstrap()
 
+# OpenCV wheels ship the EXR codec behind an opt-in switch.
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 from PIL import Image as PilImage  # noqa: E402
+from PIL import features as PilFeatures  # noqa: E402
 try:
     import av  # noqa: E402
 except ImportError:  # pragma: no cover - optional dependency
@@ -371,6 +375,60 @@ def export_sequence(marked: dict, group: str = "All") -> dict[int, int]:
             ordered_mark_indices(marked, group), start=1
         )
     }
+
+
+def crop_frame(frame: np.ndarray, x: int, y: int,
+               width: int, height: int) -> np.ndarray:
+    """Return a clamped copy of a crop rectangle, or the original frame."""
+    if width <= 0 or height <= 0:
+        return frame
+    frame_height, frame_width = frame.shape[:2]
+    left = max(0, min(int(x), frame_width - 1))
+    top = max(0, min(int(y), frame_height - 1))
+    right = min(frame_width, left + int(width))
+    bottom = min(frame_height, top + int(height))
+    if right <= left or bottom <= top:
+        return frame
+    return frame[top:bottom, left:right].copy()
+
+
+def burn_in_overlay(frame: np.ndarray, frame_idx: int, fps: float,
+                    label: str = "") -> np.ndarray:
+    """Burn frame/timestamp/label metadata into a copy of an 8-bit BGR frame."""
+    result = frame.copy()
+    timestamp = ms_to_ts(frame_to_ms(frame_idx, fps))
+    lines = [f"Frame {frame_idx:,}  |  {timestamp}"]
+    if label.strip():
+        lines.append(label.strip())
+    scale = max(0.45, min(1.2, result.shape[1] / 1280.0))
+    thickness = max(1, round(scale * 2))
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    pad = max(8, round(10 * scale))
+    line_height = max(18, round(24 * scale))
+    text_width = max(cv2.getTextSize(line, font, scale, thickness)[0][0]
+                     for line in lines)
+    box_height = pad * 2 + line_height * len(lines)
+    overlay = result.copy()
+    cv2.rectangle(overlay, (0, 0), (text_width + pad * 2, box_height),
+                  (17, 17, 27), cv2.FILLED)
+    result = cv2.addWeighted(overlay, 0.78, result, 0.22, 0)
+    for index, line in enumerate(lines):
+        cv2.putText(result, line, (pad, pad + line_height * (index + 1) - 5),
+                    font, scale, (203, 166, 247), thickness, cv2.LINE_AA)
+    return result
+
+
+def to_uint16_frame(frame: np.ndarray) -> np.ndarray:
+    return np.asarray(frame, dtype=np.uint16) * 257
+
+
+def ffmpeg_extract_command(video_path: str, frame_idx: int, fps: float,
+                            output_path: str) -> str:
+    """Return a reproducible FFmpeg single-frame extraction command."""
+    seconds = frame_to_ms(frame_idx, fps) / 1000.0
+    video = str(video_path).replace('"', '\\"')
+    output = str(output_path).replace('"', '\\"')
+    return f'ffmpeg -ss {seconds:.3f} -i "{video}" -frames:v 1 -y "{output}"'
 
 
 BACKEND_OPTIONS = ["Auto", "OpenCV"] + (["PyAV"] if av is not None else [])
@@ -809,6 +867,16 @@ def load_config() -> dict:
         "export_quality": 90,
         "export_scale": "100%",
         "export_group": "All",
+        "burn_overlay": False,
+        "crop_enabled": False,
+        "crop_x": 0,
+        "crop_y": 0,
+        "crop_width": 1280,
+        "crop_height": 720,
+        "sheet_title": "",
+        "sheet_watermark": "",
+        "sheet_columns": 0,
+        "sheet_pdf": False,
         "naming_template": DEFAULT_TEMPLATE,
         "show_overlay": True,
         "speed": "1x",
@@ -1900,7 +1968,10 @@ class MainWindow(QMainWindow):
         fmt_row = QHBoxLayout()
         fmt_row.addWidget(QLabel("Format:"))
         self._fmt_combo = QComboBox()
-        self._fmt_combo.addItems(["PNG", "JPEG", "WebP", "TIFF", "BMP", "GIF"])
+        self._fmt_combo.addItems([
+            "PNG", "JPEG", "WebP", "TIFF", "TIFF 16-bit", "BMP",
+            "GIF", "WebP Animation", "AVIF", "EXR",
+        ])
         self._fmt_combo.currentTextChanged.connect(self._fmt_changed)
         fmt_row.addWidget(self._fmt_combo)
         fmt_row.addStretch()
@@ -1929,6 +2000,58 @@ class MainWindow(QMainWindow):
         self._group_combo.currentTextChanged.connect(self._group_changed)
         gi.addWidget(self._group_combo, 1)
         el.addWidget(group_g)
+
+        transform_g = QGroupBox("Export Transforms")
+        ti = QVBoxLayout(transform_g)
+        self._burn_check = QCheckBox("Burn timestamp, frame, and label")
+        ti.addWidget(self._burn_check)
+        crop_row = QHBoxLayout()
+        self._crop_check = QCheckBox("Crop")
+        crop_row.addWidget(self._crop_check)
+        crop_row.addWidget(QLabel("X"))
+        self._crop_x = QSpinBox()
+        self._crop_x.setRange(0, 100000)
+        crop_row.addWidget(self._crop_x)
+        crop_row.addWidget(QLabel("Y"))
+        self._crop_y = QSpinBox()
+        self._crop_y.setRange(0, 100000)
+        crop_row.addWidget(self._crop_y)
+        crop_row.addWidget(QLabel("W"))
+        self._crop_w = QSpinBox()
+        self._crop_w.setRange(1, 100000)
+        crop_row.addWidget(self._crop_w)
+        crop_row.addWidget(QLabel("H"))
+        self._crop_h = QSpinBox()
+        self._crop_h.setRange(1, 100000)
+        crop_row.addWidget(self._crop_h)
+        ti.addLayout(crop_row)
+        el.addWidget(transform_g)
+
+        sheet_g = QGroupBox("Contact Sheet")
+        si2 = QVBoxLayout(sheet_g)
+        title_row = QHBoxLayout()
+        title_row.addWidget(QLabel("Title:"))
+        self._sheet_title = QLineEdit()
+        self._sheet_title.setPlaceholderText("Optional sheet title")
+        title_row.addWidget(self._sheet_title, 1)
+        si2.addLayout(title_row)
+        watermark_row = QHBoxLayout()
+        watermark_row.addWidget(QLabel("Watermark:"))
+        self._sheet_watermark = QLineEdit()
+        self._sheet_watermark.setPlaceholderText("Optional watermark")
+        watermark_row.addWidget(self._sheet_watermark, 1)
+        si2.addLayout(watermark_row)
+        sheet_options = QHBoxLayout()
+        sheet_options.addWidget(QLabel("Columns:"))
+        self._sheet_columns = QSpinBox()
+        self._sheet_columns.setRange(0, 6)
+        self._sheet_columns.setSpecialValueText("Auto")
+        sheet_options.addWidget(self._sheet_columns)
+        self._sheet_pdf = QCheckBox("Also save PDF")
+        sheet_options.addWidget(self._sheet_pdf)
+        sheet_options.addStretch()
+        si2.addLayout(sheet_options)
+        el.addWidget(sheet_g)
 
         # Scale
         scale_g = QGroupBox("Scale")
@@ -2000,6 +2123,10 @@ class MainWindow(QMainWindow):
         self._sheet_btn.setFixedHeight(34)
         self._sheet_btn.clicked.connect(self.export_contact_sheet)
         oi.addWidget(self._sheet_btn)
+        self._ffmpeg_btn = QPushButton("FFmpeg Commands...")
+        self._ffmpeg_btn.setFixedHeight(30)
+        self._ffmpeg_btn.clicked.connect(self.show_ffmpeg_commands)
+        oi.addWidget(self._ffmpeg_btn)
         el.addWidget(out_g)
 
         self._status_lbl = QLabel("")
@@ -2053,6 +2180,16 @@ class MainWindow(QMainWindow):
         self._qual_spin.setValue(cfg.get("export_quality", 90))
         self._scale_combo.setCurrentText(cfg.get("export_scale", "100%"))
         self._group_combo.setCurrentText(cfg.get("export_group", "All"))
+        self._burn_check.setChecked(cfg.get("burn_overlay", False))
+        self._crop_check.setChecked(cfg.get("crop_enabled", False))
+        self._crop_x.setValue(cfg.get("crop_x", 0))
+        self._crop_y.setValue(cfg.get("crop_y", 0))
+        self._crop_w.setValue(cfg.get("crop_width", 1280))
+        self._crop_h.setValue(cfg.get("crop_height", 720))
+        self._sheet_title.setText(cfg.get("sheet_title", ""))
+        self._sheet_watermark.setText(cfg.get("sheet_watermark", ""))
+        self._sheet_columns.setValue(cfg.get("sheet_columns", 0))
+        self._sheet_pdf.setChecked(cfg.get("sheet_pdf", False))
         self._name_edit.setText(cfg.get("naming_template", DEFAULT_TEMPLATE))
         self._speed_combo.setCurrentText(cfg.get("speed", "1x"))
         self._backend_combo.blockSignals(True)
@@ -2598,6 +2735,7 @@ class MainWindow(QMainWindow):
         has = n > 0
         self._export_btn.setEnabled(has)
         self._sheet_btn.setEnabled(has)
+        self._ffmpeg_btn.setEnabled(has)
         self._clear_btn.setEnabled(has)
         self._del_sel_btn.setEnabled(has)
         self._btn_prev_mark.setEnabled(has)
@@ -2799,6 +2937,38 @@ class MainWindow(QMainWindow):
                               interpolation=cv2.INTER_LANCZOS4)
         return frame
 
+    def _apply_export_transform(self, frame: np.ndarray,
+                                frame_idx: int, label: str) -> np.ndarray:
+        if self._crop_check.isChecked():
+            frame = crop_frame(
+                frame, self._crop_x.value(), self._crop_y.value(),
+                self._crop_w.value(), self._crop_h.value(),
+            )
+        frame = self._apply_scale(frame, self._scale_combo.currentText())
+        if self._burn_check.isChecked():
+            frame = burn_in_overlay(frame, frame_idx, self.fps, label)
+        return frame
+
+    def _write_export_frame(self, path: str, frame: np.ndarray,
+                            fmt: str, quality: int,
+                            enc_flags: list) -> bool:
+        try:
+            if fmt == "AVIF":
+                if not PilFeatures.check("avif"):
+                    return False
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                PilImage.fromarray(rgb).save(path, format="AVIF", quality=quality)
+                return True
+            if fmt == "TIFF 16-bit":
+                return bool(cv2.imwrite(path, to_uint16_frame(frame)))
+            if fmt == "EXR":
+                float_frame = frame.astype(np.float32) / 255.0
+                flags = [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT]
+                return bool(cv2.imwrite(path, float_frame, flags))
+            return bool(cv2.imwrite(path, frame, enc_flags))
+        except (OSError, ValueError, cv2.error):
+            return False
+
     def export_frames(self):
         if not self.cap or not self.marked:
             return
@@ -2811,13 +2981,17 @@ class MainWindow(QMainWindow):
         stem     = Path(self._video_path).stem
         os.makedirs(out_dir, exist_ok=True)
 
-        ext_map  = {"PNG": ".png", "JPEG": ".jpg", "WebP": ".webp",
-                    "TIFF": ".tif", "BMP": ".bmp", "GIF": ".gif"}
+        ext_map  = {
+            "PNG": ".png", "JPEG": ".jpg", "WebP": ".webp",
+            "TIFF": ".tif", "TIFF 16-bit": ".tif", "BMP": ".bmp",
+            "GIF": ".gif", "WebP Animation": ".webp", "AVIF": ".avif",
+            "EXR": ".exr",
+        }
         ext      = ext_map.get(fmt, ".png")
         enc_flags: list = []
         if fmt == "JPEG":
             enc_flags = [cv2.IMWRITE_JPEG_QUALITY, quality]
-        elif fmt == "WebP":
+        elif fmt in ("WebP", "WebP Animation", "AVIF"):
             enc_flags = [cv2.IMWRITE_WEBP_QUALITY, quality]
 
         frames_data = self._collect_frames(group)
@@ -2826,19 +3000,20 @@ class MainWindow(QMainWindow):
             return
         exported, errors = 0, 0
 
-        if fmt == "GIF":
-            # Export all marks as separate GIFs (one frame each) or an animated GIF
-            self._export_gif(frames_data, out_dir, stem, scale, quality)
+        if fmt in ("GIF", "WebP Animation"):
+            self._export_animation(frames_data, out_dir, stem, fmt, quality)
             self._update_export_config(out_dir, fmt, quality, scale, template, group)
             return
 
         sequence = export_sequence(self.marked, group)
         for idx, frame, label in frames_data:
-            frame = self._apply_scale(frame, scale)
+            frame = self._apply_export_transform(frame, idx, label)
             fname = apply_template(
                 template, stem, idx, self.fps, label, sequence[idx]
             ) + ext
-            ok = cv2.imwrite(os.path.join(out_dir, fname), frame, enc_flags)
+            ok = self._write_export_frame(
+                os.path.join(out_dir, fname), frame, fmt, quality, enc_flags
+            )
             if ok:
                 exported += 1
             else:
@@ -2854,25 +3029,69 @@ class MainWindow(QMainWindow):
         )
         self._tabs.setCurrentIndex(1)
 
-    def _export_gif(self, frames_data: list, out_dir: str, stem: str,
-                    scale: str, quality: int):
+    def show_ffmpeg_commands(self):
+        if not self.cap or not self.marked:
+            return
+        group = self._group_combo.currentText()
+        output_dir = self._dir_edit.text().strip() or str(Path.home() / "Desktop")
+        template = self._name_edit.text().strip() or DEFAULT_TEMPLATE
+        fmt = self._fmt_combo.currentText()
+        ext = {
+            "PNG": ".png", "JPEG": ".jpg", "WebP": ".webp",
+            "TIFF": ".tif", "TIFF 16-bit": ".tif", "BMP": ".bmp",
+            "GIF": ".gif", "WebP Animation": ".webp", "AVIF": ".avif",
+            "EXR": ".exr",
+        }.get(fmt, ".png")
+        sequence = export_sequence(self.marked, group)
+        lines = []
+        for position, idx in enumerate(ordered_mark_indices(self.marked, group), 1):
+            label = self.marked[idx].get("label", "")
+            filename = apply_template(
+                template, Path(self._video_path).stem, idx, self.fps,
+                label, sequence.get(idx, position),
+            ) + ext
+            lines.append(ffmpeg_extract_command(
+                self._video_path, idx, self.fps,
+                os.path.join(output_dir, filename),
+            ))
+        if not lines:
+            self._set_status(f"No marks in export group: {group}", YELLOW)
+            return
+        QMessageBox.information(
+            self, "FFmpeg Commands", "\n".join(lines),
+        )
+
+    def _export_animation(self, frames_data: list, out_dir: str, stem: str,
+                          fmt: str, quality: int):
         if not frames_data:
             return
         pil_frames = []
-        for _, bgr, _ in frames_data:
-            bgr = self._apply_scale(bgr, scale)
+        for idx, bgr, label in frames_data:
+            bgr = self._apply_export_transform(bgr, idx, label)
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            pil_frames.append(PilImage.fromarray(rgb).convert("P", palette=PilImage.ADAPTIVE,
-                                                               dither=0))
+            image = PilImage.fromarray(rgb)
+            if fmt == "GIF":
+                image = image.convert("P", palette=PilImage.ADAPTIVE, dither=0)
+            pil_frames.append(image)
         group = self._group_combo.currentText()
         suffix = "" if group == "All" else f"_{safe_filename(group)}"
-        out_path = os.path.join(out_dir, f"{safe_filename(stem)}{suffix}_marks.gif")
-        pil_frames[0].save(
-            out_path, save_all=True,
-            append_images=pil_frames[1:],
-            duration=500, loop=0, optimize=True,
+        extension = "gif" if fmt == "GIF" else "webp"
+        out_path = os.path.join(out_dir, f"{safe_filename(stem)}{suffix}_marks.{extension}")
+        save_kwargs = {
+            "save_all": True,
+            "append_images": pil_frames[1:],
+            "duration": 500,
+            "loop": 0,
+        }
+        if fmt == "GIF":
+            save_kwargs["optimize"] = True
+        else:
+            save_kwargs["quality"] = quality
+            save_kwargs["method"] = 6
+        pil_frames[0].save(out_path, format=extension.upper(), **save_kwargs)
+        self._set_status(
+            f"Exported animated {fmt} ({len(pil_frames)} frames)\n{out_dir}", GREEN
         )
-        self._set_status(f"Exported animated GIF ({len(pil_frames)} frames)\n{out_dir}", GREEN)
         self._tabs.setCurrentIndex(1)
 
     def export_contact_sheet(self):
@@ -2887,20 +3106,29 @@ class MainWindow(QMainWindow):
             self._set_status(f"No marks in export group: {group}", YELLOW)
             return
         n    = len(frames_data)
-        cols = max(2, min(6, math.ceil(math.sqrt(n))))
+        configured_cols = self._sheet_columns.value()
+        cols = (max(1, min(6, configured_cols)) if configured_cols
+                else max(2, min(6, math.ceil(math.sqrt(n)))))
         rows = math.ceil(n / cols)
 
         cell_w, cell_h, label_h = 320, 180, 26
+        title = self._sheet_title.text().strip()
+        watermark = self._sheet_watermark.text().strip()
+        title_h = 34 if title else 0
         pad_c = [int(c * 0.9) for c in [30, 30, 46]]   # BASE in BGR
 
         sheet_w = cols * cell_w
-        sheet_h = rows * (cell_h + label_h)
+        sheet_h = title_h + rows * (cell_h + label_h)
         sheet   = np.full((sheet_h, sheet_w, 3), pad_c, dtype=np.uint8)
+        if title:
+            cv2.putText(sheet, title, (8, 24), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.72, (203, 166, 247), 2, cv2.LINE_AA)
 
         for i, (idx, frame, label) in enumerate(frames_data):
             r, c = divmod(i, cols)
             x = c * cell_w
-            y = r * (cell_h + label_h)
+            y = title_h + r * (cell_h + label_h)
+            frame = self._apply_export_transform(frame, idx, label)
             # Fit frame into cell
             fh, fw = frame.shape[:2]
             scale_f = min(cell_w / fw, cell_h / fh)
@@ -2916,12 +3144,39 @@ class MainWindow(QMainWindow):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42,
                         (203, 166, 247), 1, cv2.LINE_AA)
 
+        if watermark:
+            text_size = cv2.getTextSize(
+                watermark, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+            )[0]
+            cv2.putText(
+                sheet, watermark,
+                (max(6, sheet_w - text_size[0] - 8), sheet_h - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (166, 173, 200), 1, cv2.LINE_AA,
+            )
+
         stem     = Path(self._video_path).stem
         suffix = "" if group == "All" else f"_{safe_filename(group)}"
         out_path = os.path.join(out_dir, f"{safe_filename(stem)}{suffix}_contact_sheet.png")
         cv2.imwrite(out_path, sheet)
+        pdf_path = ""
+        if self._sheet_pdf.isChecked():
+            pdf_path = os.path.join(
+                out_dir, f"{safe_filename(stem)}{suffix}_contact_sheet.pdf"
+            )
+            with PilImage.open(out_path) as image:
+                image.convert("RGB").save(pdf_path, "PDF", resolution=150.0)
+        self._cfg.update({
+            "sheet_title": title,
+            "sheet_watermark": watermark,
+            "sheet_columns": configured_cols,
+            "sheet_pdf": self._sheet_pdf.isChecked(),
+        })
+        save_config(self._cfg)
         group_note = f" [{group}]" if group != "All" else ""
-        self._set_status(f"Contact sheet saved ({n} frames){group_note}\n{out_path}", TEAL)
+        output_note = f"\n{pdf_path}" if pdf_path else ""
+        self._set_status(
+            f"Contact sheet saved ({n} frames){group_note}\n{out_path}{output_note}", TEAL
+        )
         self._tabs.setCurrentIndex(1)
 
     def _update_export_config(self, out_dir, fmt, quality, scale, template, group="All"):
@@ -2932,6 +3187,12 @@ class MainWindow(QMainWindow):
             "export_scale":    scale,
             "naming_template": template,
             "export_group":     group,
+            "burn_overlay":     self._burn_check.isChecked(),
+            "crop_enabled":     self._crop_check.isChecked(),
+            "crop_x":            self._crop_x.value(),
+            "crop_y":            self._crop_y.value(),
+            "crop_width":        self._crop_w.value(),
+            "crop_height":       self._crop_h.value(),
         })
         save_config(self._cfg)
 
@@ -3023,7 +3284,7 @@ class MainWindow(QMainWindow):
         save_config(self._cfg)
 
     def _fmt_changed(self, fmt: str):
-        lossy = fmt in ("JPEG", "WebP")
+        lossy = fmt in ("JPEG", "WebP", "WebP Animation", "AVIF")
         self._qual_lbl_l.setEnabled(lossy)
         self._qual_spin.setEnabled(lossy)
 
