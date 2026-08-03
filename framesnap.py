@@ -33,6 +33,10 @@ def _branding_icon_path() -> Path:
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
 def _bootstrap():
+    # PyInstaller bundles the dependencies; running the installer from a
+    # frozen executable would recurse through sys.executable indefinitely.
+    if getattr(sys, "frozen", False):
+        return
     import importlib
     to_install = []
     for mod, pkg in [
@@ -63,12 +67,16 @@ _bootstrap()
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 from PIL import Image as PilImage  # noqa: E402
+try:
+    import av  # noqa: E402
+except ImportError:  # pragma: no cover - optional dependency
+    av = None
 from PyQt6.QtWidgets import (  # noqa: E402
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QListWidget, QListWidgetItem,
     QFileDialog, QLineEdit, QGroupBox, QSizePolicy, QFrame, QSplitter,
     QMenu, QComboBox, QSpinBox, QInputDialog, QMessageBox,
-    QStyle, QStyleOptionSlider, QTabWidget, QAbstractItemView,
+    QStyle, QStyleOptionSlider, QTabWidget, QAbstractItemView, QCheckBox,
 )
 from PyQt6.QtCore import (  # noqa: E402
     Qt, QTimer, QThread, QMutex, QWaitCondition, pyqtSignal,
@@ -332,14 +340,218 @@ def apply_template(template: str, stem: str, frame_idx: int,
     return safe_filename(result)
 
 
-def open_cap(path: str) -> cv2.VideoCapture | None:
-    """Try FFmpeg backend first, fall back to OS default."""
-    for backend in (cv2.CAP_FFMPEG, cv2.CAP_ANY):
-        cap = cv2.VideoCapture(path, backend)
-        if cap.isOpened():
-            return cap
-        cap.release()
-    return None
+BACKEND_OPTIONS = ["Auto", "OpenCV"] + (["PyAV"] if av is not None else [])
+
+
+def _hardware_backend_name() -> str:
+    if sys.platform == "win32":
+        return "d3d11va"
+    if sys.platform == "darwin":
+        return "videotoolbox"
+    return "vaapi"
+
+
+class VideoReader:
+    """Small common reader API for OpenCV and optional PyAV decoding."""
+
+    def __init__(self, path: str, backend: str = "Auto",
+                 hardware_accel: bool = False):
+        self.path = path
+        self.backend_name = ""
+        self.audio_tracks: int | None = None
+        self.hardware_accel = False
+        self.hardware_fallback = False
+        self._cv_cap: cv2.VideoCapture | None = None
+        self._container = None
+        self._stream = None
+        self._decoder = None
+        self._seek_target: int | None = None
+        self._current_frame = -1
+        self._decode_index = 0
+
+        requested = backend if backend in BACKEND_OPTIONS else "Auto"
+        candidates = [requested]
+        if requested == "Auto":
+            candidates = ["PyAV", "OpenCV"] if av is not None else ["OpenCV"]
+
+        last_error: Exception | None = None
+        for candidate in candidates:
+            try:
+                if candidate == "PyAV":
+                    self._open_pyav(path, hardware_accel)
+                else:
+                    self._open_opencv(path)
+                return
+            except Exception as exc:
+                last_error = exc
+                self.release()
+
+        detail = f" ({last_error})" if last_error else ""
+        raise RuntimeError(f"No decoder could open {path}{detail}")
+
+    def _open_opencv(self, path: str) -> None:
+        for backend in (cv2.CAP_FFMPEG, cv2.CAP_ANY):
+            cap = cv2.VideoCapture(path, backend)
+            if cap.isOpened():
+                self._cv_cap = cap
+                self.backend_name = "OpenCV / FFmpeg"
+                self.audio_tracks = _probe_audio_tracks(path)
+                return
+            cap.release()
+        raise RuntimeError("OpenCV could not open the video")
+
+    def _open_pyav(self, path: str, hardware_accel: bool) -> None:
+        if av is None:
+            raise RuntimeError("PyAV is not installed")
+        options = {}
+        requested_accel = _hardware_backend_name() if hardware_accel else ""
+        if requested_accel:
+            options["hwaccel"] = requested_accel
+        try:
+            self._container = av.open(path, options=options)
+        except Exception:
+            if not options:
+                raise
+            self._container = av.open(path, options={})
+            self.hardware_fallback = True
+
+        self._stream = next(iter(self._container.streams.video), None)
+        if self._stream is None:
+            raise RuntimeError("PyAV found no video stream")
+        try:
+            self._stream.thread_type = "AUTO"
+        except (AttributeError, ValueError):
+            pass
+        self._decoder = self._container.decode(self._stream)
+        self.audio_tracks = len(self._container.streams.audio)
+        self.hardware_accel = bool(requested_accel and not self.hardware_fallback)
+        suffix = f" + {requested_accel}" if self.hardware_accel else ""
+        self.backend_name = f"PyAV{suffix}"
+
+    def isOpened(self) -> bool:
+        if self._cv_cap is not None:
+            return self._cv_cap.isOpened()
+        return self._container is not None and self._stream is not None
+
+    def release(self) -> None:
+        if self._cv_cap is not None:
+            self._cv_cap.release()
+            self._cv_cap = None
+        if self._container is not None:
+            self._container.close()
+            self._container = None
+        self._stream = None
+        self._decoder = None
+
+    def _pyav_frame_index(self, frame) -> int:
+        if frame.pts is not None and self._stream is not None:
+            try:
+                timestamp = float(frame.pts * self._stream.time_base)
+                if timestamp >= 0:
+                    return max(0, int(round(timestamp * self.fps)))
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        return self._decode_index
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        if self._cv_cap is not None:
+            return self._cv_cap.read()
+        if self._decoder is None:
+            return False, None
+        while True:
+            try:
+                frame = next(self._decoder)
+            except StopIteration:
+                return False, None
+            idx = self._pyav_frame_index(frame)
+            self._decode_index = idx + 1
+            if self._seek_target is not None and idx < self._seek_target:
+                continue
+            self._seek_target = None
+            self._current_frame = idx
+            return True, frame.to_ndarray(format="bgr24")
+
+    def set(self, prop: int, value: float) -> bool:
+        if self._cv_cap is not None:
+            return bool(self._cv_cap.set(prop, value))
+        if prop == cv2.CAP_PROP_POS_FRAMES:
+            self._seek_frame(max(0, int(value)))
+            return True
+        if prop == cv2.CAP_PROP_POS_MSEC:
+            self._seek_frame(max(0, int(round(value * self.fps / 1000.0))))
+            return True
+        return False
+
+    def _seek_frame(self, idx: int) -> None:
+        if self._container is None or self._stream is None:
+            return
+        time_base = float(self._stream.time_base or 1 / 90_000)
+        timestamp = int((idx / self.fps) / time_base) if self.fps > 0 else 0
+        self._container.seek(max(0, timestamp), stream=self._stream,
+                             any_frame=False, backward=True)
+        self._decoder = self._container.decode(self._stream)
+        self._seek_target = idx
+        self._current_frame = idx - 1
+        self._decode_index = max(0, idx - 1)
+
+    @property
+    def fps(self) -> float:
+        if self._cv_cap is not None:
+            return self._cv_cap.get(cv2.CAP_PROP_FPS) or 30.0
+        if self._stream is not None:
+            rate = self._stream.average_rate or self._stream.base_rate
+            if rate:
+                return float(rate)
+        return 30.0
+
+    @property
+    def frame_count(self) -> int:
+        if self._cv_cap is not None:
+            return int(self._cv_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if self._stream is None:
+            return 0
+        frames = int(self._stream.frames or 0)
+        if frames > 0:
+            return frames
+        duration = self._stream.duration
+        if duration is not None and self._stream.time_base is not None:
+            return max(0, int(round(float(duration * self._stream.time_base)
+                                     * self.fps)))
+        return 0
+
+    def get(self, prop: int) -> float:
+        if self._cv_cap is not None:
+            return self._cv_cap.get(prop)
+        if prop == cv2.CAP_PROP_FPS:
+            return self.fps
+        if prop == cv2.CAP_PROP_FRAME_COUNT:
+            return float(self.frame_count)
+        if prop == cv2.CAP_PROP_FRAME_WIDTH:
+            return float(self._stream.width if self._stream else 0)
+        if prop == cv2.CAP_PROP_FRAME_HEIGHT:
+            return float(self._stream.height if self._stream else 0)
+        if prop == cv2.CAP_PROP_POS_FRAMES:
+            return float(max(0, self._current_frame))
+        return 0.0
+
+
+def _probe_audio_tracks(path: str) -> int | None:
+    """Read stream metadata for an OpenCV session when PyAV is available."""
+    if av is None:
+        return None
+    try:
+        with av.open(path) as container:
+            return len(container.streams.audio)
+    except Exception:
+        return None
+
+
+def open_cap(path: str, backend: str = "Auto",
+             hardware_accel: bool = False) -> VideoReader | None:
+    try:
+        return VideoReader(path, backend, hardware_accel)
+    except (OSError, RuntimeError, ValueError):
+        return None
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -354,6 +566,8 @@ def load_config() -> dict:
         "naming_template": DEFAULT_TEMPLATE,
         "show_overlay": True,
         "speed": "1x",
+        "backend": "Auto",
+        "hardware_accel": False,
     }
     if CONFIG_PATH.exists():
         try:
@@ -408,11 +622,16 @@ class PreviewThread(QThread):
         self._cond  = QWaitCondition()
         self._pending_frame: int = -1
         self._pending_path: str | None = None
+        self._pending_backend = "Auto"
+        self._pending_hardware = False
         self._running = True
 
-    def open_video(self, path: str) -> None:
+    def open_video(self, path: str, backend: str = "Auto",
+                   hardware_accel: bool = False) -> None:
         self._mutex.lock()
         self._pending_path = path
+        self._pending_backend = backend
+        self._pending_hardware = hardware_accel
         self._mutex.unlock()
         self._cond.wakeOne()
 
@@ -441,6 +660,8 @@ class PreviewThread(QThread):
                 break
             path  = self._pending_path
             idx   = self._pending_frame
+            backend = self._pending_backend
+            hardware_accel = self._pending_hardware
             self._pending_path  = None
             self._pending_frame = -1
             self._mutex.unlock()
@@ -448,7 +669,7 @@ class PreviewThread(QThread):
             if path is not None:
                 if self._cap:
                     self._cap.release()
-                self._cap = open_cap(path)
+                self._cap = open_cap(path, backend, hardware_accel)
 
             if idx >= 0 and self._cap and self._cap.isOpened():
                 self._cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -722,9 +943,13 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
 
         self._cfg = load_config()
+        self._backend = self._cfg.get("backend", "Auto")
+        if self._backend not in BACKEND_OPTIONS:
+            self._backend = "Auto"
+        self._hardware_accel = bool(self._cfg.get("hardware_accel", False))
 
         # Video state
-        self.cap: cv2.VideoCapture | None = None
+        self.cap: VideoReader | None = None
         self._video_path = ""
         self.total_frames = 0       # 0 means unknown
         self.fps          = 30.0
@@ -840,6 +1065,23 @@ class MainWindow(QMainWindow):
         self._file_lbl.setStyleSheet(f"color: {SUBTEXT0}; font-size: 12px;")
         top_bar.addWidget(open_btn)
         top_bar.addWidget(self._file_lbl, 1)
+        top_bar.addWidget(QLabel("Decoder:"))
+        self._backend_combo = QComboBox()
+        self._backend_combo.addItems(BACKEND_OPTIONS)
+        self._backend_combo.setFixedHeight(30)
+        self._backend_combo.setToolTip(
+            "Auto prefers PyAV when installed; OpenCV uses its FFmpeg wrapper."
+        )
+        self._backend_combo.currentTextChanged.connect(self._backend_changed)
+        top_bar.addWidget(self._backend_combo)
+        self._hardware_check = QCheckBox("HW")
+        self._hardware_check.setFixedHeight(30)
+        self._hardware_check.setToolTip(
+            "Request platform hardware decode through PyAV when available."
+        )
+        self._hardware_check.setEnabled(av is not None)
+        self._hardware_check.toggled.connect(self._hardware_toggled)
+        top_bar.addWidget(self._hardware_check)
         left.addLayout(top_bar)
 
         self._info_bar = QLabel("")
@@ -1155,9 +1397,55 @@ class MainWindow(QMainWindow):
         self._scale_combo.setCurrentText(cfg.get("export_scale", "100%"))
         self._name_edit.setText(cfg.get("naming_template", DEFAULT_TEMPLATE))
         self._speed_combo.setCurrentText(cfg.get("speed", "1x"))
+        self._backend_combo.blockSignals(True)
+        self._backend_combo.setCurrentText(self._backend)
+        self._backend_combo.blockSignals(False)
+        self._hardware_check.blockSignals(True)
+        self._hardware_check.setChecked(self._hardware_accel)
+        self._hardware_check.blockSignals(False)
         overlay_on = cfg.get("show_overlay", True)
         self._act_overlay.setChecked(overlay_on)
         self.display.set_show_overlay(overlay_on)
+
+    def _backend_changed(self, backend: str):
+        if backend not in BACKEND_OPTIONS:
+            return
+        previous = self._backend
+        self._backend = backend
+        self._cfg["backend"] = backend
+        save_config(self._cfg)
+        if self._video_path and self.cap:
+            if not self._open_path(self._video_path,
+                                   start_frame=self.current_frame,
+                                   preserve_marks=True,
+                                   record_recent=False):
+                self._backend = previous
+                self._cfg["backend"] = previous
+                save_config(self._cfg)
+                self._backend_combo.blockSignals(True)
+                self._backend_combo.setCurrentText(previous)
+                self._backend_combo.blockSignals(False)
+            else:
+                self._set_status(f"Decoder: {self.cap.backend_name}", BLUE)
+
+    def _hardware_toggled(self, enabled: bool):
+        previous = self._hardware_accel
+        self._hardware_accel = enabled
+        self._cfg["hardware_accel"] = enabled
+        save_config(self._cfg)
+        if self._video_path and self.cap:
+            if not self._open_path(self._video_path,
+                                   start_frame=self.current_frame,
+                                   preserve_marks=True,
+                                   record_recent=False):
+                self._hardware_accel = previous
+                self._cfg["hardware_accel"] = previous
+                save_config(self._cfg)
+                self._hardware_check.blockSignals(True)
+                self._hardware_check.setChecked(previous)
+                self._hardware_check.blockSignals(False)
+            else:
+                self._set_status(f"Decoder: {self.cap.backend_name}", BLUE)
 
     # ── Video loading ─────────────────────────────────────────────────────────
 
@@ -1168,10 +1456,20 @@ class MainWindow(QMainWindow):
         if path:
             self._open_path(path)
 
-    def _open_path(self, path: str):
+    def _open_path(self, path: str, start_frame: int = 0,
+                   preserve_marks: bool = False,
+                   record_recent: bool = True) -> bool:
         if not os.path.isfile(path):
             QMessageBox.warning(self, "Not Found", f"File not found:\n{path}")
-            return
+            return False
+
+        cap = open_cap(path, self._backend, self._hardware_accel)
+        if cap is None or not cap.isOpened():
+            QMessageBox.critical(self, "Error",
+                                 f"Cannot open video:\n{path}\n\n"
+                                 f"Decoder: {self._backend}\n"
+                                 "File may be unsupported or missing codec.")
+            return False
 
         # BUG FIX: stop timer BEFORE releasing old cap
         self._timer.stop()
@@ -1181,13 +1479,6 @@ class MainWindow(QMainWindow):
         if self.cap:
             self.cap.release()
             self.cap = None
-
-        cap = open_cap(path)
-        if cap is None or not cap.isOpened():
-            QMessageBox.critical(self, "Error",
-                                 f"Cannot open video:\n{path}\n\n"
-                                 "File may be unsupported or missing codec.")
-            return
 
         self.cap = cap
         self._video_path = path
@@ -1203,12 +1494,16 @@ class MainWindow(QMainWindow):
         self.current_frame = 0
         self._cache.clear()
 
-        # BUG FIX: clear stale marks from previous video
-        self.clear_marks()
+        # Marks remain useful when only the decoder is changed.
+        if not preserve_marks:
+            self.clear_marks()
+
+        target_frame = max(0, min(start_frame, self.total_frames - 1)) \
+            if self.total_frames > 0 else max(0, start_frame)
 
         self.slider.blockSignals(True)
         self.slider.setRange(0, max(0, self.total_frames - 1))
-        self.slider.setValue(0)
+        self.slider.setValue(target_frame)
         self.slider.setEnabled(self.total_frames > 0)
         self.slider.blockSignals(False)
 
@@ -1223,10 +1518,16 @@ class MainWindow(QMainWindow):
         vh  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         sz  = os.path.getsize(path)
         tf  = f"{self.total_frames:,}" if self.total_frames else "unknown"
+        audio = (f"{cap.audio_tracks} audio track"
+                 f"{'s' if cap.audio_tracks != 1 else ''}"
+                 if cap.audio_tracks is not None else "audio unknown")
+        decoder = cap.backend_name
+        if cap.hardware_fallback:
+            decoder += " (software fallback)"
         self._info_bar.setText(
             f"  {vw}x{vh}  |  {self.fps:.3f} fps  |  "
             f"{ms_to_ts(frame_to_ms(self.total_frames or 0, self.fps))}  |  "
-            f"{tf} frames  |  {sizeof_fmt(sz)}"
+            f"{tf} frames  |  {sizeof_fmt(sz)}  |  {decoder}  |  {audio}"
         )
         self._info_bar.show()
 
@@ -1235,9 +1536,11 @@ class MainWindow(QMainWindow):
                   self._mark_btn, self._copy_btn):
             b.setEnabled(True)
 
-        self._preview_thread.open_video(path)
-        self._show(0)
-        self._push_recent(path)
+        self._preview_thread.open_video(path, self._backend, self._hardware_accel)
+        self._show(target_frame)
+        if record_recent:
+            self._push_recent(path)
+        return True
 
     # ── Playback ──────────────────────────────────────────────────────────────
 
