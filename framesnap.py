@@ -742,6 +742,34 @@ def detect_scene_cuts(path: str, backend: str = "Auto",
     return cuts
 
 
+def extract_chapters(path: str) -> list[tuple[int, str]]:
+    """Return chapter start frame indices and titles from the container."""
+    if av is None:
+        return []
+    try:
+        with av.open(path) as container:
+            stream = next(iter(container.streams.video), None)
+            fps = 30.0
+            if stream is not None:
+                rate = stream.average_rate or stream.base_rate
+                if rate:
+                    fps = float(rate)
+            chapters = []
+            seen = set()
+            for index, chapter in enumerate(container.chapters, start=1):
+                seconds = float(chapter.start * chapter.time_base)
+                frame_idx = max(0, int(round(seconds * fps)))
+                if frame_idx in seen:
+                    continue
+                seen.add(frame_idx)
+                metadata = chapter.metadata or {}
+                title = str(metadata.get("title") or f"Chapter {index}").strip()
+                chapters.append((frame_idx, title))
+            return chapters
+    except Exception:
+        return []
+
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
@@ -1541,6 +1569,7 @@ class MainWindow(QMainWindow):
         edit_menu = mb.addMenu("Edit")
         edit_menu.addAction(self._make_act("Mark Current Frame", self.mark_frame))
         edit_menu.addAction(self._make_act("Auto-mark Scene Cuts", self.auto_mark_scenes))
+        edit_menu.addAction(self._make_act("Auto-mark Chapters", self.auto_mark_chapters))
         edit_menu.addAction(self._make_act("Clear All Marks",    self.clear_marks))
         edit_menu.addSeparator()
         edit_menu.addAction(self._make_act("Copy Current Frame to Clipboard",
@@ -2407,6 +2436,29 @@ class MainWindow(QMainWindow):
     def _on_scenes_failed(self, path: str, error: str):
         if path == self._video_path:
             self._set_status(f"Scene detection failed: {error}", YELLOW)
+
+    def auto_mark_chapters(self):
+        if not self.cap or not self._video_path:
+            QMessageBox.information(self, "No Video", "Open a video before loading chapters.")
+            return
+        chapters = extract_chapters(self._video_path)
+        if not chapters:
+            self._set_status("No embedded chapter markers found.", YELLOW)
+            return
+        original_position = self.current_frame
+        added = 0
+        for frame_idx, title in chapters:
+            self._show(frame_idx)
+            before = len(self.marked)
+            self.mark_frame()
+            if len(self.marked) > before and frame_idx in self.marked:
+                self.marked[frame_idx]["label"] = title
+                self.marked[frame_idx]["widget"].update_label(title)
+                added += 1
+        self._show(original_position)
+        self._set_status(
+            f"Loaded {added} chapter mark{'s' if added != 1 else ''}.", GREEN
+        )
 
     # ── Marking ───────────────────────────────────────────────────────────────
 

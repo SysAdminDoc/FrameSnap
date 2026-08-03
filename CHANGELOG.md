@@ -10,6 +10,7 @@ All notable changes to FrameSnap will be documented in this file.
 - Added: opt-in cached 1280px proxy playback for large videos while exports read the source.
 - Added: background thumbnail strip sampling with click-to-jump timeline navigation.
 - Added: background histogram-based scene-cut detection with automatic marks.
+- Added: embedded MP4/MKV chapter starts as labeled marks.
 - Fixed: frozen PyInstaller builds no longer recursively invoke the dependency bootstrapper.
 
 ## [v2.1.0] - %Y->- (HEAD -> main, origin/main)

@@ -10,6 +10,7 @@ from framesnap import (
     build_video_proxy,
     detect_scene_cuts,
     extract_audio_waveform,
+    extract_chapters,
     frame_to_ms,
     ms_to_ts,
     open_cap,
@@ -141,3 +142,9 @@ def test_scene_detection_marks_histogram_cuts(tmp_path):
     writer.release()
     cuts = detect_scene_cuts(str(path), "OpenCV", threshold=0.4, min_gap_frames=3)
     assert any(7 <= cut <= 9 for cut in cuts)
+
+
+def test_chapter_extraction_handles_container_without_chapters(tmp_path):
+    path = tmp_path / "no-chapters.mp4"
+    _write_test_video(path)
+    assert extract_chapters(str(path)) == []
