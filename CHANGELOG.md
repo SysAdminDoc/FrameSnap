@@ -20,6 +20,9 @@ All notable changes to FrameSnap will be documented in this file.
 - Added: per-mark FFmpeg extraction command echo for scripted replay.
 - Added: same-video session merge and frame-level session diff actions.
 - Added: relative-timestamp session templates that can be applied to another video.
+- Added: multi-video drag-and-drop/open queues with mark reuse and previous/next navigation.
+- Added: noninteractive CSV/JSON marker-list export with frame/time selection and transforms.
+- Added: Windows per-monitor-v2 DPI setup and Latte, GitHub Dark, and AMOLED themes.
 - Fixed: frozen PyInstaller builds no longer recursively invoke the dependency bootstrapper.
 
 ## [v2.1.0] - %Y->- (HEAD -> main, origin/main)

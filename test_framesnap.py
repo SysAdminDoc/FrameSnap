@@ -1,5 +1,6 @@
 import os
 import math
+import json
 import numpy as np
 import pytest
 import wave
@@ -11,6 +12,7 @@ import cv2  # noqa: E402
 from framesnap import av as pyav
 from framesnap import (
     apply_template,
+    batch_export_markers,
     burn_in_overlay,
     build_video_proxy,
     crop_frame,
@@ -19,10 +21,13 @@ from framesnap import (
     extract_chapters,
     ffmpeg_extract_command,
     frame_to_ms,
+    main,
     diff_session_data,
     merge_session_data,
     ms_to_ts,
     session_template_from_data,
+    stylesheet_for_theme,
+    THEME_NAMES,
     template_to_marks,
     open_cap,
     parse_tags,
@@ -124,6 +129,37 @@ def test_session_template_round_trips_relative_timestamps():
     assert [mark["frame"] for mark in applied] == [0, 60]
     assert applied[1]["label"] == "later"
     assert applied[1]["tags"] == "hero"
+
+
+def test_batch_marker_export_supports_csv_json_and_cli(tmp_path):
+    video = tmp_path / "batch.mp4"
+    _write_test_video(video)
+    csv_path = tmp_path / "markers.csv"
+    csv_path.write_text("frame,label\n0,first\n3,last\n", encoding="utf-8")
+    csv_output = tmp_path / "csv-output"
+    result = batch_export_markers(csv_path, csv_output, str(video), "PNG")
+    assert result == {"exported": 2, "failed": [], "videos": 1}
+    assert len(list(csv_output.glob("*.png"))) == 2
+
+    json_path = tmp_path / "markers.json"
+    json_path.write_text(
+        json.dumps({"video_path": str(video), "marks": [{"time_ms": 200}]}),
+        encoding="utf-8",
+    )
+    json_output = tmp_path / "json-output"
+    assert main([
+        "--batch-markers", str(json_path),
+        "--output-dir", str(json_output),
+        "--format", "JPEG",
+    ]) == 0
+    assert len(list(json_output.glob("*.jpg"))) == 1
+
+
+def test_alternative_theme_stylesheets_are_available():
+    for theme in THEME_NAMES:
+        stylesheet = stylesheet_for_theme(theme)
+        assert "QMainWindow" in stylesheet
+        assert stylesheet.startswith("\nQMainWindow")
 
 
 def test_export_codecs_write_avif_tiff16_and_exr(tmp_path):

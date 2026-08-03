@@ -7,6 +7,8 @@ Browse any video, mark frames, and export screenshots — all formats, all featu
 import sys
 import os
 import json
+import argparse
+import csv
 import subprocess
 import math
 import hashlib
@@ -278,6 +280,92 @@ QTabBar::tab:hover:!selected {{ background: {SURFACE1}; color: {TEXT}; }}
 QSplitter::handle {{ background-color: {SURFACE0}; width: 2px; }}
 QFrame[frameShape="4"] {{ color: {SURFACE1}; }}
 """
+
+THEME_NAMES = (
+    "Catppuccin Mocha", "Catppuccin Latte", "GitHub Dark", "AMOLED Black",
+)
+THEME_OVERRIDES = {
+    "Catppuccin Mocha": "",
+    "Catppuccin Latte": """
+QMainWindow, QDialog, QWidget { background-color: #eff1f5; color: #4c4f69; }
+QLabel { color: #4c4f69; }
+QMenuBar, QMenu { background-color: #e6e9ef; color: #4c4f69; }
+QMenuBar { border-bottom-color: #ccd0da; }
+QMenu { border-color: #bcc0cc; }
+QMenu::item:selected { background-color: #ccd0da; color: #8839ef; }
+QPushButton { background-color: #e6e9ef; color: #4c4f69; border-color: #bcc0cc; }
+QPushButton:hover { background-color: #ccd0da; border-color: #8839ef; color: #8839ef; }
+QLineEdit, QListWidget { background-color: #e6e9ef; color: #4c4f69; border-color: #bcc0cc; }
+QComboBox, QSpinBox { background-color: #e6e9ef; color: #4c4f69; border-color: #bcc0cc; }
+QComboBox QAbstractItemView { background-color: #e6e9ef; color: #4c4f69; }
+QGroupBox, QTabWidget::pane { border-color: #bcc0cc; background: #e6e9ef; }
+QGroupBox::title { color: #8839ef; }
+QTabBar::tab { background-color: #ccd0da; color: #6c6f85; }
+QTabBar::tab:selected { background-color: #8839ef; color: #eff1f5; }
+QScrollBar:vertical { background-color: #e6e9ef; }
+QScrollBar::handle:vertical { background-color: #9ca0b0; }
+QSlider::groove:horizontal { background-color: #ccd0da; }
+QSlider::handle:horizontal, QSlider::sub-page:horizontal { background-color: #8839ef; }
+QPushButton#markBtn { background-color: #8839ef; color: #eff1f5; }
+QPushButton#exportBtn { background-color: #40a02b; color: #eff1f5; }
+QPushButton#sheetBtn { background-color: #179299; color: #eff1f5; }
+QPushButton#copyBtn { background-color: #1e66f5; color: #eff1f5; }
+""",
+    "GitHub Dark": """
+QMainWindow, QDialog, QWidget { background-color: #0d1117; color: #e6edf3; }
+QLabel { color: #e6edf3; }
+QMenuBar, QMenu { background-color: #161b22; color: #e6edf3; }
+QMenuBar { border-bottom-color: #30363d; }
+QMenu { border-color: #484f58; }
+QMenu::item:selected { background-color: #30363d; color: #58a6ff; }
+QPushButton { background-color: #21262d; color: #e6edf3; border-color: #30363d; }
+QPushButton:hover { background-color: #30363d; border-color: #58a6ff; color: #58a6ff; }
+QLineEdit, QListWidget { background-color: #161b22; color: #e6edf3; border-color: #30363d; }
+QComboBox, QSpinBox { background-color: #21262d; color: #e6edf3; border-color: #30363d; }
+QComboBox QAbstractItemView { background-color: #161b22; color: #e6edf3; }
+QGroupBox, QTabWidget::pane { border-color: #30363d; background: #161b22; }
+QGroupBox::title { color: #d2a8ff; }
+QTabBar::tab { background-color: #21262d; color: #8b949e; }
+QTabBar::tab:selected { background-color: #238636; color: #ffffff; }
+QScrollBar:vertical { background-color: #161b22; }
+QScrollBar::handle:vertical { background-color: #484f58; }
+QSlider::groove:horizontal { background-color: #30363d; }
+QSlider::handle:horizontal, QSlider::sub-page:horizontal { background-color: #58a6ff; }
+QPushButton#markBtn { background-color: #a371f7; color: #0d1117; }
+QPushButton#exportBtn { background-color: #3fb950; color: #0d1117; }
+QPushButton#sheetBtn { background-color: #39c5cf; color: #0d1117; }
+QPushButton#copyBtn { background-color: #58a6ff; color: #0d1117; }
+""",
+    "AMOLED Black": """
+QMainWindow, QDialog, QWidget { background-color: #000000; color: #f5f5f5; }
+QLabel { color: #f5f5f5; }
+QMenuBar, QMenu { background-color: #000000; color: #f5f5f5; }
+QMenuBar { border-bottom-color: #252525; }
+QMenu { border-color: #353535; }
+QMenu::item:selected { background-color: #252525; color: #00e5ff; }
+QPushButton { background-color: #151515; color: #f5f5f5; border-color: #353535; }
+QPushButton:hover { background-color: #252525; border-color: #00e5ff; color: #00e5ff; }
+QLineEdit, QListWidget { background-color: #050505; color: #f5f5f5; border-color: #353535; }
+QComboBox, QSpinBox { background-color: #151515; color: #f5f5f5; border-color: #353535; }
+QComboBox QAbstractItemView { background-color: #050505; color: #f5f5f5; }
+QGroupBox, QTabWidget::pane { border-color: #353535; background: #050505; }
+QGroupBox::title { color: #00e5ff; }
+QTabBar::tab { background-color: #151515; color: #aaaaaa; }
+QTabBar::tab:selected { background-color: #00e5ff; color: #000000; }
+QScrollBar:vertical { background-color: #050505; }
+QScrollBar::handle:vertical { background-color: #555555; }
+QSlider::groove:horizontal { background-color: #252525; }
+QSlider::handle:horizontal, QSlider::sub-page:horizontal { background-color: #00e5ff; }
+QPushButton#markBtn { background-color: #ff00aa; color: #000000; }
+QPushButton#exportBtn { background-color: #00e676; color: #000000; }
+QPushButton#sheetBtn { background-color: #00e5ff; color: #000000; }
+QPushButton#copyBtn { background-color: #448aff; color: #000000; }
+""",
+}
+
+
+def stylesheet_for_theme(theme: str) -> str:
+    return STYLESHEET + THEME_OVERRIDES.get(theme, "")
 
 CONFIG_PATH     = Path.home() / ".framesnap_config.json"
 MAX_RECENT      = 10
@@ -615,6 +703,205 @@ def ffmpeg_extract_command(video_path: str, frame_idx: int, fps: float,
     video = str(video_path).replace('"', '\\"')
     output = str(output_path).replace('"', '\\"')
     return f'ffmpeg -ss {seconds:.3f} -i "{video}" -frames:v 1 -y "{output}"'
+
+
+def _value_present(value) -> bool:
+    return value is not None and str(value).strip() != ""
+
+
+def _parse_marker_time_ms(value) -> float | None:
+    if not _value_present(value):
+        return None
+    text = str(value).strip()
+    if ":" not in text:
+        return float(text) * 1000.0
+    parts = text.split(":")
+    if len(parts) != 3:
+        raise ValueError(f"Invalid timestamp: {value}")
+    hours, minutes, seconds = parts
+    return (float(hours) * 3600.0 + float(minutes) * 60.0
+            + float(seconds)) * 1000.0
+
+
+def _resolve_marker_video(value: str, default_video: str,
+                          base_dir: Path) -> str:
+    raw = str(value or default_video).strip()
+    if not raw:
+        raise ValueError("Each marker needs a video_path or --video")
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = base_dir / path
+    return str(path.resolve())
+
+
+def load_marker_list(path: str | Path, video_path: str = "") -> list[dict]:
+    """Load CSV/JSON frame markers for noninteractive batch export."""
+    marker_path = Path(path)
+    if marker_path.suffix.casefold() == ".csv":
+        with marker_path.open(newline="", encoding="utf-8-sig") as handle:
+            payload = list(csv.DictReader(handle))
+        default_video = video_path
+    else:
+        raw = json.loads(marker_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            default_video = str(raw.get("video_path", raw.get("video", video_path)))
+            payload = raw.get("marks", raw.get("markers", []))
+        else:
+            default_video = video_path
+            payload = raw
+    if not isinstance(payload, list):
+        raise ValueError("Marker list must be a JSON array or an object with marks")
+
+    entries = []
+    base_dir = marker_path.parent.resolve()
+    for number, raw_entry in enumerate(payload, 1):
+        if not isinstance(raw_entry, dict):
+            raise ValueError(f"Marker {number} must be an object")
+        frame = None
+        if _value_present(raw_entry.get("frame")):
+            frame = int(float(raw_entry["frame"]))
+            if frame < 0:
+                raise ValueError(f"Marker {number} has a negative frame")
+        time_ms = None
+        if frame is None:
+            if _value_present(raw_entry.get("time_ms")):
+                time_ms = float(raw_entry["time_ms"])
+            else:
+                time_ms = _parse_marker_time_ms(
+                    raw_entry.get("seconds", raw_entry.get("time",
+                                               raw_entry.get("timestamp")))
+                )
+            if time_ms is None or time_ms < 0:
+                raise ValueError(f"Marker {number} needs frame or timestamp")
+        entries.append({
+            "video_path": _resolve_marker_video(
+                raw_entry.get("video_path", raw_entry.get("video",
+                                     raw_entry.get("path", ""))),
+                default_video, base_dir,
+            ),
+            "frame": frame,
+            "time_ms": time_ms,
+            "label": str(raw_entry.get("label", "")).strip(),
+            "tags": ", ".join(parse_tags(str(raw_entry.get("tags", "")))),
+            "comment": str(raw_entry.get("comment", "")).strip(),
+        })
+    if not entries:
+        raise ValueError("Marker list is empty")
+    return entries
+
+
+def scale_export_frame(frame: np.ndarray, scale: str) -> np.ndarray:
+    scale_map = {"100%": 1.0, "75%": 0.75, "50%": 0.5, "25%": 0.25}
+    factor = scale_map.get(scale, 1.0)
+    if factor == 1.0:
+        return frame
+    height, width = frame.shape[:2]
+    return cv2.resize(frame, (max(1, int(width * factor)),
+                              max(1, int(height * factor))),
+                      interpolation=cv2.INTER_LANCZOS4)
+
+
+def transform_export_frame(frame: np.ndarray, frame_idx: int, fps: float,
+                           label: str, scale: str = "100%",
+                           burn_overlay: bool = False,
+                           crop: tuple[int, int, int, int] | None = None) -> np.ndarray:
+    if crop is not None:
+        frame = crop_frame(frame, *crop)
+    frame = scale_export_frame(frame, scale)
+    if burn_overlay:
+        frame = burn_in_overlay(frame, frame_idx, fps, label)
+    return frame
+
+
+def export_extension(fmt: str) -> str:
+    return {
+        "PNG": ".png", "JPEG": ".jpg", "WebP": ".webp",
+        "TIFF": ".tif", "TIFF 16-bit": ".tif", "BMP": ".bmp",
+        "AVIF": ".avif", "EXR": ".exr",
+    }.get(fmt, ".png")
+
+
+def write_export_frame(path: str, frame: np.ndarray, fmt: str,
+                       quality: int = 90) -> bool:
+    try:
+        if fmt == "AVIF":
+            if not PilFeatures.check("avif"):
+                return False
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            PilImage.fromarray(rgb).save(path, format="AVIF", quality=quality)
+            return True
+        if fmt == "TIFF 16-bit":
+            return bool(cv2.imwrite(path, to_uint16_frame(frame)))
+        if fmt == "EXR":
+            float_frame = frame.astype(np.float32) / 255.0
+            return bool(cv2.imwrite(
+                path, float_frame,
+                [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT],
+            ))
+        flags = []
+        if fmt == "JPEG":
+            flags = [cv2.IMWRITE_JPEG_QUALITY, quality]
+        elif fmt == "WebP":
+            flags = [cv2.IMWRITE_WEBP_QUALITY, quality]
+        return bool(cv2.imwrite(path, frame, flags))
+    except (OSError, ValueError, cv2.error):
+        return False
+
+
+def batch_export_markers(marker_path: str | Path, output_dir: str | Path,
+                         video_path: str = "", fmt: str = "PNG",
+                         quality: int = 90, scale: str = "100%",
+                         template: str = DEFAULT_TEMPLATE,
+                         burn_overlay: bool = False,
+                         crop: tuple[int, int, int, int] | None = None) -> dict:
+    if fmt in ("GIF", "WebP Animation"):
+        raise ValueError("Batch marker export supports still-image formats only")
+    entries = load_marker_list(marker_path, video_path)
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    by_video: dict[str, list[dict]] = {}
+    for entry in entries:
+        by_video.setdefault(entry["video_path"], []).append(entry)
+
+    exported = 0
+    failures = []
+    extension = export_extension(fmt)
+    for source, source_entries in by_video.items():
+        reader = open_cap(source, "Auto", False, True)
+        if reader is None or not reader.isOpened():
+            failures.append(f"Could not open {source}")
+            continue
+        try:
+            fps = reader.get(cv2.CAP_PROP_FPS) or 30.0
+            resolved = []
+            for entry in source_entries:
+                frame = entry["frame"]
+                if frame is None:
+                    frame = max(0, round(entry["time_ms"] * fps / 1000.0))
+                resolved.append((frame, entry))
+            resolved.sort(key=lambda item: item[0])
+            stem = Path(source).stem
+            for sequence, (frame_idx, entry) in enumerate(resolved, 1):
+                reader.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, frame = reader.read()
+                if not ret:
+                    failures.append(f"{source}: could not read frame {frame_idx}")
+                    continue
+                frame = transform_export_frame(
+                    frame, frame_idx, fps, entry["label"], scale,
+                    burn_overlay, crop,
+                )
+                name = apply_template(
+                    template, stem, frame_idx, fps, entry["label"], sequence
+                ) + extension
+                path = output / name
+                if write_export_frame(str(path), frame, fmt, quality):
+                    exported += 1
+                else:
+                    failures.append(f"{source}: could not write {path}")
+        finally:
+            reader.release()
+    return {"exported": exported, "failed": failures, "videos": len(by_video)}
 
 
 BACKEND_OPTIONS = ["Auto", "OpenCV"] + (["PyAV"] if av is not None else [])
@@ -1048,6 +1335,7 @@ def extract_chapters(path: str) -> list[tuple[int, str]]:
 def load_config() -> dict:
     defaults = {
         "recent": [],
+        "theme": "Catppuccin Mocha",
         "last_output_dir": str(Path.home() / "Desktop"),
         "export_format": "PNG",
         "export_quality": 90,
@@ -1591,7 +1879,7 @@ class ThumbnailStripWidget(QWidget):
 
 class VideoDisplay(QLabel):
     wheel_delta  = pyqtSignal(int)
-    file_dropped = pyqtSignal(str)
+    file_dropped = pyqtSignal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1673,9 +1961,10 @@ class VideoDisplay(QLabel):
             event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent):
-        urls = event.mimeData().urls()
-        if urls:
-            self.file_dropped.emit(urls[0].toLocalFile())
+        paths = [url.toLocalFile() for url in event.mimeData().urls()
+                 if url.isLocalFile()]
+        if paths:
+            self.file_dropped.emit(paths)
 
 
 # ── Frame Item Widget ─────────────────────────────────────────────────────────
@@ -1802,6 +2091,10 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
 
         self._cfg = load_config()
+        self._theme = self._cfg.get("theme", THEME_NAMES[0])
+        if self._theme not in THEME_NAMES:
+            self._theme = THEME_NAMES[0]
+        self._apply_theme(self._theme, persist=False)
         self._backend = self._cfg.get("backend", "Auto")
         if self._backend not in BACKEND_OPTIONS:
             self._backend = "Auto"
@@ -1815,6 +2108,8 @@ class MainWindow(QMainWindow):
         self.cap: VideoReader | None = None
         self._video_path = ""
         self._playback_path = ""
+        self._video_queue: list[str] = []
+        self._queue_index = -1
         self.total_frames = 0       # 0 means unknown
         self.fps          = 30.0
         self.current_frame = 0
@@ -1892,6 +2187,15 @@ class MainWindow(QMainWindow):
                                             checkable=True,
                                             checked=self._cfg.get("show_overlay", True))
         view_menu.addAction(self._act_overlay)
+        theme_menu = view_menu.addMenu("Theme")
+        self._theme_actions = {}
+        for theme in THEME_NAMES:
+            action = self._make_act(
+                theme, lambda _checked, choice=theme: self._apply_theme(choice),
+                checkable=True, checked=theme == self._theme,
+            )
+            self._theme_actions[theme] = action
+            theme_menu.addAction(action)
 
         self._refresh_recent_menu()
 
@@ -1954,6 +2258,19 @@ class MainWindow(QMainWindow):
         self._file_lbl.setStyleSheet(f"color: {SUBTEXT0}; font-size: 12px;")
         top_bar.addWidget(open_btn)
         top_bar.addWidget(self._file_lbl, 1)
+        self._queue_lbl = QLabel("Queue: 0/0")
+        self._queue_lbl.setStyleSheet(f"color: {OVERLAY0}; font-size: 11px;")
+        self._queue_prev_btn = QPushButton("◀")
+        self._queue_prev_btn.setFixedSize(28, 28)
+        self._queue_prev_btn.setToolTip("Previous video in queue")
+        self._queue_prev_btn.clicked.connect(self.previous_queue_video)
+        self._queue_next_btn = QPushButton("▶")
+        self._queue_next_btn.setFixedSize(28, 28)
+        self._queue_next_btn.setToolTip("Next video in queue")
+        self._queue_next_btn.clicked.connect(self.next_queue_video)
+        top_bar.addWidget(self._queue_lbl)
+        top_bar.addWidget(self._queue_prev_btn)
+        top_bar.addWidget(self._queue_next_btn)
         top_bar.addWidget(QLabel("Decoder:"))
         self._backend_combo = QComboBox()
         self._backend_combo.addItems(BACKEND_OPTIONS)
@@ -1996,7 +2313,7 @@ class MainWindow(QMainWindow):
 
         self.display = VideoDisplay()
         self.display.wheel_delta.connect(self.step)
-        self.display.file_dropped.connect(self._open_path)
+        self.display.file_dropped.connect(self._open_queue)
         left.addWidget(self.display, 1)
 
         div = QFrame()
@@ -2337,6 +2654,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
         root.addWidget(splitter)
+        self._update_queue_ui()
 
     def _build_timer(self):
         self._timer = QTimer()
@@ -2477,15 +2795,61 @@ class MainWindow(QMainWindow):
     # ── Video loading ─────────────────────────────────────────────────────────
 
     def open_video(self):
-        path, _ = QFileDialog.getOpenFileName(
+        paths, _ = QFileDialog.getOpenFileNames(
             self, "Open Video", "", VIDEO_FILTER
         )
-        if path:
-            self._open_path(path)
+        if paths:
+            self._open_queue(paths)
+
+    def _open_queue(self, paths: list[str]):
+        unique = []
+        seen = set()
+        for path in paths:
+            key = os.path.normcase(os.path.abspath(path))
+            if path and key not in seen:
+                unique.append(path)
+                seen.add(key)
+        if not unique:
+            return
+        self._video_queue = unique
+        self._queue_index = 0
+        if not self._open_path(unique[0], update_queue=False):
+            self._video_queue = []
+            self._queue_index = -1
+        self._update_queue_ui()
+
+    def _open_queue_index(self, index: int) -> bool:
+        if not self._video_queue or not 0 <= index < len(self._video_queue):
+            return False
+        self._queue_index = index
+        opened = self._open_path(
+            self._video_queue[index], preserve_marks=True,
+            update_queue=False,
+        )
+        self._update_queue_ui()
+        return opened
+
+    def previous_queue_video(self):
+        self._open_queue_index(self._queue_index - 1)
+
+    def next_queue_video(self):
+        self._open_queue_index(self._queue_index + 1)
+
+    def _update_queue_ui(self):
+        if not hasattr(self, "_queue_lbl"):
+            return
+        count = len(self._video_queue)
+        current = self._queue_index + 1 if self._queue_index >= 0 else 0
+        self._queue_lbl.setText(f"Queue: {current}/{count}")
+        self._queue_prev_btn.setEnabled(self._queue_index > 0)
+        self._queue_next_btn.setEnabled(
+            self._queue_index >= 0 and self._queue_index < count - 1
+        )
 
     def _open_path(self, path: str, start_frame: int = 0,
                    preserve_marks: bool = False,
-                   record_recent: bool = True) -> bool:
+                   record_recent: bool = True,
+                   update_queue: bool = True) -> bool:
         if not os.path.isfile(path):
             QMessageBox.warning(self, "Not Found", f"File not found:\n{path}")
             return False
@@ -2532,6 +2896,10 @@ class MainWindow(QMainWindow):
         self.cap = cap
         self._video_path = path
         self._playback_path = playback_path
+        if update_queue and not preserve_marks:
+            self._video_queue = [path]
+            self._queue_index = 0
+        self._update_queue_ui()
 
         # BUG FIX: handle formats where FRAME_COUNT is 0 or -1
         raw_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -3596,6 +3964,21 @@ class MainWindow(QMainWindow):
 
     # ── View toggles ──────────────────────────────────────────────────────────
 
+    def _apply_theme(self, theme: str, persist: bool = True):
+        if theme not in THEME_NAMES:
+            theme = THEME_NAMES[0]
+        self._theme = theme
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(stylesheet_for_theme(theme))
+        for name, action in getattr(self, "_theme_actions", {}).items():
+            action.blockSignals(True)
+            action.setChecked(name == theme)
+            action.blockSignals(False)
+        if persist:
+            self._cfg["theme"] = theme
+            save_config(self._cfg)
+
     def _toggle_overlay(self, checked: bool):
         self.display.set_show_overlay(checked)
         self._cfg["show_overlay"] = checked
@@ -3625,9 +4008,10 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent):
-        urls = event.mimeData().urls()
-        if urls:
-            self._open_path(urls[0].toLocalFile())
+        paths = [url.toLocalFile() for url in event.mimeData().urls()
+                 if url.isLocalFile()]
+        if paths:
+            self._open_queue(paths)
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
@@ -3646,13 +4030,93 @@ class MainWindow(QMainWindow):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main():
+def configure_high_dpi() -> bool:
+    """Opt into Windows per-monitor-v2 scaling before Qt creates a screen."""
+    os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        setter = user32.SetProcessDpiAwarenessContext
+        setter.argtypes = [ctypes.c_void_p]
+        setter.restype = ctypes.c_bool
+        if setter(ctypes.c_void_p(-4)):  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+            return True
+    except (AttributeError, OSError, OverflowError):
+        pass
+    try:
+        import ctypes
+        return ctypes.windll.shcore.SetProcessDpiAwareness(2) in (0, 0x80070005)
+    except (AttributeError, OSError):
+        return False
+
+
+def _build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="FrameSnap video marker exporter and desktop viewer."
+    )
+    parser.add_argument(
+        "--batch-markers", "--markers", dest="marker_path",
+        help="CSV or JSON marker list for noninteractive export",
+    )
+    parser.add_argument(
+        "--video", default="",
+        help="Default video when marker rows omit video_path",
+    )
+    parser.add_argument("--output-dir", default=".")
+    parser.add_argument(
+        "--format", default="PNG",
+        choices=["PNG", "JPEG", "WebP", "TIFF", "TIFF 16-bit", "BMP", "AVIF", "EXR"],
+    )
+    parser.add_argument("--quality", type=int, default=90, choices=range(1, 101))
+    parser.add_argument(
+        "--scale", default="100%", choices=["100%", "75%", "50%", "25%"],
+    )
+    parser.add_argument("--template", default=DEFAULT_TEMPLATE)
+    parser.add_argument("--burn-in", action="store_true")
+    parser.add_argument(
+        "--crop", nargs=4, type=int, metavar=("X", "Y", "W", "H"),
+    )
+    parser.add_argument("--version", action="version", version="FrameSnap 2.1.0")
+    return parser
+
+
+def _run_batch_cli(args: argparse.Namespace) -> int:
+    crop = tuple(args.crop) if args.crop else None
+    try:
+        result = batch_export_markers(
+            args.marker_path, args.output_dir, args.video, args.format,
+            args.quality, args.scale, args.template, args.burn_in, crop,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"Batch export failed: {exc}", file=sys.stderr)
+        return 2
+    print(
+        f"Exported {result['exported']} frame(s) from {result['videos']} video(s)"
+    )
+    for failure in result["failed"]:
+        print(f"Warning: {failure}", file=sys.stderr)
+    return 1 if result["failed"] else 0
+
+
+def main(argv: list[str] | None = None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv:
+        parser = _build_cli_parser()
+        args = parser.parse_args(argv)
+        if not args.marker_path:
+            parser.print_help()
+            return 0
+        return _run_batch_cli(args)
+
+    configure_high_dpi()
     app = QApplication(sys.argv)
     branding_icon = QIcon(str(_branding_icon_path()))
     app.setWindowIcon(branding_icon)
     app.setApplicationName("FrameSnap")
     app.setApplicationVersion("2.1.0")
-    app.setStyleSheet(STYLESHEET)
+    app.setStyleSheet(stylesheet_for_theme(THEME_NAMES[0]))
 
     icon_path = Path(__file__).parent / "icon.svg"
     if icon_path.exists():
@@ -3662,8 +4126,8 @@ def main():
 
     win.setWindowIcon(branding_icon)
     win.show()
-    sys.exit(app.exec())
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

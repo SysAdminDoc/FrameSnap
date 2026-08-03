@@ -24,7 +24,8 @@
 - Step frame-by-frame (-10, -1, +1, +10)
 - Drag scrubber to any position
 - **Mouse wheel** on the video to step frames
-- **Drag-and-drop** a video file directly onto the window
+- **Drag-and-drop queue** — drop several videos at once, then move through the queue with the
+  previous/next controls while reusing marks and export settings
 - Recent files menu for quick access
 
 ### Scrubber
@@ -42,17 +43,20 @@
 
 ### Export
 
-- **Formats:** PNG (lossless), JPEG, WebP, TIFF, BMP, or animated GIF
-- **Quality control** for JPEG and WebP (1–100%)
+- **Formats:** PNG, JPEG, WebP, TIFF, 16-bit TIFF, BMP, AVIF, EXR, animated GIF, or animated WebP
+- **Quality control** for JPEG, WebP, animated WebP, and AVIF (1–100%)
 - **Scale:** 100%, 75%, 50%, 25%, or custom pixel width
+- **Burn-in overlay** — optionally bake frame number, timestamp, and label into every export
+- **Crop rectangle** — apply one reusable crop to every exported frame
 - **Filename template** with variables:
   - `{stem}` — video filename without extension
   - `{frame}` — zero-padded frame number (e.g. `001234`)
   - `{ts}` — timestamp as `HH-MM-SS-mmm`
   - `{label}` — custom mark label (or `mark` if unset)
   - `{n}` — sequential mark number
-- **Animated GIF** — exports all marked frames as a single looping GIF via Pillow
-- **Contact Sheet** — assembles all marked frames into a single PNG grid with timestamps
+- **Animated GIF / WebP** — exports all marked frames as one looping animation via Pillow
+- **Contact Sheet** — configurable title, watermark, column count, and optional PDF output
+- **FFmpeg Commands** — show replayable single-frame extraction commands for every mark
 - **Open Folder** button to reveal the export directory in Explorer / Finder
 - **Copy to Clipboard** — copy the current frame or any mark's frame directly
 
@@ -60,13 +64,17 @@
 
 - **Save Session** — stores video path + all marks + labels + colors to a `.fsnap` JSON file
 - **Load Session** — restores video, marks, labels, and colors from a session file
+- **Merge Sessions** — combine two sessions for the same video, unioning tags and notes
+- **Compare Sessions** — show added, removed, and changed marks
+- **Session Templates** — save relative timestamps to `.fstpl` and apply them to another video
 
 ### UX
 
 - **Frame overlay** on video display — shows frame number, total frames, and timestamp (toggleable via View menu)
 - **Video info bar** — resolution, FPS, duration, frame count, file size shown on load
 - Preferences auto-saved (output folder, format, quality, scale, template, overlay state, speed)
-- Catppuccin Mocha dark theme throughout
+- **Themes:** Catppuccin Mocha, Catppuccin Latte, GitHub Dark, and AMOLED Black
+- Windows per-monitor-v2 DPI awareness is enabled before Qt creates the application window
 
 ---
 
@@ -74,6 +82,7 @@
 
 - Python 3.10+
 - Dependencies are **auto-installed on first run**: `PyQt6`, `opencv-python`, `numpy`, `Pillow`
+- Optional `PyAV` enables the alternate decoder and audio-track metadata path
 
 ---
 
@@ -86,6 +95,19 @@ python framesnap.py
 ```
 
 On first launch, missing packages are installed automatically via pip. No manual setup required.
+
+### Noninteractive batch export
+
+Use a CSV or JSON marker list without opening the GUI. Rows may contain `frame` or `time_ms` (or
+`time` as seconds / `HH:MM:SS.mmm`), plus an optional `label`, `tags`, and `comment`. Include
+`video_path` per row or provide `--video`:
+
+```bash
+python framesnap.py --batch-markers markers.csv --video clip.mp4 \
+  --output-dir exports --format PNG --burn-in
+```
+
+The command returns a nonzero exit code if any listed frame cannot be read or written.
 
 ---
 
