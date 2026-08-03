@@ -8,6 +8,7 @@ from framesnap import av as pyav
 from framesnap import (
     apply_template,
     build_video_proxy,
+    detect_scene_cuts,
     extract_audio_waveform,
     frame_to_ms,
     ms_to_ts,
@@ -127,3 +128,16 @@ def test_thumbnail_indices_cover_the_full_video():
     assert thumbnail_frame_indices(100, 4) == [0, 33, 66, 99]
     assert thumbnail_frame_indices(1, 18) == [0]
     assert thumbnail_frame_indices(0, 18) == []
+
+
+def test_scene_detection_marks_histogram_cuts(tmp_path):
+    path = tmp_path / "scenes.mp4"
+    writer = cv2.VideoWriter(
+        str(path), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (32, 24)
+    )
+    assert writer.isOpened()
+    for value in ([0] * 8) + ([220] * 8):
+        writer.write(np.full((24, 32, 3), value, dtype=np.uint8))
+    writer.release()
+    cuts = detect_scene_cuts(str(path), "OpenCV", threshold=0.4, min_gap_frames=3)
+    assert any(7 <= cut <= 9 for cut in cuts)

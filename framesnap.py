@@ -704,6 +704,44 @@ def thumbnail_frame_indices(total_frames: int, count: int = 18) -> list[int]:
     })
 
 
+def detect_scene_cuts(path: str, backend: str = "Auto",
+                      hardware_accel: bool = False,
+                      exact_seek: bool = True,
+                      threshold: float = 0.45,
+                      min_gap_frames: int = 1) -> list[int]:
+    """Find content cuts using histogram distance between consecutive frames."""
+    reader = open_cap(path, backend, hardware_accel, exact_seek)
+    if reader is None or not reader.isOpened():
+        return []
+    threshold = max(0.0, min(1.0, threshold))
+    min_gap_frames = max(1, min_gap_frames)
+    cuts: list[int] = []
+    previous_hist = None
+    last_cut = -min_gap_frames
+    frame_idx = 0
+    try:
+        while True:
+            ok, frame = reader.read()
+            if not ok or frame is None:
+                break
+            small = cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA)
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            hist = cv2.calcHist([gray], [0], None, [32], [0, 256])
+            cv2.normalize(hist, hist)
+            if previous_hist is not None:
+                distance = float(cv2.compareHist(
+                    previous_hist, hist, cv2.HISTCMP_BHATTACHARYYA
+                ))
+                if distance >= threshold and frame_idx - last_cut >= min_gap_frames:
+                    cuts.append(frame_idx)
+                    last_cut = frame_idx
+            previous_hist = hist
+            frame_idx += 1
+    finally:
+        reader.release()
+    return cuts
+
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
@@ -991,6 +1029,59 @@ class ThumbnailStripThread(QThread):
                 finally:
                     reader.release()
             self.thumbnails_ready.emit(path, frames)
+
+
+class SceneDetectThread(QThread):
+    """Run histogram-based scene detection off the GUI thread."""
+    scenes_ready = pyqtSignal(str, object)
+    scenes_failed = pyqtSignal(str, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._mutex = QMutex()
+        self._cond = QWaitCondition()
+        self._pending: tuple[str, str, bool, bool, float, int] | None = None
+        self._running = True
+
+    def request(self, path: str, backend: str, hardware_accel: bool,
+                exact_seek: bool, threshold: float,
+                min_gap_frames: int) -> None:
+        self._mutex.lock()
+        self._pending = (path, backend, hardware_accel, exact_seek,
+                         threshold, min_gap_frames)
+        self._mutex.unlock()
+        self._cond.wakeOne()
+
+    def stop(self) -> None:
+        self._mutex.lock()
+        self._running = False
+        self._mutex.unlock()
+        self._cond.wakeOne()
+        self.wait(3000)
+
+    def run(self) -> None:
+        while True:
+            self._mutex.lock()
+            while self._running and self._pending is None:
+                self._cond.wait(self._mutex)
+            if not self._running:
+                self._mutex.unlock()
+                break
+            pending = self._pending
+            self._pending = None
+            self._mutex.unlock()
+
+            if pending is None:
+                continue
+            path, backend, hardware_accel, exact_seek, threshold, min_gap = pending
+            try:
+                cuts = detect_scene_cuts(
+                    path, backend, hardware_accel, exact_seek,
+                    threshold, min_gap,
+                )
+                self.scenes_ready.emit(path, cuts)
+            except Exception as exc:
+                self.scenes_failed.emit(path, str(exc))
 
 
 # ── Mark Slider ───────────────────────────────────────────────────────────────
@@ -1419,6 +1510,10 @@ class MainWindow(QMainWindow):
         self._thumbnail_thread = ThumbnailStripThread(self)
         self._thumbnail_thread.thumbnails_ready.connect(self._on_thumbnails_ready)
         self._thumbnail_thread.start()
+        self._scene_thread = SceneDetectThread(self)
+        self._scene_thread.scenes_ready.connect(self._on_scenes_ready)
+        self._scene_thread.scenes_failed.connect(self._on_scenes_failed)
+        self._scene_thread.start()
         self._pending_hover_pos = QPoint()
 
         self._build_menu()
@@ -1445,6 +1540,7 @@ class MainWindow(QMainWindow):
 
         edit_menu = mb.addMenu("Edit")
         edit_menu.addAction(self._make_act("Mark Current Frame", self.mark_frame))
+        edit_menu.addAction(self._make_act("Auto-mark Scene Cuts", self.auto_mark_scenes))
         edit_menu.addAction(self._make_act("Clear All Marks",    self.clear_marks))
         edit_menu.addSeparator()
         edit_menu.addAction(self._make_act("Copy Current Frame to Clipboard",
@@ -2280,6 +2376,38 @@ class MainWindow(QMainWindow):
         self._hover_popup.move(x, y)
         self._hover_popup.show()
 
+    # ── Scene detection ──────────────────────────────────────────────────────
+
+    def auto_mark_scenes(self):
+        if not self.cap or not self._video_path:
+            QMessageBox.information(self, "No Video", "Open a video before detecting scene cuts.")
+            return
+        if self.is_playing:
+            self.toggle_play()
+        min_gap = max(1, int(round(self.fps * 0.5)))
+        self._set_status("Detecting scene cuts...", BLUE)
+        self._scene_thread.request(
+            self._video_path, self._backend, self._hardware_accel,
+            self._seek_mode == "Exact frame", 0.45, min_gap,
+        )
+
+    def _on_scenes_ready(self, path: str, cuts):
+        if path != self._video_path:
+            return
+        if not cuts:
+            self._set_status("No scene cuts detected.", YELLOW)
+            return
+        original_position = self.current_frame
+        for frame_idx in cuts:
+            self._show(frame_idx)
+            self.mark_frame()
+        self._show(original_position)
+        self._set_status(f"Auto-marked {len(cuts)} scene cut{'s' if len(cuts) != 1 else ''}.", GREEN)
+
+    def _on_scenes_failed(self, path: str, error: str):
+        if path == self._video_path:
+            self._set_status(f"Scene detection failed: {error}", YELLOW)
+
     # ── Marking ───────────────────────────────────────────────────────────────
 
     def mark_frame(self):
@@ -2725,6 +2853,7 @@ class MainWindow(QMainWindow):
         self._waveform_thread.stop()
         self._proxy_thread.stop()
         self._thumbnail_thread.stop()
+        self._scene_thread.stop()
         if self.cap:
             self.cap.release()
         super().closeEvent(event)
