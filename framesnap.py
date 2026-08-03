@@ -341,6 +341,7 @@ def apply_template(template: str, stem: str, frame_idx: int,
 
 
 BACKEND_OPTIONS = ["Auto", "OpenCV"] + (["PyAV"] if av is not None else [])
+SEEK_OPTIONS = ["Exact frame", "Fast keyframe"]
 
 
 def _hardware_backend_name() -> str:
@@ -355,12 +356,14 @@ class VideoReader:
     """Small common reader API for OpenCV and optional PyAV decoding."""
 
     def __init__(self, path: str, backend: str = "Auto",
-                 hardware_accel: bool = False):
+                 hardware_accel: bool = False,
+                 exact_seek: bool = True):
         self.path = path
         self.backend_name = ""
         self.audio_tracks: int | None = None
         self.hardware_accel = False
         self.hardware_fallback = False
+        self.exact_seek = exact_seek
         self._cv_cap: cv2.VideoCapture | None = None
         self._container = None
         self._stream = None
@@ -488,9 +491,10 @@ class VideoReader:
         time_base = float(self._stream.time_base or 1 / 90_000)
         timestamp = int((idx / self.fps) / time_base) if self.fps > 0 else 0
         self._container.seek(max(0, timestamp), stream=self._stream,
-                             any_frame=False, backward=True)
+                             any_frame=not self.exact_seek,
+                             backward=self.exact_seek)
         self._decoder = self._container.decode(self._stream)
-        self._seek_target = idx
+        self._seek_target = idx if self.exact_seek else None
         self._current_frame = idx - 1
         self._decode_index = max(0, idx - 1)
 
@@ -547,9 +551,10 @@ def _probe_audio_tracks(path: str) -> int | None:
 
 
 def open_cap(path: str, backend: str = "Auto",
-             hardware_accel: bool = False) -> VideoReader | None:
+             hardware_accel: bool = False,
+             exact_seek: bool = True) -> VideoReader | None:
     try:
-        return VideoReader(path, backend, hardware_accel)
+        return VideoReader(path, backend, hardware_accel, exact_seek)
     except (OSError, RuntimeError, ValueError):
         return None
 
@@ -629,6 +634,7 @@ def load_config() -> dict:
         "speed": "1x",
         "backend": "Auto",
         "hardware_accel": False,
+        "seek_mode": "Exact frame",
     }
     if CONFIG_PATH.exists():
         try:
@@ -685,14 +691,17 @@ class PreviewThread(QThread):
         self._pending_path: str | None = None
         self._pending_backend = "Auto"
         self._pending_hardware = False
+        self._pending_exact_seek = True
         self._running = True
 
     def open_video(self, path: str, backend: str = "Auto",
-                   hardware_accel: bool = False) -> None:
+                   hardware_accel: bool = False,
+                   exact_seek: bool = True) -> None:
         self._mutex.lock()
         self._pending_path = path
         self._pending_backend = backend
         self._pending_hardware = hardware_accel
+        self._pending_exact_seek = exact_seek
         self._mutex.unlock()
         self._cond.wakeOne()
 
@@ -723,6 +732,7 @@ class PreviewThread(QThread):
             idx   = self._pending_frame
             backend = self._pending_backend
             hardware_accel = self._pending_hardware
+            exact_seek = self._pending_exact_seek
             self._pending_path  = None
             self._pending_frame = -1
             self._mutex.unlock()
@@ -730,7 +740,7 @@ class PreviewThread(QThread):
             if path is not None:
                 if self._cap:
                     self._cap.release()
-                self._cap = open_cap(path, backend, hardware_accel)
+                self._cap = open_cap(path, backend, hardware_accel, exact_seek)
 
             if idx >= 0 and self._cap and self._cap.isOpened():
                 self._cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -1120,6 +1130,9 @@ class MainWindow(QMainWindow):
         if self._backend not in BACKEND_OPTIONS:
             self._backend = "Auto"
         self._hardware_accel = bool(self._cfg.get("hardware_accel", False))
+        self._seek_mode = self._cfg.get("seek_mode", "Exact frame")
+        if self._seek_mode not in SEEK_OPTIONS:
+            self._seek_mode = "Exact frame"
 
         # Video state
         self.cap: VideoReader | None = None
@@ -1258,6 +1271,15 @@ class MainWindow(QMainWindow):
         self._hardware_check.setEnabled(av is not None)
         self._hardware_check.toggled.connect(self._hardware_toggled)
         top_bar.addWidget(self._hardware_check)
+        top_bar.addWidget(QLabel("Seek:"))
+        self._seek_combo = QComboBox()
+        self._seek_combo.addItems(SEEK_OPTIONS)
+        self._seek_combo.setFixedHeight(30)
+        self._seek_combo.setToolTip(
+            "Exact frame decodes forward from a keyframe; Fast keyframe returns sooner."
+        )
+        self._seek_combo.currentTextChanged.connect(self._seek_changed)
+        top_bar.addWidget(self._seek_combo)
         left.addLayout(top_bar)
 
         self._info_bar = QLabel("")
@@ -1581,6 +1603,9 @@ class MainWindow(QMainWindow):
         self._hardware_check.blockSignals(True)
         self._hardware_check.setChecked(self._hardware_accel)
         self._hardware_check.blockSignals(False)
+        self._seek_combo.blockSignals(True)
+        self._seek_combo.setCurrentText(self._seek_mode)
+        self._seek_combo.blockSignals(False)
         overlay_on = cfg.get("show_overlay", True)
         self._act_overlay.setChecked(overlay_on)
         self.display.set_show_overlay(overlay_on)
@@ -1625,6 +1650,27 @@ class MainWindow(QMainWindow):
             else:
                 self._set_status(f"Decoder: {self.cap.backend_name}", BLUE)
 
+    def _seek_changed(self, mode: str):
+        if mode not in SEEK_OPTIONS:
+            return
+        previous = self._seek_mode
+        self._seek_mode = mode
+        self._cfg["seek_mode"] = mode
+        save_config(self._cfg)
+        if self._video_path and self.cap:
+            if not self._open_path(self._video_path,
+                                   start_frame=self.current_frame,
+                                   preserve_marks=True,
+                                   record_recent=False):
+                self._seek_mode = previous
+                self._cfg["seek_mode"] = previous
+                save_config(self._cfg)
+                self._seek_combo.blockSignals(True)
+                self._seek_combo.setCurrentText(previous)
+                self._seek_combo.blockSignals(False)
+            else:
+                self._set_status(f"Seek mode: {self._seek_mode}", BLUE)
+
     # ── Video loading ─────────────────────────────────────────────────────────
 
     def open_video(self):
@@ -1641,7 +1687,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Not Found", f"File not found:\n{path}")
             return False
 
-        cap = open_cap(path, self._backend, self._hardware_accel)
+        cap = open_cap(
+            path, self._backend, self._hardware_accel,
+            self._seek_mode == "Exact frame",
+        )
         if cap is None or not cap.isOpened():
             QMessageBox.critical(self, "Error",
                                  f"Cannot open video:\n{path}\n\n"
@@ -1714,7 +1763,10 @@ class MainWindow(QMainWindow):
                   self._mark_btn, self._copy_btn):
             b.setEnabled(True)
 
-        self._preview_thread.open_video(path, self._backend, self._hardware_accel)
+        self._preview_thread.open_video(
+            path, self._backend, self._hardware_accel,
+            self._seek_mode == "Exact frame",
+        )
         self._waveform.set_loading()
         self._waveform_thread.request(path)
         self._show(target_frame)

@@ -51,6 +51,20 @@ def test_reader_seek_is_frame_accurate(tmp_path, backend):
     assert abs(float(frame.mean()) - 120.0) < 12.0
 
 
+@pytest.mark.parametrize("exact_seek", [True, False])
+def test_reader_seek_mode_is_explicit(tmp_path, exact_seek):
+    if pyav is None:
+        pytest.skip("PyAV is optional")
+    path = tmp_path / "seek-mode.mp4"
+    _write_test_video(path)
+    reader = open_cap(str(path), "PyAV", exact_seek=exact_seek)
+    assert reader is not None and reader.exact_seek is exact_seek
+    assert reader.set(cv2.CAP_PROP_POS_FRAMES, 3)
+    ok, frame = reader.read()
+    reader.release()
+    assert ok and frame is not None
+
+
 def test_auto_reader_and_hardware_request(tmp_path):
     path = tmp_path / "auto-test.mp4"
     _write_test_video(path)
