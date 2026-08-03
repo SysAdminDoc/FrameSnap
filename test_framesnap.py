@@ -19,7 +19,11 @@ from framesnap import (
     extract_chapters,
     ffmpeg_extract_command,
     frame_to_ms,
+    diff_session_data,
+    merge_session_data,
     ms_to_ts,
+    session_template_from_data,
+    template_to_marks,
     open_cap,
     parse_tags,
     proxy_cache_path,
@@ -75,6 +79,51 @@ def test_ffmpeg_command_echo_is_replayable():
         'ffmpeg -ss 1.000 -i "C:\\Videos\\sample clip.mp4" '
         '-frames:v 1 -y "C:\\Exports\\sample_000025.png"'
     )
+
+
+def test_session_merge_and_diff_preserve_mark_metadata():
+    left = {
+        "version": "2.1", "video_path": r"C:\clip.mp4", "position": 4,
+        "marks": [
+            {"frame": 4, "label": "hero", "tags": "wide",
+             "comment": "first note", "color": "#cba6f7"},
+            {"frame": 20, "label": "left-only", "color": "#f38ba8"},
+        ],
+    }
+    right = {
+        "version": "2.1", "video_path": r"C:\clip.mp4", "position": 9,
+        "marks": [
+            {"frame": 4, "label": "", "tags": "hero",
+             "comment": "second note", "color": "#cba6f7"},
+            {"frame": 30, "label": "right-only", "color": "#a6e3a1"},
+        ],
+    }
+    merged = merge_session_data(left, right)
+    assert [mark["frame"] for mark in merged["marks"]] == [4, 20, 30]
+    shared = merged["marks"][0]
+    assert shared["label"] == "hero"
+    assert shared["tags"] == "wide, hero"
+    assert shared["comment"] == "first note\nsecond note"
+    differences = diff_session_data(left, right)
+    assert [change["kind"] for change in differences] == [
+        "changed", "only-left", "only-right"
+    ]
+
+
+def test_session_template_round_trips_relative_timestamps():
+    session = {
+        "video_path": "clip.mp4",
+        "marks": [
+            {"frame": 0, "label": "start", "color": "#cba6f7"},
+            {"frame": 30, "label": "later", "tags": "hero"},
+        ],
+    }
+    template = session_template_from_data(session, 10.0)
+    assert [mark["time_ms"] for mark in template["marks"]] == [0.0, 3000.0]
+    applied = template_to_marks(template, 20.0, total_frames=100)
+    assert [mark["frame"] for mark in applied] == [0, 60]
+    assert applied[1]["label"] == "later"
+    assert applied[1]["tags"] == "hero"
 
 
 def test_export_codecs_write_avif_tiff16_and_exr(tmp_path):

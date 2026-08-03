@@ -18,6 +18,8 @@ All notable changes to FrameSnap will be documented in this file.
 - Added: animated WebP export, AVIF still export, and configurable contact-sheet title,
   watermark, columns, and PDF output.
 - Added: per-mark FFmpeg extraction command echo for scripted replay.
+- Added: same-video session merge and frame-level session diff actions.
+- Added: relative-timestamp session templates that can be applied to another video.
 - Fixed: frozen PyInstaller builds no longer recursively invoke the dependency bootstrapper.
 
 ## [v2.1.0] - %Y->- (HEAD -> main, origin/main)

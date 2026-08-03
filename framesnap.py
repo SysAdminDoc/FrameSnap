@@ -377,6 +377,192 @@ def export_sequence(marked: dict, group: str = "All") -> dict[int, int]:
     }
 
 
+SESSION_VERSION = "2.1"
+TEMPLATE_VERSION = "1"
+
+
+def _clean_session_mark(entry: dict, frame: int) -> dict:
+    return {
+        "frame": int(frame),
+        "label": str(entry.get("label", "")).strip(),
+        "color": str(entry.get("color", MAUVE)),
+        "tags": ", ".join(parse_tags(str(entry.get("tags", "")))),
+        "comment": str(entry.get("comment", "")).strip(),
+    }
+
+
+def normalize_session_data(data: dict) -> dict:
+    """Validate and normalize a .fsnap payload for interchange operations."""
+    if not isinstance(data, dict):
+        raise ValueError("Session payload must be a JSON object")
+    marks = {}
+    for entry in data.get("marks", []):
+        if not isinstance(entry, dict):
+            continue
+        try:
+            frame = int(entry.get("frame", 0))
+        except (TypeError, ValueError):
+            continue
+        if frame < 0:
+            continue
+        marks[frame] = _clean_session_mark(entry, frame)
+    try:
+        position = max(0, int(data.get("position", 0)))
+    except (TypeError, ValueError):
+        position = 0
+    return {
+        "version": str(data.get("version", SESSION_VERSION)),
+        "video_path": str(data.get("video_path", "")),
+        "position": position,
+        "marks": [marks[idx] for idx in sorted(marks)],
+    }
+
+
+def read_session_file(path: str | Path) -> dict:
+    return normalize_session_data(
+        json.loads(Path(path).read_text(encoding="utf-8"))
+    )
+
+
+def session_data_from_marks(video_path: str, position: int,
+                            marked: dict) -> dict:
+    return normalize_session_data({
+        "version": SESSION_VERSION,
+        "video_path": video_path,
+        "position": position,
+        "marks": [
+            {"frame": idx, "label": mark.get("label", ""),
+             "color": mark.get("color", MAUVE),
+             "tags": mark.get("tags", ""),
+             "comment": mark.get("comment", "")}
+            for idx, mark in sorted(marked.items())
+        ],
+    })
+
+
+def session_video_key(path: str) -> str:
+    if not path:
+        return ""
+    return os.path.normcase(os.path.abspath(os.path.expanduser(path)))
+
+
+def merge_session_data(left: dict, right: dict) -> dict:
+    """Merge two normalized sessions, using the left mark as the primary."""
+    left = normalize_session_data(left)
+    right = normalize_session_data(right)
+    if session_video_key(left["video_path"]) != session_video_key(right["video_path"]):
+        raise ValueError("Sessions reference different videos")
+
+    by_frame = {
+        mark["frame"]: dict(mark) for mark in left["marks"]
+    }
+    for incoming in right["marks"]:
+        current = by_frame.get(incoming["frame"])
+        if current is None:
+            by_frame[incoming["frame"]] = dict(incoming)
+            continue
+        current["label"] = current["label"] or incoming["label"]
+        current["color"] = current["color"] or incoming["color"]
+        current["tags"] = ", ".join(parse_tags(
+            f"{current['tags']}, {incoming['tags']}"
+        ))
+        if incoming["comment"] and incoming["comment"] != current["comment"]:
+            if current["comment"]:
+                current["comment"] += f"\n{incoming['comment']}"
+            else:
+                current["comment"] = incoming["comment"]
+    return {
+        "version": left["version"],
+        "video_path": left["video_path"] or right["video_path"],
+        "position": left["position"],
+        "marks": [by_frame[idx] for idx in sorted(by_frame)],
+    }
+
+
+def diff_session_data(left: dict, right: dict) -> list[dict]:
+    """Return frame-level additions, removals, and metadata changes."""
+    left = normalize_session_data(left)
+    right = normalize_session_data(right)
+    left_marks = {mark["frame"]: mark for mark in left["marks"]}
+    right_marks = {mark["frame"]: mark for mark in right["marks"]}
+    differences = []
+    for frame in sorted(set(left_marks) | set(right_marks)):
+        before = left_marks.get(frame)
+        after = right_marks.get(frame)
+        if before is None:
+            differences.append({"frame": frame, "kind": "only-right",
+                                "left": None, "right": after})
+        elif after is None:
+            differences.append({"frame": frame, "kind": "only-left",
+                                "left": before, "right": None})
+        elif before != after:
+            differences.append({"frame": frame, "kind": "changed",
+                                "left": before, "right": after})
+    return differences
+
+
+def session_template_from_data(data: dict, fps: float) -> dict:
+    if fps <= 0:
+        raise ValueError("Template export requires a positive frame rate")
+    normalized = normalize_session_data(data)
+    return {
+        "version": TEMPLATE_VERSION,
+        "marks": [
+            {key: mark[key] for key in ("time_ms", "label", "color", "tags", "comment")}
+            for mark in [
+                {"time_ms": round(frame_to_ms(item["frame"], fps), 3), **item}
+                for item in normalized["marks"]
+            ]
+        ],
+    }
+
+
+def normalize_template_data(data: dict) -> dict:
+    if not isinstance(data, dict):
+        raise ValueError("Template payload must be a JSON object")
+    marks = []
+    for entry in data.get("marks", []):
+        if not isinstance(entry, dict):
+            continue
+        try:
+            time_ms = float(entry.get("time_ms", 0))
+        except (TypeError, ValueError):
+            continue
+        if time_ms < 0:
+            continue
+        marks.append({
+            "time_ms": time_ms,
+            **_clean_session_mark(entry, 0),
+        })
+    return {"version": str(data.get("version", TEMPLATE_VERSION)), "marks": marks}
+
+
+def read_template_file(path: str | Path) -> dict:
+    return normalize_template_data(
+        json.loads(Path(path).read_text(encoding="utf-8"))
+    )
+
+
+def template_to_marks(template: dict, fps: float,
+                      total_frames: int = 0) -> list[dict]:
+    if fps <= 0:
+        raise ValueError("Template application requires a positive frame rate")
+    normalized = normalize_template_data(template)
+    marks = {}
+    for entry in normalized["marks"]:
+        frame = max(0, round(entry["time_ms"] * fps / 1000.0))
+        if total_frames > 0 and frame >= total_frames:
+            continue
+        marks[frame] = {
+            "frame": frame,
+            "label": entry["label"],
+            "color": entry["color"],
+            "tags": entry["tags"],
+            "comment": entry["comment"],
+        }
+    return [marks[idx] for idx in sorted(marks)]
+
+
 def crop_frame(frame: np.ndarray, x: int, y: int,
                width: int, height: int) -> np.ndarray:
     """Return a clamped copy of a crop rectangle, or the original frame."""
@@ -1680,6 +1866,15 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(self._make_act("Save Session...", self.save_session))
         file_menu.addAction(self._make_act("Load Session...", self.load_session))
+        file_menu.addAction(self._make_act("Merge Sessions...", self.merge_sessions))
+        file_menu.addAction(self._make_act("Compare Sessions...", self.diff_sessions))
+        file_menu.addSeparator()
+        file_menu.addAction(self._make_act(
+            "Save Session Template...", self.save_session_template
+        ))
+        file_menu.addAction(self._make_act(
+            "Apply Session Template...", self.apply_session_template
+        ))
         file_menu.addSeparator()
         file_menu.addAction(self._make_act("Exit", self.close))
 
@@ -3198,6 +3393,49 @@ class MainWindow(QMainWindow):
 
     # ── Session ───────────────────────────────────────────────────────────────
 
+    def _apply_session_data(self, data: dict) -> bool:
+        data = normalize_session_data(data)
+        video = data["video_path"]
+        if video and session_video_key(video) != session_video_key(self._video_path):
+            if not self._open_path(video):
+                return False
+        if not self.cap:
+            QMessageBox.warning(self, "No Video", "Open the session's video first.")
+            return False
+
+        self.clear_marks()
+        for entry in data["marks"]:
+            fidx = entry["frame"]
+            if self.total_frames > 0 and fidx >= self.total_frames:
+                continue
+            self.current_frame = fidx
+            cached = self._cache.get(fidx)
+            if cached is None:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+                ret, frame = self.cap.read()
+                if not ret:
+                    continue
+                self._last_bgr = frame
+                self._cache.put(fidx, frame)
+            else:
+                self._last_bgr = cached
+            self.mark_frame()
+            if fidx not in self.marked:
+                continue
+            self.marked[fidx]["label"] = entry["label"]
+            self.marked[fidx]["widget"].update_label(entry["label"])
+            self.marked[fidx]["tags"] = entry["tags"]
+            self.marked[fidx]["widget"].update_tags(entry["tags"])
+            self.marked[fidx]["comment"] = entry["comment"]
+            self.marked[fidx]["widget"].update_comment(entry["comment"])
+            self._set_mark_color(fidx, entry["color"])
+
+        self._refresh_group_filter()
+        pos = data["position"]
+        self._show(min(pos, max(0, self.total_frames - 1))
+                   if self.total_frames else pos)
+        return True
+
     def save_session(self):
         if not self._video_path:
             QMessageBox.warning(self, "No Video", "Open a video before saving a session.")
@@ -3209,17 +3447,9 @@ class MainWindow(QMainWindow):
             return
         if not path.endswith(".fsnap"):
             path += ".fsnap"
-        data = {
-            "version":     "2.1",
-            "video_path":  self._video_path,
-            "position":    self.current_frame,
-            "marks": [
-                {"frame": idx, "label": m["label"], "color": m["color"],
-                 "tags": m.get("tags", ""),
-                 "comment": m.get("comment", "")}
-                for idx, m in sorted(self.marked.items())
-            ],
-        }
+        data = session_data_from_marks(
+            self._video_path, self.current_frame, self.marked
+        )
         Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
         self._set_status(f"Session saved: {Path(path).name}", GREEN)
 
@@ -3230,51 +3460,139 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            data = read_session_file(path)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not read session:\n{e}")
             return
+        if self._apply_session_data(data):
+            self._set_status(f"Session loaded: {len(self.marked)} marks.", GREEN)
 
-        video = data.get("video_path", "")
-        if video and video != self._video_path:
-            self._open_path(video)
-            if not self.cap:
-                return
+    def merge_sessions(self):
+        first, _ = QFileDialog.getOpenFileName(
+            self, "Select First Session", "", "FrameSnap Session (*.fsnap)"
+        )
+        if not first:
+            return
+        second, _ = QFileDialog.getOpenFileName(
+            self, "Select Second Session", "", "FrameSnap Session (*.fsnap)"
+        )
+        if not second:
+            return
+        try:
+            left = read_session_file(first)
+            right = read_session_file(second)
+            merged = merge_session_data(left, right)
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            QMessageBox.critical(self, "Merge Failed", str(e))
+            return
+        if not self._apply_session_data(merged):
+            return
+        overlap = len({mark["frame"] for mark in left["marks"]}
+                       & {mark["frame"] for mark in right["marks"]})
+        self._set_status(
+            f"Merged {len(merged['marks'])} marks ({overlap} overlapping).", GREEN
+        )
 
-        self.clear_marks()
-        for entry in data.get("marks", []):
-            fidx  = entry.get("frame", 0)
-            label = entry.get("label", "")
-            color = entry.get("color", MAUVE)
-            tags  = ", ".join(parse_tags(entry.get("tags", "")))
-            comment = str(entry.get("comment", "")).strip()
-            if 0 <= fidx < max(self.total_frames, fidx + 1):
-                # Temporarily set current_frame so mark_frame() uses it
-                self.current_frame = fidx
-                cached = self._cache.get(fidx)
-                if cached is None:
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
-                    ret, frame = self.cap.read()
-                    if ret:
-                        self._last_bgr = frame
-                        self._cache.put(fidx, frame)
-                else:
-                    self._last_bgr = cached
+    def diff_sessions(self):
+        first, _ = QFileDialog.getOpenFileName(
+            self, "Select First Session", "", "FrameSnap Session (*.fsnap)"
+        )
+        if not first:
+            return
+        second, _ = QFileDialog.getOpenFileName(
+            self, "Select Second Session", "", "FrameSnap Session (*.fsnap)"
+        )
+        if not second:
+            return
+        try:
+            left = read_session_file(first)
+            right = read_session_file(second)
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            QMessageBox.critical(self, "Compare Failed", str(e))
+            return
+        if session_video_key(left["video_path"]) != session_video_key(right["video_path"]):
+            QMessageBox.warning(
+                self, "Different Videos",
+                "The sessions reference different videos and cannot be compared.",
+            )
+            return
+        differences = diff_session_data(left, right)
+        lines = [
+            f"{len(differences)} difference{'s' if len(differences) != 1 else ''}.",
+            f"Video: {left['video_path'] or '(unspecified)'}",
+            "",
+        ]
+        for change in differences:
+            frame = change["frame"]
+            if change["kind"] == "only-left":
+                lines.append(f"Frame {frame:,}: only in first session")
+            elif change["kind"] == "only-right":
+                lines.append(f"Frame {frame:,}: only in second session")
+            else:
+                lines.append(f"Frame {frame:,}: metadata changed")
+                lines.append(f"  first:  {change['left']}")
+                lines.append(f"  second: {change['right']}")
+        QMessageBox.information(self, "Session Diff", "\n".join(lines))
+
+    def save_session_template(self):
+        if not self._video_path or not self.marked:
+            QMessageBox.warning(self, "No Marks", "Mark frames before saving a template.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Session Template", "", "FrameSnap Template (*.fstpl)"
+        )
+        if not path:
+            return
+        if not path.endswith(".fstpl"):
+            path += ".fstpl"
+        data = session_template_from_data(
+            session_data_from_marks(self._video_path, 0, self.marked), self.fps
+        )
+        Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+        self._set_status(f"Template saved: {Path(path).name}", GREEN)
+
+    def apply_session_template(self):
+        if not self.cap:
+            QMessageBox.warning(self, "No Video", "Open a video before applying a template.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Apply Session Template", "", "FrameSnap Template (*.fstpl)"
+        )
+        if not path:
+            return
+        try:
+            template = read_template_file(path)
+            entries = template_to_marks(template, self.fps, self.total_frames)
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            QMessageBox.critical(self, "Template Failed", str(e))
+            return
+        original_position = self.current_frame
+        added = 0
+        updated = 0
+        for entry in entries:
+            fidx = entry["frame"]
+            if fidx not in self.marked:
+                self._show(fidx)
+                before = len(self.marked)
                 self.mark_frame()
-                if fidx in self.marked:
-                    if label:
-                        self.marked[fidx]["label"] = label
-                        self.marked[fidx]["widget"].update_label(label)
-                    self.marked[fidx]["tags"] = tags
-                    self.marked[fidx]["widget"].update_tags(tags)
-                    self.marked[fidx]["comment"] = comment
-                    self.marked[fidx]["widget"].update_comment(comment)
-                    self._set_mark_color(fidx, color)
-
+                if len(self.marked) == before or fidx not in self.marked:
+                    continue
+                added += 1
+            else:
+                updated += 1
+            mark = self.marked[fidx]
+            mark["label"] = entry["label"]
+            mark["widget"].update_label(entry["label"])
+            mark["tags"] = entry["tags"]
+            mark["widget"].update_tags(entry["tags"])
+            mark["comment"] = entry["comment"]
+            mark["widget"].update_comment(entry["comment"])
+            self._set_mark_color(fidx, entry["color"])
         self._refresh_group_filter()
-        pos = data.get("position", 0)
-        self._show(min(pos, max(0, self.total_frames - 1)) if self.total_frames else pos)
-        self._set_status(f"Session loaded: {len(self.marked)} marks.", GREEN)
+        self._show(original_position)
+        self._set_status(
+            f"Applied template: {added} added, {updated} updated.", GREEN
+        )
 
     # ── View toggles ──────────────────────────────────────────────────────────
 
