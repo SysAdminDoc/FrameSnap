@@ -1416,11 +1416,12 @@ class FrameItemWidget(QWidget):
 
     def __init__(self, frame_idx: int, fps: float,
                  thumb: QPixmap | None, label: str = "",
-                 color: str = MAUVE, tags: str = "", parent=None):
+                 color: str = MAUVE, tags: str = "", comment: str = "",
+                 parent=None):
         super().__init__(parent)
         self.frame_idx = frame_idx
         self.fps       = fps
-        self.setFixedHeight(72)
+        self.setFixedHeight(90)
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 6, 0)
@@ -1460,10 +1461,14 @@ class FrameItemWidget(QWidget):
         self._label_lbl.setVisible(bool(label))
         self._tags_lbl = QLabel()
         self._tags_lbl.setStyleSheet(f"color: {TEAL}; font-size: 10px;")
+        self._comment_lbl = QLabel()
+        self._comment_lbl.setStyleSheet(f"color: {SUBTEXT0}; font-size: 10px;")
+        self._comment_lbl.setToolTip(comment)
         info.addWidget(self._ts_lbl)
         info.addWidget(self._frame_lbl)
         info.addWidget(self._label_lbl)
         info.addWidget(self._tags_lbl)
+        info.addWidget(self._comment_lbl)
         inner.addLayout(info)
         inner.addStretch()
 
@@ -1494,6 +1499,8 @@ class FrameItemWidget(QWidget):
         inner.addWidget(del_btn)
 
         self.set_color(color)
+        self.update_tags(tags)
+        self.update_comment(comment)
 
     def set_color(self, color_hex: str):
         self._color_bar.setStyleSheet(
@@ -1507,6 +1514,11 @@ class FrameItemWidget(QWidget):
     def update_tags(self, tags: str):
         self._tags_lbl.setText("  ".join(f"#{tag}" for tag in parse_tags(tags)))
         self._tags_lbl.setVisible(bool(tags.strip()))
+
+    def update_comment(self, comment: str):
+        self._comment_lbl.setText(comment.strip())
+        self._comment_lbl.setToolTip(comment.strip())
+        self._comment_lbl.setVisible(bool(comment.strip()))
 
 
 # ── Main Window ───────────────────────────────────────────────────────────────
@@ -2512,7 +2524,7 @@ class MainWindow(QMainWindow):
         widget.jump_requested.connect(self._jump_to)
 
         list_item = QListWidgetItem()
-        list_item.setSizeHint(QSize(0, 78))
+        list_item.setSizeHint(QSize(0, 90))
         list_item.setData(Qt.ItemDataRole.UserRole, idx)
 
         pos = self._marks_list.count()
@@ -2524,7 +2536,7 @@ class MainWindow(QMainWindow):
         self._marks_list.setItemWidget(list_item, widget)
         self.marked[idx] = {
             "item": list_item, "widget": widget, "label": "",
-            "color": color, "tags": "",
+            "color": color, "tags": "", "comment": "",
         }
 
         self.slider.set_marks({k: v["color"] for k, v in self.marked.items()})
@@ -2599,6 +2611,7 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         act_label = menu.addAction("Edit Label...")
         act_tags = menu.addAction("Edit Tags...")
+        act_comment = menu.addAction("Edit Comment...")
         # Color submenu
         color_menu = menu.addMenu("Set Color")
         color_acts = {}
@@ -2619,6 +2632,8 @@ class MainWindow(QMainWindow):
             self._edit_label(idx)
         elif chosen == act_tags:
             self._edit_tags(idx)
+        elif chosen == act_comment:
+            self._edit_comment(idx)
         elif chosen == act_del:
             self._remove_mark(idx)
         elif chosen in color_acts:
@@ -2670,6 +2685,18 @@ class MainWindow(QMainWindow):
             self.marked[idx]["tags"] = tags
             self.marked[idx]["widget"].update_tags(tags)
             self._refresh_group_filter()
+
+    def _edit_comment(self, idx: int):
+        if idx not in self.marked:
+            return
+        text, ok = QInputDialog.getMultiLineText(
+            self, "Edit Comment", "Shot note for this mark:",
+            self.marked[idx].get("comment", ""),
+        )
+        if ok:
+            comment = text.strip()
+            self.marked[idx]["comment"] = comment
+            self.marked[idx]["widget"].update_comment(comment)
 
     # ── Clipboard ─────────────────────────────────────────────────────────────
 
@@ -2900,7 +2927,8 @@ class MainWindow(QMainWindow):
             "position":    self.current_frame,
             "marks": [
                 {"frame": idx, "label": m["label"], "color": m["color"],
-                 "tags": m.get("tags", "")}
+                 "tags": m.get("tags", ""),
+                 "comment": m.get("comment", "")}
                 for idx, m in sorted(self.marked.items())
             ],
         }
@@ -2931,6 +2959,7 @@ class MainWindow(QMainWindow):
             label = entry.get("label", "")
             color = entry.get("color", MAUVE)
             tags  = ", ".join(parse_tags(entry.get("tags", "")))
+            comment = str(entry.get("comment", "")).strip()
             if 0 <= fidx < max(self.total_frames, fidx + 1):
                 # Temporarily set current_frame so mark_frame() uses it
                 self.current_frame = fidx
@@ -2950,6 +2979,8 @@ class MainWindow(QMainWindow):
                         self.marked[fidx]["widget"].update_label(label)
                     self.marked[fidx]["tags"] = tags
                     self.marked[fidx]["widget"].update_tags(tags)
+                    self.marked[fidx]["comment"] = comment
+                    self.marked[fidx]["widget"].update_comment(comment)
                     self._set_mark_color(fidx, color)
 
         self._refresh_group_filter()

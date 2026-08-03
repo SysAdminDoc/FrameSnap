@@ -12,6 +12,7 @@ All notable changes to FrameSnap will be documented in this file.
 - Added: background histogram-based scene-cut detection with automatic marks.
 - Added: embedded MP4/MKV chapter starts as labeled marks.
 - Added: comma-separated marker tags with persisted group-filtered exports.
+- Added: timestamped mark comments with visible shot-note metadata and session persistence.
 - Fixed: frozen PyInstaller builds no longer recursively invoke the dependency bootstrapper.
 
 ## [v2.1.0] - %Y->- (HEAD -> main, origin/main)
