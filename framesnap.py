@@ -60,21 +60,21 @@ def _bootstrap():
 
 _bootstrap()
 
-import cv2
-import numpy as np
-from PIL import Image as PilImage
-from PyQt6.QtWidgets import (
+import cv2  # noqa: E402
+import numpy as np  # noqa: E402
+from PIL import Image as PilImage  # noqa: E402
+from PyQt6.QtWidgets import (  # noqa: E402
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QListWidget, QListWidgetItem,
     QFileDialog, QLineEdit, QGroupBox, QSizePolicy, QFrame, QSplitter,
     QMenu, QComboBox, QSpinBox, QInputDialog, QMessageBox,
     QStyle, QStyleOptionSlider, QTabWidget, QAbstractItemView,
 )
-from PyQt6.QtCore import (
+from PyQt6.QtCore import (  # noqa: E402
     Qt, QTimer, QThread, QMutex, QWaitCondition, pyqtSignal,
     QPoint, QSize, QRect,
 )
-from PyQt6.QtGui import (, QIcon
+from PyQt6.QtGui import (  # noqa: E402
     QPixmap, QImage, QIcon, QPainter, QColor, QFont, QAction,
     QDragEnterEvent, QDropEvent,
 )
@@ -601,8 +601,10 @@ class VideoDisplay(QLabel):
 
     def wheelEvent(self, event):
         d = event.angleDelta().y()
-        if d > 0:   self.wheel_delta.emit(-1)
-        elif d < 0: self.wheel_delta.emit(1)
+        if d > 0:
+            self.wheel_delta.emit(-1)
+        elif d < 0:
+            self.wheel_delta.emit(1)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         # Accept any file — let cv2 decide if it's valid
@@ -1196,8 +1198,6 @@ class MainWindow(QMainWindow):
         if raw_count > 0:
             self.total_frames = raw_count
         else:
-            # Estimate from duration property (seconds)
-            dur_s = cap.get(cv2.CAP_PROP_POS_AVI_RATIO)
             self.total_frames = 0   # unknown; slider will be disabled
 
         self.current_frame = 0
