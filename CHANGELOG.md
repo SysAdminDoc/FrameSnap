@@ -13,6 +13,7 @@ All notable changes to FrameSnap will be documented in this file.
 - Added: embedded MP4/MKV chapter starts as labeled marks.
 - Added: comma-separated marker tags with persisted group-filtered exports.
 - Added: timestamped mark comments with visible shot-note metadata and session persistence.
+- Added: Ripple Delete action with compact export numbering after mark removal.
 - Fixed: frozen PyInstaller builds no longer recursively invoke the dependency bootstrapper.
 
 ## [v2.1.0] - %Y->- (HEAD -> main, origin/main)

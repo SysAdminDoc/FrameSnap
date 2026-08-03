@@ -357,6 +357,22 @@ def parse_tags(value: str) -> list[str]:
     return tags
 
 
+def ordered_mark_indices(marked: dict, group: str = "All") -> list[int]:
+    return sorted(
+        idx for idx, mark in marked.items()
+        if group == "All" or group in parse_tags(mark.get("tags", ""))
+    )
+
+
+def export_sequence(marked: dict, group: str = "All") -> dict[int, int]:
+    """Assign compact 1-based export numbers after any mark is removed."""
+    return {
+        idx: number for number, idx in enumerate(
+            ordered_mark_indices(marked, group), start=1
+        )
+    }
+
+
 BACKEND_OPTIONS = ["Auto", "OpenCV"] + (["PyAV"] if av is not None else [])
 SEEK_OPTIONS = ["Exact frame", "Fast keyframe"]
 
@@ -2552,6 +2568,14 @@ class MainWindow(QMainWindow):
         self.slider.set_marks({k: v["color"] for k, v in self.marked.items()})
         self._update_marks_ui()
 
+    def _ripple_delete(self, idx: int):
+        if idx not in self.marked:
+            return
+        self._remove_mark(idx)
+        self._set_status(
+            "Ripple deleted mark; subsequent export numbers were compacted.", BLUE
+        )
+
     def _delete_selected(self):
         for item in list(self._marks_list.selectedItems()):
             idx = item.data(Qt.ItemDataRole.UserRole)
@@ -2620,6 +2644,7 @@ class MainWindow(QMainWindow):
             color_acts[ca] = (name, hex_val)
         menu.addSeparator()
         act_del = menu.addAction("Remove")
+        act_ripple = menu.addAction("Ripple Delete")
 
         chosen = menu.exec(self._marks_list.mapToGlobal(pos))
         if chosen is None:
@@ -2636,6 +2661,8 @@ class MainWindow(QMainWindow):
             self._edit_comment(idx)
         elif chosen == act_del:
             self._remove_mark(idx)
+        elif chosen == act_ripple:
+            self._ripple_delete(idx)
         elif chosen in color_acts:
             _, hex_val = color_acts[chosen]
             self._set_mark_color(idx, hex_val)
@@ -2748,10 +2775,7 @@ class MainWindow(QMainWindow):
         if reader is None or not reader.isOpened():
             return results
         try:
-            for idx in sorted(self.marked):
-                if (selected_group != "All"
-                        and selected_group not in parse_tags(self.marked[idx].get("tags", ""))):
-                    continue
+            for idx in ordered_mark_indices(self.marked, selected_group):
                 reader.set(cv2.CAP_PROP_POS_FRAMES, idx)
                 ret, frame = reader.read()
                 if ret:
@@ -2808,9 +2832,12 @@ class MainWindow(QMainWindow):
             self._update_export_config(out_dir, fmt, quality, scale, template, group)
             return
 
-        for n, (idx, frame, label) in enumerate(frames_data, start=1):
+        sequence = export_sequence(self.marked, group)
+        for idx, frame, label in frames_data:
             frame = self._apply_scale(frame, scale)
-            fname = apply_template(template, stem, idx, self.fps, label, n) + ext
+            fname = apply_template(
+                template, stem, idx, self.fps, label, sequence[idx]
+            ) + ext
             ok = cv2.imwrite(os.path.join(out_dir, fname), frame, enc_flags)
             if ok:
                 exported += 1

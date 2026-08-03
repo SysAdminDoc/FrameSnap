@@ -16,6 +16,8 @@ from framesnap import (
     open_cap,
     parse_tags,
     proxy_cache_path,
+    export_sequence,
+    ordered_mark_indices,
     thumbnail_frame_indices,
 )
 
@@ -38,6 +40,11 @@ def test_timestamp_and_template_helpers():
     )
     assert result == "clip_000012_00-00-00-480_hero_close_003"
     assert parse_tags(" hero, HERO, close-up,  ") == ["hero", "close-up"]
+    marked = {
+        2: {"tags": "hero"}, 9: {"tags": "cut"}, 15: {"tags": "hero"}
+    }
+    assert ordered_mark_indices(marked, "hero") == [2, 15]
+    assert export_sequence(marked, "hero") == {2: 1, 15: 2}
 
 
 @pytest.mark.parametrize("backend", ["OpenCV", "PyAV"])
