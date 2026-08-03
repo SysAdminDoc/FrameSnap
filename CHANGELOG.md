@@ -8,6 +8,7 @@ All notable changes to FrameSnap will be documented in this file.
 - Added: background audio waveform analysis and a timeline waveform track under the scrubber.
 - Added: persisted Exact frame and Fast keyframe seek modes for PyAV playback.
 - Added: opt-in cached 1280px proxy playback for large videos while exports read the source.
+- Added: background thumbnail strip sampling with click-to-jump timeline navigation.
 - Fixed: frozen PyInstaller builds no longer recursively invoke the dependency bootstrapper.
 
 ## [v2.1.0] - %Y->- (HEAD -> main, origin/main)

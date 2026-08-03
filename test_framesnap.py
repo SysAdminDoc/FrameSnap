@@ -13,6 +13,7 @@ from framesnap import (
     ms_to_ts,
     open_cap,
     proxy_cache_path,
+    thumbnail_frame_indices,
 )
 
 
@@ -120,3 +121,9 @@ def test_proxy_generation_is_cached_and_downscaled(tmp_path):
     assert int(reader.get(cv2.CAP_PROP_FRAME_HEIGHT)) == 12
     reader.release()
     assert proxy_cache_path(source) == proxy_cache_path(source)
+
+
+def test_thumbnail_indices_cover_the_full_video():
+    assert thumbnail_frame_indices(100, 4) == [0, 33, 66, 99]
+    assert thumbnail_frame_indices(1, 18) == [0]
+    assert thumbnail_frame_indices(0, 18) == []

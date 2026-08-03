@@ -693,6 +693,17 @@ def build_video_proxy(source_path: str, output_path: str | Path,
     return proxy_width, proxy_height
 
 
+def thumbnail_frame_indices(total_frames: int, count: int = 18) -> list[int]:
+    if total_frames <= 0 or count <= 0:
+        return []
+    if count == 1:
+        return [0]
+    return sorted({
+        round(index * (total_frames - 1) / (count - 1))
+        for index in range(count)
+    })
+
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
@@ -920,6 +931,68 @@ class ProxyThread(QThread):
                 self.proxy_failed.emit(source_path, str(exc))
 
 
+class ThumbnailStripThread(QThread):
+    """Decode evenly-spaced scrubber thumbnails away from the UI thread."""
+    thumbnails_ready = pyqtSignal(str, object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._mutex = QMutex()
+        self._cond = QWaitCondition()
+        self._pending: tuple[str, str, bool, bool] | None = None
+        self._running = True
+
+    def request(self, path: str, backend: str, hardware_accel: bool,
+                exact_seek: bool) -> None:
+        self._mutex.lock()
+        self._pending = (path, backend, hardware_accel, exact_seek)
+        self._mutex.unlock()
+        self._cond.wakeOne()
+
+    def stop(self) -> None:
+        self._mutex.lock()
+        self._running = False
+        self._mutex.unlock()
+        self._cond.wakeOne()
+        self.wait(3000)
+
+    def run(self) -> None:
+        while True:
+            self._mutex.lock()
+            while self._running and self._pending is None:
+                self._cond.wait(self._mutex)
+            if not self._running:
+                self._mutex.unlock()
+                break
+            pending = self._pending
+            self._pending = None
+            self._mutex.unlock()
+
+            if pending is None:
+                continue
+            path, backend, hardware_accel, exact_seek = pending
+            reader = open_cap(path, backend, hardware_accel, exact_seek)
+            frames = []
+            if reader is not None and reader.isOpened():
+                try:
+                    for idx in thumbnail_frame_indices(reader.frame_count):
+                        reader.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                        ok, frame = reader.read()
+                        if ok and frame is not None:
+                            h, w = frame.shape[:2]
+                            scale = min(1.0, 150 / max(1, w))
+                            if scale < 1.0:
+                                frame = cv2.resize(
+                                    frame, (max(2, int(w * scale)),
+                                            max(2, int(h * scale))),
+                                    interpolation=cv2.INTER_AREA,
+                                )
+                            frames.append((idx, frame.copy()))
+                finally:
+                    reader.release()
+            self.thumbnails_ready.emit(path, frames)
+
+
 # ── Mark Slider ───────────────────────────────────────────────────────────────
 
 class MarkSlider(QSlider):
@@ -1055,6 +1128,60 @@ class WaveformWidget(QWidget):
         position_x = left + int(self._position * width)
         painter.setPen(QColor(MAUVE))
         painter.drawLine(position_x, 2, position_x, self.height() - 3)
+
+
+class ThumbnailStripWidget(QWidget):
+    """A clickable strip of evenly-spaced frame thumbnails."""
+    frame_clicked = pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(60)
+        self.setMaximumHeight(78)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._frames: list[tuple[int, QPixmap]] = []
+        self._message = "Thumbnail strip loads after opening a video"
+
+    def set_loading(self) -> None:
+        self._frames = []
+        self._message = "Building thumbnail strip..."
+        self.update()
+
+    def set_frames(self, frames) -> None:
+        self._frames = [
+            (idx, bgr_to_pixmap(frame)) for idx, frame in frames
+        ]
+        self._message = "No video frames available" if not self._frames else ""
+        self.update()
+
+    def paintEvent(self, event):
+        del event
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(CRUST))
+        if not self._frames:
+            painter.setPen(QColor(OVERLAY0))
+            painter.setFont(QFont("Segoe UI", 10))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._message)
+            return
+
+        tile_width = max(1, self.width() // len(self._frames))
+        for pos, (_, pixmap) in enumerate(self._frames):
+            tile = QRect(pos * tile_width, 3, tile_width, self.height() - 6)
+            painter.drawPixmap(
+                tile,
+                pixmap.scaled(tile.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                              Qt.TransformationMode.SmoothTransformation),
+            )
+            if pos:
+                painter.setPen(QColor(SURFACE0))
+                painter.drawLine(tile.left(), tile.top(), tile.left(), tile.bottom())
+
+    def mousePressEvent(self, event):
+        if self._frames and event.button() == Qt.MouseButton.LeftButton:
+            tile_width = max(1, self.width() // len(self._frames))
+            pos = max(0, min(len(self._frames) - 1, event.position().x() // tile_width))
+            self.frame_clicked.emit(self._frames[int(pos)][0])
+        super().mousePressEvent(event)
 
 
 # ── Video Display ─────────────────────────────────────────────────────────────
@@ -1289,6 +1416,9 @@ class MainWindow(QMainWindow):
         self._proxy_thread.proxy_ready.connect(self._on_proxy_ready)
         self._proxy_thread.proxy_failed.connect(self._on_proxy_failed)
         self._proxy_thread.start()
+        self._thumbnail_thread = ThumbnailStripThread(self)
+        self._thumbnail_thread.thumbnails_ready.connect(self._on_thumbnails_ready)
+        self._thumbnail_thread.start()
         self._pending_hover_pos = QPoint()
 
         self._build_menu()
@@ -1462,6 +1592,9 @@ class MainWindow(QMainWindow):
         left.addLayout(scrub)
         self._waveform = WaveformWidget()
         left.addWidget(self._waveform)
+        self._thumbnail_strip = ThumbnailStripWidget()
+        self._thumbnail_strip.frame_clicked.connect(self._jump_to_thumbnail)
+        left.addWidget(self._thumbnail_strip)
 
         # Controls
         ctrl = QHBoxLayout()
@@ -1944,6 +2077,11 @@ class MainWindow(QMainWindow):
         )
         self._waveform.set_loading()
         self._waveform_thread.request(path)
+        self._thumbnail_strip.set_loading()
+        self._thumbnail_thread.request(
+            playback_path, self._backend, self._hardware_accel,
+            self._seek_mode == "Exact frame",
+        )
         self._show(target_frame)
         if proxy_candidate is not None and playback_path == path:
             self._set_status("Building playback proxy...", BLUE)
@@ -2065,6 +2203,10 @@ class MainWindow(QMainWindow):
         if self._slider_held:
             self._show(val)
 
+    def _jump_to_thumbnail(self, frame_idx: int):
+        if self.cap:
+            self._show(frame_idx)
+
     def _speed_changed(self, text: str):
         try:
             self._speed = float(text.rstrip("x"))
@@ -2117,6 +2259,10 @@ class MainWindow(QMainWindow):
     def _on_proxy_failed(self, source_path: str, error: str):
         if source_path == self._video_path and self._proxy_enabled:
             self._set_status(f"Proxy unavailable; using full-resolution playback. {error}", YELLOW)
+
+    def _on_thumbnails_ready(self, path: str, frames):
+        if path == self._playback_path:
+            self._thumbnail_strip.set_frames(frames)
 
     def _on_preview_ready(self, frame_idx: int, bgr: np.ndarray):
         px = bgr_to_pixmap(bgr).scaled(
@@ -2578,6 +2724,7 @@ class MainWindow(QMainWindow):
         self._preview_thread.stop()
         self._waveform_thread.stop()
         self._proxy_thread.stop()
+        self._thumbnail_thread.stop()
         if self.cap:
             self.cap.release()
         super().closeEvent(event)
