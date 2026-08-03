@@ -14,6 +14,7 @@ from framesnap import (
     frame_to_ms,
     ms_to_ts,
     open_cap,
+    parse_tags,
     proxy_cache_path,
     thumbnail_frame_indices,
 )
@@ -36,6 +37,7 @@ def test_timestamp_and_template_helpers():
         "{stem}_{frame}_{ts}_{label}_{n}", "clip", 12, 25, "hero/close", 3
     )
     assert result == "clip_000012_00-00-00-480_hero_close_003"
+    assert parse_tags(" hero, HERO, close-up,  ") == ["hero", "close-up"]
 
 
 @pytest.mark.parametrize("backend", ["OpenCV", "PyAV"])

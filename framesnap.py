@@ -344,6 +344,19 @@ def apply_template(template: str, stem: str, frame_idx: int,
     return safe_filename(result)
 
 
+def parse_tags(value: str) -> list[str]:
+    """Normalize comma-separated mark tags while preserving user order."""
+    tags = []
+    seen = set()
+    for raw in value.split(","):
+        tag = " ".join(raw.strip().split())
+        key = tag.casefold()
+        if tag and key not in seen:
+            tags.append(tag)
+            seen.add(key)
+    return tags
+
+
 BACKEND_OPTIONS = ["Auto", "OpenCV"] + (["PyAV"] if av is not None else [])
 SEEK_OPTIONS = ["Exact frame", "Fast keyframe"]
 
@@ -779,6 +792,7 @@ def load_config() -> dict:
         "export_format": "PNG",
         "export_quality": 90,
         "export_scale": "100%",
+        "export_group": "All",
         "naming_template": DEFAULT_TEMPLATE,
         "show_overlay": True,
         "speed": "1x",
@@ -1402,7 +1416,7 @@ class FrameItemWidget(QWidget):
 
     def __init__(self, frame_idx: int, fps: float,
                  thumb: QPixmap | None, label: str = "",
-                 color: str = MAUVE, parent=None):
+                 color: str = MAUVE, tags: str = "", parent=None):
         super().__init__(parent)
         self.frame_idx = frame_idx
         self.fps       = fps
@@ -1444,9 +1458,12 @@ class FrameItemWidget(QWidget):
         self._label_lbl = QLabel(label)
         self._label_lbl.setStyleSheet(f"color: {PEACH}; font-size: 11px; font-style: italic;")
         self._label_lbl.setVisible(bool(label))
+        self._tags_lbl = QLabel()
+        self._tags_lbl.setStyleSheet(f"color: {TEAL}; font-size: 10px;")
         info.addWidget(self._ts_lbl)
         info.addWidget(self._frame_lbl)
         info.addWidget(self._label_lbl)
+        info.addWidget(self._tags_lbl)
         inner.addLayout(info)
         inner.addStretch()
 
@@ -1486,6 +1503,10 @@ class FrameItemWidget(QWidget):
     def update_label(self, label: str):
         self._label_lbl.setText(label)
         self._label_lbl.setVisible(bool(label))
+
+    def update_tags(self, tags: str):
+        self._tags_lbl.setText("  ".join(f"#{tag}" for tag in parse_tags(tags)))
+        self._tags_lbl.setVisible(bool(tags.strip()))
 
 
 # ── Main Window ───────────────────────────────────────────────────────────────
@@ -1871,6 +1892,16 @@ class MainWindow(QMainWindow):
         fi.addLayout(qual_row)
         el.addWidget(fmt_g)
 
+        group_g = QGroupBox("Export Group")
+        gi = QHBoxLayout(group_g)
+        gi.addWidget(QLabel("Group:"))
+        self._group_combo = QComboBox()
+        self._group_combo.addItem("All")
+        self._group_combo.setToolTip("Export only marks carrying the selected tag.")
+        self._group_combo.currentTextChanged.connect(self._group_changed)
+        gi.addWidget(self._group_combo, 1)
+        el.addWidget(group_g)
+
         # Scale
         scale_g = QGroupBox("Scale")
         si = QVBoxLayout(scale_g)
@@ -1993,6 +2024,7 @@ class MainWindow(QMainWindow):
         self._fmt_combo.setCurrentText(cfg.get("export_format", "PNG"))
         self._qual_spin.setValue(cfg.get("export_quality", 90))
         self._scale_combo.setCurrentText(cfg.get("export_scale", "100%"))
+        self._group_combo.setCurrentText(cfg.get("export_group", "All"))
         self._name_edit.setText(cfg.get("naming_template", DEFAULT_TEMPLATE))
         self._speed_combo.setCurrentText(cfg.get("speed", "1x"))
         self._backend_combo.blockSignals(True)
@@ -2480,7 +2512,7 @@ class MainWindow(QMainWindow):
         widget.jump_requested.connect(self._jump_to)
 
         list_item = QListWidgetItem()
-        list_item.setSizeHint(QSize(0, 72))
+        list_item.setSizeHint(QSize(0, 78))
         list_item.setData(Qt.ItemDataRole.UserRole, idx)
 
         pos = self._marks_list.count()
@@ -2490,7 +2522,10 @@ class MainWindow(QMainWindow):
                 break
         self._marks_list.insertItem(pos, list_item)
         self._marks_list.setItemWidget(list_item, widget)
-        self.marked[idx] = {"item": list_item, "widget": widget, "label": "", "color": color}
+        self.marked[idx] = {
+            "item": list_item, "widget": widget, "label": "",
+            "color": color, "tags": "",
+        }
 
         self.slider.set_marks({k: v["color"] for k, v in self.marked.items()})
         self._update_marks_ui()
@@ -2531,6 +2566,27 @@ class MainWindow(QMainWindow):
         self._del_sel_btn.setEnabled(has)
         self._btn_prev_mark.setEnabled(has)
         self._btn_next_mark.setEnabled(has)
+        self._refresh_group_filter()
+
+    def _refresh_group_filter(self):
+        if not hasattr(self, "_group_combo"):
+            return
+        current = self._group_combo.currentText() or self._cfg.get("export_group", "All")
+        groups = sorted({
+            tag for mark in self.marked.values()
+            for tag in parse_tags(mark.get("tags", ""))
+        }, key=str.casefold)
+        self._group_combo.blockSignals(True)
+        self._group_combo.clear()
+        self._group_combo.addItem("All")
+        self._group_combo.addItems(groups)
+        self._group_combo.setCurrentText(current if current in ["All", *groups] else "All")
+        self._group_combo.blockSignals(False)
+        self._cfg["export_group"] = self._group_combo.currentText()
+
+    def _group_changed(self, group: str):
+        self._cfg["export_group"] = group
+        save_config(self._cfg)
 
     def _marks_context_menu(self, pos):
         item = self._marks_list.itemAt(pos)
@@ -2542,6 +2598,7 @@ class MainWindow(QMainWindow):
         act_copy  = menu.addAction("Copy Frame to Clipboard")
         menu.addSeparator()
         act_label = menu.addAction("Edit Label...")
+        act_tags = menu.addAction("Edit Tags...")
         # Color submenu
         color_menu = menu.addMenu("Set Color")
         color_acts = {}
@@ -2560,6 +2617,8 @@ class MainWindow(QMainWindow):
             self._copy_mark_frame(idx)
         elif chosen == act_label:
             self._edit_label(idx)
+        elif chosen == act_tags:
+            self._edit_tags(idx)
         elif chosen == act_del:
             self._remove_mark(idx)
         elif chosen in color_acts:
@@ -2598,6 +2657,19 @@ class MainWindow(QMainWindow):
         if ok:
             self.marked[idx]["label"] = text
             self.marked[idx]["widget"].update_label(text)
+
+    def _edit_tags(self, idx: int):
+        if idx not in self.marked:
+            return
+        text, ok = QInputDialog.getText(
+            self, "Edit Tags", "Comma-separated tags for this mark:",
+            text=self.marked[idx].get("tags", ""),
+        )
+        if ok:
+            tags = ", ".join(parse_tags(text))
+            self.marked[idx]["tags"] = tags
+            self.marked[idx]["widget"].update_tags(tags)
+            self._refresh_group_filter()
 
     # ── Clipboard ─────────────────────────────────────────────────────────────
 
@@ -2638,9 +2710,10 @@ class MainWindow(QMainWindow):
         else:
             subprocess.Popen(["xdg-open", d])
 
-    def _collect_frames(self) -> list[tuple[int, np.ndarray, str]]:
+    def _collect_frames(self, group: str | None = None) -> list[tuple[int, np.ndarray, str]]:
         """Seek and read each marked frame. Returns [(idx, bgr, label), ...]."""
         results = []
+        selected_group = group or self._group_combo.currentText()
         reader = open_cap(
             self._video_path, self._backend, self._hardware_accel,
             self._seek_mode == "Exact frame",
@@ -2649,6 +2722,9 @@ class MainWindow(QMainWindow):
             return results
         try:
             for idx in sorted(self.marked):
+                if (selected_group != "All"
+                        and selected_group not in parse_tags(self.marked[idx].get("tags", ""))):
+                    continue
                 reader.set(cv2.CAP_PROP_POS_FRAMES, idx)
                 ret, frame = reader.read()
                 if ret:
@@ -2680,6 +2756,7 @@ class MainWindow(QMainWindow):
         quality  = self._qual_spin.value()
         scale    = self._scale_combo.currentText()
         template = self._name_edit.text().strip() or DEFAULT_TEMPLATE
+        group    = self._group_combo.currentText()
         stem     = Path(self._video_path).stem
         os.makedirs(out_dir, exist_ok=True)
 
@@ -2692,13 +2769,16 @@ class MainWindow(QMainWindow):
         elif fmt == "WebP":
             enc_flags = [cv2.IMWRITE_WEBP_QUALITY, quality]
 
-        frames_data = self._collect_frames()
+        frames_data = self._collect_frames(group)
+        if not frames_data:
+            self._set_status(f"No marks in export group: {group}", YELLOW)
+            return
         exported, errors = 0, 0
 
         if fmt == "GIF":
             # Export all marks as separate GIFs (one frame each) or an animated GIF
             self._export_gif(frames_data, out_dir, stem, scale, quality)
-            self._update_export_config(out_dir, fmt, quality, scale, template)
+            self._update_export_config(out_dir, fmt, quality, scale, template, group)
             return
 
         for n, (idx, frame, label) in enumerate(frames_data, start=1):
@@ -2710,11 +2790,13 @@ class MainWindow(QMainWindow):
             else:
                 errors += 1
 
-        self._update_export_config(out_dir, fmt, quality, scale, template)
+        self._update_export_config(out_dir, fmt, quality, scale, template, group)
         color = YELLOW if errors else GREEN
         self._set_status(
             f"Exported {exported} frame{'s' if exported != 1 else ''}"
-            + (f" ({errors} failed)" if errors else "") + f"\n{out_dir}", color
+            + (f" ({errors} failed)" if errors else "")
+            + (f" [{group}]" if group != "All" else "")
+            + f"\n{out_dir}", color
         )
         self._tabs.setCurrentIndex(1)
 
@@ -2728,7 +2810,9 @@ class MainWindow(QMainWindow):
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             pil_frames.append(PilImage.fromarray(rgb).convert("P", palette=PilImage.ADAPTIVE,
                                                                dither=0))
-        out_path = os.path.join(out_dir, f"{safe_filename(stem)}_marks.gif")
+        group = self._group_combo.currentText()
+        suffix = "" if group == "All" else f"_{safe_filename(group)}"
+        out_path = os.path.join(out_dir, f"{safe_filename(stem)}{suffix}_marks.gif")
         pil_frames[0].save(
             out_path, save_all=True,
             append_images=pil_frames[1:],
@@ -2743,7 +2827,12 @@ class MainWindow(QMainWindow):
         out_dir = self._dir_edit.text().strip() or str(Path.home() / "Desktop")
         os.makedirs(out_dir, exist_ok=True)
 
-        n    = len(self.marked)
+        group = self._group_combo.currentText()
+        frames_data = self._collect_frames(group)
+        if not frames_data:
+            self._set_status(f"No marks in export group: {group}", YELLOW)
+            return
+        n    = len(frames_data)
         cols = max(2, min(6, math.ceil(math.sqrt(n))))
         rows = math.ceil(n / cols)
 
@@ -2754,7 +2843,6 @@ class MainWindow(QMainWindow):
         sheet_h = rows * (cell_h + label_h)
         sheet   = np.full((sheet_h, sheet_w, 3), pad_c, dtype=np.uint8)
 
-        frames_data = self._collect_frames()
         for i, (idx, frame, label) in enumerate(frames_data):
             r, c = divmod(i, cols)
             x = c * cell_w
@@ -2775,18 +2863,21 @@ class MainWindow(QMainWindow):
                         (203, 166, 247), 1, cv2.LINE_AA)
 
         stem     = Path(self._video_path).stem
-        out_path = os.path.join(out_dir, f"{safe_filename(stem)}_contact_sheet.png")
+        suffix = "" if group == "All" else f"_{safe_filename(group)}"
+        out_path = os.path.join(out_dir, f"{safe_filename(stem)}{suffix}_contact_sheet.png")
         cv2.imwrite(out_path, sheet)
-        self._set_status(f"Contact sheet saved ({n} frames)\n{out_path}", TEAL)
+        group_note = f" [{group}]" if group != "All" else ""
+        self._set_status(f"Contact sheet saved ({n} frames){group_note}\n{out_path}", TEAL)
         self._tabs.setCurrentIndex(1)
 
-    def _update_export_config(self, out_dir, fmt, quality, scale, template):
+    def _update_export_config(self, out_dir, fmt, quality, scale, template, group="All"):
         self._cfg.update({
             "last_output_dir": out_dir,
             "export_format":   fmt,
             "export_quality":  quality,
             "export_scale":    scale,
             "naming_template": template,
+            "export_group":     group,
         })
         save_config(self._cfg)
 
@@ -2808,7 +2899,8 @@ class MainWindow(QMainWindow):
             "video_path":  self._video_path,
             "position":    self.current_frame,
             "marks": [
-                {"frame": idx, "label": m["label"], "color": m["color"]}
+                {"frame": idx, "label": m["label"], "color": m["color"],
+                 "tags": m.get("tags", "")}
                 for idx, m in sorted(self.marked.items())
             ],
         }
@@ -2838,6 +2930,7 @@ class MainWindow(QMainWindow):
             fidx  = entry.get("frame", 0)
             label = entry.get("label", "")
             color = entry.get("color", MAUVE)
+            tags  = ", ".join(parse_tags(entry.get("tags", "")))
             if 0 <= fidx < max(self.total_frames, fidx + 1):
                 # Temporarily set current_frame so mark_frame() uses it
                 self.current_frame = fidx
@@ -2855,8 +2948,11 @@ class MainWindow(QMainWindow):
                     if label:
                         self.marked[fidx]["label"] = label
                         self.marked[fidx]["widget"].update_label(label)
+                    self.marked[fidx]["tags"] = tags
+                    self.marked[fidx]["widget"].update_tags(tags)
                     self._set_mark_color(fidx, color)
 
+        self._refresh_group_filter()
         pos = data.get("position", 0)
         self._show(min(pos, max(0, self.total_frames - 1)) if self.total_frames else pos)
         self._set_status(f"Session loaded: {len(self.marked)} marks.", GREEN)
