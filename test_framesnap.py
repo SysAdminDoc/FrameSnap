@@ -1,9 +1,17 @@
 import cv2
+import math
 import numpy as np
 import pytest
+import wave
 
 from framesnap import av as pyav
-from framesnap import apply_template, frame_to_ms, ms_to_ts, open_cap
+from framesnap import (
+    apply_template,
+    extract_audio_waveform,
+    frame_to_ms,
+    ms_to_ts,
+    open_cap,
+)
 
 
 def _write_test_video(path):
@@ -54,3 +62,31 @@ def test_auto_reader_and_hardware_request(tmp_path):
     assert reader.backend_name
     assert reader.hardware_accel or reader.hardware_fallback or pyav is None
     reader.release()
+
+
+def test_waveform_without_audio_is_empty(tmp_path):
+    path = tmp_path / "silent-video.mp4"
+    _write_test_video(path)
+    samples, duration = extract_audio_waveform(str(path))
+    assert samples == []
+    assert duration == 0.0
+
+
+def test_waveform_extracts_audio_levels(tmp_path):
+    path = tmp_path / "tone.wav"
+    sample_rate = 8_000
+    sample_count = sample_rate // 2
+    with wave.open(str(path), "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(sample_rate)
+        values = [
+            int(12_000 * math.sin(2 * math.pi * 440 * index / sample_rate))
+            for index in range(sample_count)
+        ]
+        audio.writeframes(np.asarray(values, dtype="<i2").tobytes())
+
+    samples, duration = extract_audio_waveform(str(path), bucket_count=32)
+    assert len(samples) == 32
+    assert 0.45 < duration < 0.55
+    assert max(samples) > 0.8

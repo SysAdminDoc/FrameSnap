@@ -554,6 +554,67 @@ def open_cap(path: str, backend: str = "Auto",
         return None
 
 
+def extract_audio_waveform(path: str, bucket_count: int = 1200) -> tuple[list[float], float]:
+    """Return normalized RMS buckets and duration for the first audio track."""
+    if av is None or bucket_count <= 0:
+        return [], 0.0
+    try:
+        with av.open(path) as container:
+            stream = next(iter(container.streams.audio), None)
+            if stream is None:
+                return [], 0.0
+            duration = 0.0
+            if stream.duration is not None and stream.time_base is not None:
+                duration = float(stream.duration * stream.time_base)
+            if duration <= 0 and container.duration:
+                duration = float(container.duration) / 1_000_000.0
+
+            levels = np.zeros(bucket_count, dtype=np.float32)
+            cursor = 0.0
+            last_bucket = -1
+            for frame in container.decode(stream):
+                raw = np.asarray(frame.to_ndarray())
+                if raw.size == 0:
+                    continue
+                source_dtype = raw.dtype
+                values = raw.astype(np.float32, copy=False)
+                if np.issubdtype(source_dtype, np.integer):
+                    info = np.iinfo(source_dtype)
+                    denominator = float(max(abs(info.min), info.max))
+                else:
+                    peak = float(np.max(np.abs(values)))
+                    denominator = 1.0 if peak <= 1.5 else max(peak, 1.0)
+                rms = float(np.sqrt(np.mean(np.square(values / denominator))))
+                rms = max(0.0, min(1.0, rms))
+
+                frame_time = frame.time
+                start_time = float(frame_time) if frame_time is not None else cursor
+                sample_rate = frame.sample_rate or stream.rate or 1
+                frame_duration = frame.samples / sample_rate
+                end_time = start_time + frame_duration
+                cursor = max(cursor, end_time)
+                if duration > 0:
+                    start = max(0, min(bucket_count - 1,
+                                       int(start_time / duration * bucket_count)))
+                    end = max(start + 1, int(math.ceil(
+                        end_time / duration * bucket_count)))
+                    end = min(bucket_count, end)
+                else:
+                    start = min(bucket_count - 1, last_bucket + 1)
+                    end = min(bucket_count, start + 1)
+                levels[start:end] = np.maximum(levels[start:end], rms)
+                last_bucket = max(last_bucket, end - 1)
+
+            if duration <= 0:
+                duration = cursor
+            peak = float(levels.max()) if levels.size else 0.0
+            if peak > 0:
+                levels /= peak
+            return levels.tolist(), duration
+    except Exception:
+        return [], 0.0
+
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
@@ -681,6 +742,47 @@ class PreviewThread(QThread):
             self._cap.release()
 
 
+class WaveformThread(QThread):
+    """Build an audio waveform without blocking playback or scrubbing."""
+    waveform_ready = pyqtSignal(str, object, float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._mutex = QMutex()
+        self._cond = QWaitCondition()
+        self._pending_path: str | None = None
+        self._running = True
+
+    def request(self, path: str) -> None:
+        self._mutex.lock()
+        self._pending_path = path
+        self._mutex.unlock()
+        self._cond.wakeOne()
+
+    def stop(self) -> None:
+        self._mutex.lock()
+        self._running = False
+        self._mutex.unlock()
+        self._cond.wakeOne()
+        self.wait(3000)
+
+    def run(self) -> None:
+        while True:
+            self._mutex.lock()
+            while self._running and self._pending_path is None:
+                self._cond.wait(self._mutex)
+            if not self._running:
+                self._mutex.unlock()
+                break
+            path = self._pending_path
+            self._pending_path = None
+            self._mutex.unlock()
+
+            if path is not None:
+                samples, duration = extract_audio_waveform(path)
+                self.waveform_ready.emit(path, samples, duration)
+
+
 # ── Mark Slider ───────────────────────────────────────────────────────────────
 
 class MarkSlider(QSlider):
@@ -745,6 +847,77 @@ class MarkSlider(QSlider):
             painter.setBrush(col)
             x = self._frame_to_x(idx)
             painter.drawRoundedRect(x - 1, cy - 7, 3, 14, 1, 1)
+
+
+class WaveformWidget(QWidget):
+    """Compact RMS waveform aligned with the video timeline."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(46)
+        self.setMaximumHeight(58)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._samples: list[float] = []
+        self._duration = 0.0
+        self._position = 0.0
+        self._message = "Audio waveform loads after opening a video"
+
+    def clear(self) -> None:
+        self._samples = []
+        self._duration = 0.0
+        self._position = 0.0
+        self._message = "Audio waveform loads after opening a video"
+        self.update()
+
+    def set_loading(self) -> None:
+        self._samples = []
+        self._duration = 0.0
+        self._message = "Analyzing audio waveform..."
+        self.update()
+
+    def set_waveform(self, samples: list[float], duration: float) -> None:
+        self._samples = samples
+        self._duration = max(0.0, duration)
+        self._message = "No audio track" if not samples else ""
+        self.update()
+
+    def set_position(self, seconds: float) -> None:
+        if self._duration > 0:
+            self._position = max(0.0, min(1.0, seconds / self._duration))
+        else:
+            self._position = 0.0
+        self.update()
+
+    def paintEvent(self, event):
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor(MANTLE))
+        painter.setPen(QColor(SURFACE0))
+        painter.drawLine(0, self.height() // 2, self.width(), self.height() // 2)
+
+        if not self._samples:
+            painter.setPen(QColor(OVERLAY0))
+            painter.setFont(QFont("Segoe UI", 10))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._message)
+            return
+
+        center = self.height() // 2
+        amplitude = max(4, (self.height() - 10) // 2)
+        left = 5
+        width = max(1, self.width() - left * 2)
+        painter.setPen(QColor(TEAL))
+        for x in range(width):
+            sample_index = min(len(self._samples) - 1,
+                               int(x / width * len(self._samples)))
+            level = max(0.0, min(1.0, float(self._samples[sample_index])))
+            half = max(1, int(level * amplitude))
+            px = left + x
+            painter.drawLine(px, center - half, px, center + half)
+
+        position_x = left + int(self._position * width)
+        painter.setPen(QColor(MAUVE))
+        painter.drawLine(position_x, 2, position_x, self.height() - 3)
 
 
 # ── Video Display ─────────────────────────────────────────────────────────────
@@ -967,6 +1140,9 @@ class MainWindow(QMainWindow):
         self._preview_thread = PreviewThread(self)
         self._preview_thread.preview_ready.connect(self._on_preview_ready)
         self._preview_thread.start()
+        self._waveform_thread = WaveformThread(self)
+        self._waveform_thread.waveform_ready.connect(self._on_waveform_ready)
+        self._waveform_thread.start()
         self._pending_hover_pos = QPoint()
 
         self._build_menu()
@@ -1122,6 +1298,8 @@ class MainWindow(QMainWindow):
         scrub.addWidget(self.slider, 1)
         scrub.addWidget(self._dur_lbl)
         left.addLayout(scrub)
+        self._waveform = WaveformWidget()
+        left.addWidget(self._waveform)
 
         # Controls
         ctrl = QHBoxLayout()
@@ -1537,6 +1715,8 @@ class MainWindow(QMainWindow):
             b.setEnabled(True)
 
         self._preview_thread.open_video(path, self._backend, self._hardware_accel)
+        self._waveform.set_loading()
+        self._waveform_thread.request(path)
         self._show(target_frame)
         if record_recent:
             self._push_recent(path)
@@ -1572,6 +1752,7 @@ class MainWindow(QMainWindow):
         self._pos_lbl.setText(ms_to_ts(ms))
         tf  = f" / {self.total_frames:,}" if self.total_frames else ""
         self.display.set_overlay(f"Frame {idx:,}{tf}  |  {ms_to_ts(ms)}")
+        self._waveform.set_position(ms / 1000.0)
 
         if not self._slider_held and self.total_frames > 0:
             self.slider.blockSignals(True)
@@ -1610,6 +1791,7 @@ class MainWindow(QMainWindow):
         self._pos_lbl.setText(ms_to_ts(ms))
         tf = f" / {self.total_frames:,}" if self.total_frames else ""
         self.display.set_overlay(f"Frame {nxt:,}{tf}  |  {ms_to_ts(ms)}")
+        self._waveform.set_position(ms / 1000.0)
 
         if not self._slider_held and self.total_frames > 0:
             self.slider.blockSignals(True)
@@ -1678,6 +1860,12 @@ class MainWindow(QMainWindow):
 
     def _slider_hover_left(self):
         self._hover_popup.hide()
+
+    def _on_waveform_ready(self, path: str, samples, duration: float):
+        if path != self._video_path:
+            return
+        self._waveform.set_waveform(samples, duration)
+        self._waveform.set_position(frame_to_ms(self.current_frame, self.fps) / 1000.0)
 
     def _on_preview_ready(self, frame_idx: int, bgr: np.ndarray):
         px = bgr_to_pixmap(bgr).scaled(
@@ -2128,6 +2316,7 @@ class MainWindow(QMainWindow):
         self._timer.stop()
         self._hover_popup.hide()
         self._preview_thread.stop()
+        self._waveform_thread.stop()
         if self.cap:
             self.cap.release()
         super().closeEvent(event)
