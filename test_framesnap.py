@@ -20,8 +20,10 @@ from framesnap import (
     detect_scene_cuts,
     extract_audio_waveform,
     extract_chapters,
+    find_similar_frames,
     ffmpeg_extract_command,
     frame_to_ms,
+    hamming_distance,
     main,
     diff_session_data,
     merge_session_data,
@@ -32,6 +34,7 @@ from framesnap import (
     template_to_marks,
     open_cap,
     parse_tags,
+    perceptual_hash,
     proxy_cache_path,
     export_sequence,
     ordered_mark_indices,
@@ -295,6 +298,25 @@ def test_scene_detection_marks_histogram_cuts(tmp_path):
     writer.release()
     cuts = detect_scene_cuts(str(path), "OpenCV", threshold=0.4, min_gap_frames=3)
     assert any(7 <= cut <= 9 for cut in cuts)
+
+
+def test_perceptual_hashes_and_similarity_search(tmp_path):
+    frame = np.zeros((24, 32, 3), dtype=np.uint8)
+    altered = frame.copy()
+    altered[4:12, 8:20] = 255
+    digest = perceptual_hash(frame)
+    assert perceptual_hash(frame) == digest
+    assert hamming_distance(digest, digest ^ 0b1011) == 3
+    assert hamming_distance(digest, perceptual_hash(altered)) > 0
+
+    path = tmp_path / "similar.mp4"
+    _write_test_video(path)
+    result = find_similar_frames(
+        str(path), "OpenCV", threshold=0, sample_step=1,
+    )
+    assert result["scanned"] == 5
+    assert result["matches"]
+    assert all(match["frame"] > match["similar_to"] for match in result["matches"])
 
 
 def test_chapter_extraction_handles_container_without_chapters(tmp_path):

@@ -1303,6 +1303,118 @@ def detect_scene_cuts(path: str, backend: str = "Auto",
     return cuts
 
 
+def perceptual_hash(frame: np.ndarray, hash_size: int = 8) -> int:
+    """Return a compact DCT perceptual hash for a BGR or grayscale frame."""
+    if frame is None or frame.size == 0:
+        return 0
+    hash_size = max(2, min(16, int(hash_size)))
+    if frame.ndim == 3:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = frame
+    side = hash_size * 4
+    resized = cv2.resize(gray, (side, side), interpolation=cv2.INTER_AREA)
+    coefficients = cv2.dct(resized.astype(np.float32))[:hash_size, :hash_size]
+    baseline = float(np.median(coefficients[1:, :]))
+    digest = 0
+    for bit in (coefficients > baseline).flat:
+        digest = (digest << 1) | int(bool(bit))
+    return digest
+
+
+def hamming_distance(left: int, right: int) -> int:
+    """Return the number of differing bits between two perceptual hashes."""
+    return (int(left) ^ int(right)).bit_count()
+
+
+class _HammingHashIndex:
+    """Small BK-tree index for bounded-distance integer hash lookups."""
+
+    def __init__(self):
+        self._root: list | None = None
+
+    def add(self, digest: int, frame_idx: int) -> None:
+        if self._root is None:
+            self._root = [digest, [frame_idx], {}]
+            return
+        node = self._root
+        while True:
+            distance = hamming_distance(digest, node[0])
+            if distance == 0:
+                node[1].append(frame_idx)
+                return
+            child = node[2].get(distance)
+            if child is None:
+                node[2][distance] = [digest, [frame_idx], {}]
+                return
+            node = child
+
+    def query(self, digest: int, threshold: int) -> list[tuple[int, int]]:
+        if self._root is None:
+            return []
+        matches = []
+        pending = [self._root]
+        while pending:
+            node = pending.pop()
+            distance = hamming_distance(digest, node[0])
+            if distance <= threshold:
+                matches.append((distance, node[1][0]))
+            lower = distance - threshold
+            upper = distance + threshold
+            pending.extend(
+                child for edge, child in node[2].items()
+                if lower <= edge <= upper
+            )
+        return matches
+
+
+def find_similar_frames(path: str, backend: str = "Auto",
+                        hardware_accel: bool = False,
+                        exact_seek: bool = True,
+                        threshold: int = 8,
+                        sample_step: int = 5,
+                        hash_size: int = 8,
+                        max_matches: int = 2000) -> dict:
+    """Scan sampled frames and return earlier near-duplicate matches."""
+    hash_size = max(2, min(16, int(hash_size)))
+    threshold = max(0, min(hash_size * hash_size, int(threshold)))
+    sample_step = max(1, int(sample_step))
+    max_matches = max(1, int(max_matches))
+    reader = open_cap(path, backend, hardware_accel, exact_seek)
+    result = {"scanned": 0, "matches": [], "truncated": False}
+    if reader is None or not reader.isOpened():
+        return result
+
+    index = _HammingHashIndex()
+    frame_idx = 0
+    try:
+        while True:
+            ok, frame = reader.read()
+            if not ok or frame is None:
+                break
+            if frame_idx % sample_step == 0:
+                digest = perceptual_hash(frame, hash_size)
+                result["scanned"] += 1
+                candidates = index.query(digest, threshold)
+                if candidates:
+                    distance, similar_to = min(
+                        candidates, key=lambda item: (item[0], item[1])
+                    )
+                    if len(result["matches"]) < max_matches:
+                        result["matches"].append({
+                            "frame": frame_idx,
+                            "similar_to": similar_to,
+                            "distance": distance,
+                        })
+                    else:
+                        result["truncated"] = True
+                index.add(digest, frame_idx)
+            frame_idx += 1
+    finally:
+        reader.release()
+    return result
+
+
 def extract_chapters(path: str) -> list[tuple[int, str]]:
     """Return chapter start frame indices and titles from the container."""
     if av is None:
@@ -1359,6 +1471,8 @@ def load_config() -> dict:
         "hardware_accel": False,
         "seek_mode": "Exact frame",
         "proxy_enabled": False,
+        "similarity_threshold": 8,
+        "similarity_step": 5,
     }
     if CONFIG_PATH.exists():
         try:
@@ -1683,6 +1797,58 @@ class SceneDetectThread(QThread):
                 self.scenes_ready.emit(path, cuts)
             except Exception as exc:
                 self.scenes_failed.emit(path, str(exc))
+
+
+class SimilarityThread(QThread):
+    """Search perceptual hashes away from the UI thread."""
+    similar_ready = pyqtSignal(str, object)
+    similar_failed = pyqtSignal(str, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._mutex = QMutex()
+        self._cond = QWaitCondition()
+        self._pending: tuple[str, str, bool, bool, int, int] | None = None
+        self._running = True
+
+    def request(self, path: str, backend: str, hardware_accel: bool,
+                exact_seek: bool, threshold: int, sample_step: int) -> None:
+        self._mutex.lock()
+        self._pending = (path, backend, hardware_accel, exact_seek,
+                         threshold, sample_step)
+        self._mutex.unlock()
+        self._cond.wakeOne()
+
+    def stop(self) -> None:
+        self._mutex.lock()
+        self._running = False
+        self._mutex.unlock()
+        self._cond.wakeOne()
+        self.wait(3000)
+
+    def run(self) -> None:
+        while True:
+            self._mutex.lock()
+            while self._running and self._pending is None:
+                self._cond.wait(self._mutex)
+            if not self._running:
+                self._mutex.unlock()
+                break
+            pending = self._pending
+            self._pending = None
+            self._mutex.unlock()
+
+            if pending is None:
+                continue
+            path, backend, hardware_accel, exact_seek, threshold, sample_step = pending
+            try:
+                matches = find_similar_frames(
+                    path, backend, hardware_accel, exact_seek,
+                    threshold, sample_step,
+                )
+                self.similar_ready.emit(path, matches)
+            except Exception as exc:
+                self.similar_failed.emit(path, str(exc))
 
 
 # ── Mark Slider ───────────────────────────────────────────────────────────────
@@ -2141,6 +2307,10 @@ class MainWindow(QMainWindow):
         self._scene_thread.scenes_ready.connect(self._on_scenes_ready)
         self._scene_thread.scenes_failed.connect(self._on_scenes_failed)
         self._scene_thread.start()
+        self._similarity_thread = SimilarityThread(self)
+        self._similarity_thread.similar_ready.connect(self._on_similarity_ready)
+        self._similarity_thread.similar_failed.connect(self._on_similarity_failed)
+        self._similarity_thread.start()
         self._pending_hover_pos = QPoint()
 
         self._build_menu()
@@ -2178,6 +2348,7 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self._make_act("Mark Current Frame", self.mark_frame))
         edit_menu.addAction(self._make_act("Auto-mark Scene Cuts", self.auto_mark_scenes))
         edit_menu.addAction(self._make_act("Auto-mark Chapters", self.auto_mark_chapters))
+        edit_menu.addAction(self._make_act("Find Similar Frames...", self.find_similar_frames))
         edit_menu.addAction(self._make_act("Clear All Marks",    self.clear_marks))
         edit_menu.addSeparator()
         edit_menu.addAction(self._make_act("Copy Current Frame to Clipboard",
@@ -3198,6 +3369,76 @@ class MainWindow(QMainWindow):
         if path == self._video_path:
             self._set_status(f"Scene detection failed: {error}", YELLOW)
 
+    # ── Similarity search ────────────────────────────────────────────────────
+
+    def find_similar_frames(self):
+        if not self.cap or not self._video_path:
+            QMessageBox.information(
+                self, "No Video", "Open a video before searching for similar frames."
+            )
+            return
+        threshold, accepted = QInputDialog.getInt(
+            self, "Find Similar Frames",
+            "Maximum perceptual hash distance (0–64):",
+            int(self._cfg.get("similarity_threshold", 8)), 0, 64,
+        )
+        if not accepted:
+            return
+        sample_step, accepted = QInputDialog.getInt(
+            self, "Find Similar Frames",
+            "Sample every N frames (1 scans every frame):",
+            int(self._cfg.get("similarity_step", 5)), 1, 1000,
+        )
+        if not accepted:
+            return
+        self._cfg.update({
+            "similarity_threshold": threshold,
+            "similarity_step": sample_step,
+        })
+        save_config(self._cfg)
+        if self.is_playing:
+            self.toggle_play()
+        self._set_status(
+            f"Searching {Path(self._video_path).name} for near-duplicates...", BLUE
+        )
+        self._similarity_thread.request(
+            self._video_path, self._backend, self._hardware_accel,
+            self._seek_mode == "Exact frame", threshold, sample_step,
+        )
+
+    def _on_similarity_ready(self, path: str, result: dict):
+        if path != self._video_path:
+            return
+        matches = result.get("matches", [])
+        if not matches:
+            self._set_status(
+                f"No near-duplicate frames found in {result.get('scanned', 0):,} samples.",
+                YELLOW,
+            )
+            return
+        shown = matches[:80]
+        lines = [
+            f"Scanned {result.get('scanned', 0):,} sampled frames.",
+            f"Found {len(matches):,}{'+' if result.get('truncated') else ''} near-duplicates.",
+            "",
+        ]
+        lines.extend(
+            f"Frame {match['frame']:,} ≈ {match['similar_to']:,} "
+            f"(distance {match['distance']})"
+            for match in shown
+        )
+        if len(matches) > len(shown) or result.get("truncated"):
+            lines.append("…additional matches omitted from this summary.")
+        QMessageBox.information(self, "Similar Frames", "\n".join(lines))
+        self._set_status(
+            f"Found {len(matches):,}{'+' if result.get('truncated') else ''} near-duplicate frames.",
+            GREEN,
+        )
+
+    def _on_similarity_failed(self, path: str, error: str):
+        if path == self._video_path:
+            self._set_status(f"Similarity search failed: {error}", YELLOW)
+
     def auto_mark_chapters(self):
         if not self.cap or not self._video_path:
             QMessageBox.information(self, "No Video", "Open a video before loading chapters.")
@@ -4024,6 +4265,7 @@ class MainWindow(QMainWindow):
         self._proxy_thread.stop()
         self._thumbnail_thread.stop()
         self._scene_thread.stop()
+        self._similarity_thread.stop()
         if self.cap:
             self.cap.release()
         super().closeEvent(event)

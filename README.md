@@ -40,6 +40,7 @@
 - **Prev / Next mark** navigation buttons for quick cycling
 - **Multi-select** marks with Ctrl/Shift+Click, then bulk delete selected
 - Marks are kept sorted by time and persist in sessions
+- **Find Similar Frames** — perceptual-hash scan with configurable sampling to identify near-duplicates
 
 ### Export
 
