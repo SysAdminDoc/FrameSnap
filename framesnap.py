@@ -80,7 +80,7 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     av = None
 from PyQt6.QtWidgets import (  # noqa: E402
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QApplication, QMainWindow, QDialog, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QListWidget, QListWidgetItem,
     QFileDialog, QLineEdit, QGroupBox, QSizePolicy, QFrame, QSplitter,
     QMenu, QComboBox, QSpinBox, QInputDialog, QMessageBox,
@@ -389,6 +389,19 @@ def ms_to_ts(ms: float) -> str:
 
 def frame_to_ms(idx: int, fps: float) -> float:
     return (idx / fps) * 1000.0 if fps > 0 else 0.0
+
+
+def ab_frame_limit(left_count: int, right_count: int) -> int:
+    """Return the last shared A/B slider position for two frame counts."""
+    return max(0, max(int(left_count), int(right_count)) - 1)
+
+
+def clamp_frame_position(position: int, frame_count: int) -> int:
+    """Clamp a frame position when a stream exposes a known frame count."""
+    position = max(0, int(position))
+    if frame_count > 0:
+        return min(position, int(frame_count) - 1)
+    return position
 
 
 def bgr_to_pixmap(bgr: np.ndarray) -> QPixmap:
@@ -2161,6 +2174,12 @@ class VideoDisplay(QLabel):
         self.setStyleSheet(f"background-color: {CRUST}; border-radius: 10px;")
         self._refresh()
 
+    def show_message(self, message: str):
+        self._bgr = None
+        self.clear()
+        self._placeholder()
+        self.setText(message)
+
     def set_overlay(self, text: str):
         self._overlay_text = text
         self.update()
@@ -2222,6 +2241,148 @@ class VideoDisplay(QLabel):
                  if url.isLocalFile()]
         if paths:
             self.file_dropped.emit(paths)
+
+
+# ── A/B Viewer ───────────────────────────────────────────────────────────────
+
+class ABViewerDialog(QDialog):
+    """Compare two videos at the same numeric frame position."""
+
+    def __init__(self, parent, left_path: str, right_path: str,
+                 backend: str, hardware_accel: bool, exact_seek: bool,
+                 start_frame: int = 0):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setWindowTitle("FrameSnap · Side-by-Side A/B Viewer")
+        self.setMinimumSize(1060, 700)
+        self.resize(1280, 800)
+
+        self._left_path = left_path
+        self._right_path = right_path
+        self._left_reader = open_cap(left_path, backend, hardware_accel, exact_seek)
+        self._right_reader = open_cap(right_path, backend, hardware_accel, exact_seek)
+        if self._left_reader is None or self._right_reader is None:
+            if self._left_reader is not None:
+                self._left_reader.release()
+            if self._right_reader is not None:
+                self._right_reader.release()
+            raise RuntimeError("The selected videos could not be opened by the chosen decoder.")
+
+        self._left_count = max(0, self._left_reader.frame_count)
+        self._right_count = max(0, self._right_reader.frame_count)
+        self._max_count = max(self._left_count, self._right_count)
+        self._position = 0
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        viewers = QSplitter(Qt.Orientation.Horizontal)
+        viewers.setChildrenCollapsible(False)
+        left_panel, self._left_display = self._make_display(
+            "A", left_path, self._left_count, viewers
+        )
+        right_panel, self._right_display = self._make_display(
+            "B", right_path, self._right_count, viewers
+        )
+        viewers.addWidget(left_panel)
+        viewers.addWidget(right_panel)
+        viewers.setSizes([1, 1])
+        root.addWidget(viewers, 1)
+
+        control_row = QHBoxLayout()
+        previous = QPushButton("−1")
+        previous.setToolTip("Show the previous frame position in both videos")
+        previous.clicked.connect(lambda: self._show_position(self._position - 1))
+        next_button = QPushButton("+1")
+        next_button.setToolTip("Show the next frame position in both videos")
+        next_button.clicked.connect(lambda: self._show_position(self._position + 1))
+        self._position_label = QLabel("Frame 0")
+        self._position_label.setMinimumWidth(90)
+        self._position_label.setStyleSheet(
+            f"color: {MAUVE}; font-family: Consolas, monospace;"
+        )
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setRange(0, ab_frame_limit(self._left_count, self._right_count))
+        self._slider.setEnabled(self._max_count > 0)
+        self._slider.valueChanged.connect(self._show_position)
+        control_row.addWidget(previous)
+        control_row.addWidget(next_button)
+        control_row.addWidget(self._position_label)
+        control_row.addWidget(self._slider, 1)
+        root.addLayout(control_row)
+
+        count_text = (
+            f"A: {self._count_text(self._left_count)} frames  ·  "
+            f"B: {self._count_text(self._right_count)} frames  ·  "
+            "Frame positions are compared by index"
+        )
+        self._status_label = QLabel(count_text)
+        self._status_label.setStyleSheet(f"color: {SUBTEXT0}; font-size: 11px;")
+        root.addWidget(self._status_label)
+
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.close)
+        root.addWidget(close_button, 0, Qt.AlignmentFlag.AlignRight)
+
+        self._show_position(start_frame)
+
+    @staticmethod
+    def _count_text(count: int) -> str:
+        return f"{count:,}" if count > 0 else "unknown"
+
+    @staticmethod
+    def _make_display(title: str, path: str, count: int, parent=None):
+        panel = QWidget(parent)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        heading = QLabel(f"{title}  ·  {Path(path).name}")
+        heading.setToolTip(path)
+        heading.setStyleSheet(f"color: {TEXT}; font-weight: bold;")
+        display = VideoDisplay()
+        display.setMinimumSize(320, 180)
+        layout.addWidget(heading)
+        layout.addWidget(display, 1)
+        return panel, display
+
+    def _read_at(self, reader: VideoReader, count: int,
+                 position: int) -> np.ndarray | None:
+        if count > 0 and position >= count:
+            return None
+        if not reader.set(cv2.CAP_PROP_POS_FRAMES, position):
+            return None
+        ok, frame = reader.read()
+        return frame if ok else None
+
+    def _show_position(self, position: int):
+        if self._max_count > 0:
+            position = clamp_frame_position(position, self._max_count)
+        else:
+            position = max(0, int(position))
+        self._position = position
+        self._slider.blockSignals(True)
+        self._slider.setValue(position)
+        self._slider.blockSignals(False)
+        self._position_label.setText(f"Frame {position:,}")
+
+        left_frame = self._read_at(self._left_reader, self._left_count, position)
+        right_frame = self._read_at(self._right_reader, self._right_count, position)
+        if left_frame is None:
+            self._left_display.show_message(f"No frame {position:,} in video A")
+        else:
+            self._left_display.show_frame(left_frame)
+            self._left_display.set_overlay(f"Frame {position:,}")
+        if right_frame is None:
+            self._right_display.show_message(f"No frame {position:,} in video B")
+        else:
+            self._right_display.show_frame(right_frame)
+            self._right_display.set_overlay(f"Frame {position:,}")
+
+    def closeEvent(self, event):
+        self._left_reader.release()
+        self._right_reader.release()
+        super().closeEvent(event)
 
 
 # ── Frame Item Widget ─────────────────────────────────────────────────────────
@@ -2363,6 +2524,7 @@ class MainWindow(QMainWindow):
 
         # Video state
         self.cap: VideoReader | None = None
+        self._ab_dialog: ABViewerDialog | None = None
         self._video_path = ""
         self._playback_path = ""
         self._video_queue: list[str] = []
@@ -2418,6 +2580,9 @@ class MainWindow(QMainWindow):
         file_menu = mb.addMenu("File")
         self._recent_menu = QMenu("Recent Files", self)
         file_menu.addAction(self._make_act("Open Video...", self.open_video))
+        file_menu.addAction(self._make_act(
+            "Open Side-by-Side A/B Viewer...", self.open_ab_viewer
+        ))
         file_menu.addSeparator()
         file_menu.addMenu(self._recent_menu)
         file_menu.addSeparator()
@@ -3071,6 +3236,41 @@ class MainWindow(QMainWindow):
         )
         if paths:
             self._open_queue(paths)
+
+    def open_ab_viewer(self):
+        first_path = self._video_path if os.path.isfile(self._video_path) else ""
+        if not first_path:
+            first_path, _ = QFileDialog.getOpenFileName(
+                self, "Choose A Video", "", VIDEO_FILTER
+            )
+        if not first_path:
+            return
+        second_path, _ = QFileDialog.getOpenFileName(
+            self, "Choose B Video", "", VIDEO_FILTER
+        )
+        if not second_path:
+            return
+        if os.path.normcase(os.path.abspath(first_path)) == os.path.normcase(
+                os.path.abspath(second_path)):
+            QMessageBox.information(
+                self, "Choose Two Videos",
+                "Choose two different video files for an A/B comparison.",
+            )
+            return
+        if self._ab_dialog is not None:
+            self._ab_dialog.close()
+        try:
+            dialog = ABViewerDialog(
+                self, first_path, second_path, self._backend,
+                self._hardware_accel, self._seek_mode == "Exact frame",
+                self.current_frame,
+            )
+        except RuntimeError as exc:
+            QMessageBox.critical(self, "A/B Viewer Failed", str(exc))
+            return
+        self._ab_dialog = dialog
+        dialog.finished.connect(lambda _result: setattr(self, "_ab_dialog", None))
+        dialog.show()
 
     def _open_queue(self, paths: list[str]):
         unique = []
@@ -4403,6 +4603,9 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._timer.stop()
         self._hover_popup.hide()
+        if self._ab_dialog is not None:
+            self._ab_dialog.close()
+            self._ab_dialog = None
         self._preview_thread.stop()
         self._waveform_thread.stop()
         self._proxy_thread.stop()

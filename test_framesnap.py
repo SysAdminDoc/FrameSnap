@@ -13,10 +13,12 @@ import cv2  # noqa: E402
 from framesnap import av as pyav
 from framesnap import (
     apply_template,
+    ab_frame_limit,
     batch_export_markers,
     burn_in_overlay,
     build_video_proxy,
     crop_frame,
+    clamp_frame_position,
     detect_scene_cuts,
     detect_codes,
     extract_audio_waveform,
@@ -78,6 +80,14 @@ def test_mouse_wheel_step_is_persisted_per_video():
     assert wheel_step_for_video(config, path) == 12
     assert set_wheel_step_for_video(config, path, 5000) == 1000
     assert wheel_step_for_video(config, path) == 1000
+
+
+def test_ab_viewer_frame_position_helpers():
+    assert ab_frame_limit(5, 11) == 10
+    assert ab_frame_limit(0, 0) == 0
+    assert clamp_frame_position(-4, 10) == 0
+    assert clamp_frame_position(20, 10) == 9
+    assert clamp_frame_position(20, 0) == 20
 
 
 def test_export_transforms_preserve_expected_dimensions_and_metadata():

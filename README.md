@@ -25,6 +25,7 @@
 - Drag scrubber to any position
 - **Mouse wheel** on the video to step frames
 - **Per-video mouse-wheel step** — configure 1–1000 frames per notch from Edit → Set Mouse-Wheel Step
+- **Side-by-side A/B viewer** — compare two files at the same frame index from File → Open Side-by-Side A/B Viewer
 - **Drag-and-drop queue** — drop several videos at once, then move through the queue with the
   previous/next controls while reusing marks and export settings
 - Recent files menu for quick access
