@@ -1511,6 +1511,29 @@ def extract_chapters(path: str) -> list[tuple[int, str]]:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
+def wheel_step_for_video(cfg: dict, path: str) -> int:
+    """Return the persisted mouse-wheel step for one video path."""
+    entries = cfg.get("wheel_steps", {})
+    if not isinstance(entries, dict):
+        return 1
+    try:
+        value = int(entries.get(str(Path(path).expanduser().resolve()), 1))
+    except (TypeError, ValueError):
+        value = 1
+    return max(1, min(1000, value))
+
+
+def set_wheel_step_for_video(cfg: dict, path: str, step: int) -> int:
+    """Persist and return a clamped mouse-wheel step for one video path."""
+    entries = cfg.setdefault("wheel_steps", {})
+    if not isinstance(entries, dict):
+        entries = {}
+        cfg["wheel_steps"] = entries
+    value = max(1, min(1000, int(step)))
+    entries[str(Path(path).expanduser().resolve())] = value
+    return value
+
+
 def load_config() -> dict:
     defaults = {
         "recent": [],
@@ -1539,6 +1562,7 @@ def load_config() -> dict:
         "proxy_enabled": False,
         "similarity_threshold": 8,
         "similarity_step": 5,
+        "wheel_steps": {},
     }
     if CONFIG_PATH.exists():
         try:
@@ -2349,6 +2373,7 @@ class MainWindow(QMainWindow):
         self.is_playing   = False
         self._loop_mode   = False
         self._speed       = 1.0
+        self._wheel_step  = 1
         self._slider_held = False
         self._last_bgr: np.ndarray | None = None
         self._cache = FrameCache(40)
@@ -2417,6 +2442,9 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self._make_act("Find Similar Frames...", self.find_similar_frames))
         edit_menu.addAction(self._make_act(
             "Detect QR/Barcodes in Current Frame", self.detect_codes_current_frame
+        ))
+        edit_menu.addAction(self._make_act(
+            "Set Mouse-Wheel Step...", self.set_mouse_wheel_step
         ))
         edit_menu.addAction(self._make_act("Clear All Marks",    self.clear_marks))
         edit_menu.addSeparator()
@@ -2553,7 +2581,9 @@ class MainWindow(QMainWindow):
         left.addWidget(self._info_bar)
 
         self.display = VideoDisplay()
-        self.display.wheel_delta.connect(self.step)
+        self.display.wheel_delta.connect(
+            lambda direction: self.step(direction * self._wheel_step)
+        )
         self.display.file_dropped.connect(self._open_queue)
         left.addWidget(self.display, 1)
 
@@ -3137,6 +3167,7 @@ class MainWindow(QMainWindow):
         self.cap = cap
         self._video_path = path
         self._playback_path = playback_path
+        self._wheel_step = wheel_step_for_video(self._cfg, path)
         if update_queue and not preserve_marks:
             self._video_queue = [path]
             self._queue_index = 0
@@ -3312,6 +3343,29 @@ class MainWindow(QMainWindow):
         if self.is_playing:
             self.toggle_play()
         self._show(self.current_frame + delta)
+
+    def set_mouse_wheel_step(self):
+        if not self._video_path:
+            QMessageBox.information(
+                self, "No Video", "Open a video before setting its mouse-wheel step."
+            )
+            return
+        step, accepted = QInputDialog.getInt(
+            self, "Mouse-Wheel Step",
+            "Frames to move per mouse-wheel notch:",
+            self._wheel_step, 1, 1000,
+        )
+        if not accepted:
+            return
+        self._wheel_step = set_wheel_step_for_video(
+            self._cfg, self._video_path, step
+        )
+        save_config(self._cfg)
+        self._set_status(
+            f"Mouse wheel moves {self._wheel_step} frame"
+            f"{'s' if self._wheel_step != 1 else ''} for this video.",
+            GREEN,
+        )
 
     def _slider_press(self):
         self._slider_held = True

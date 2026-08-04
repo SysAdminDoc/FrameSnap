@@ -36,6 +36,8 @@ from framesnap import (
     open_cap,
     parse_tags,
     perceptual_hash,
+    set_wheel_step_for_video,
+    wheel_step_for_video,
     proxy_cache_path,
     export_sequence,
     ordered_mark_indices,
@@ -67,6 +69,15 @@ def test_timestamp_and_template_helpers():
     }
     assert ordered_mark_indices(marked, "hero") == [2, 15]
     assert export_sequence(marked, "hero") == {2: 1, 15: 2}
+
+
+def test_mouse_wheel_step_is_persisted_per_video():
+    config = {"wheel_steps": {}}
+    path = r"C:\clips\one.mp4"
+    assert set_wheel_step_for_video(config, path, 12) == 12
+    assert wheel_step_for_video(config, path) == 12
+    assert set_wheel_step_for_video(config, path, 5000) == 1000
+    assert wheel_step_for_video(config, path) == 1000
 
 
 def test_export_transforms_preserve_expected_dimensions_and_metadata():

@@ -26,6 +26,7 @@ All notable changes to FrameSnap will be documented in this file.
 - Added: native Linux AppImage and Flatpak bundles with desktop metadata and pinned runtime wheels.
 - Added: background perceptual-hash similarity search with configurable threshold and sampling.
 - Added: current-frame QR and barcode detection through OpenCV.
+- Added: per-video mouse-wheel step settings persisted in the local configuration.
 - Added: `multiprocessing.freeze_support()` for frozen OpenCV/PyAV entry points.
 - Fixed: Windows PyInstaller builds include NumPy’s frozen exception module and tolerate missing
   standard streams in windowed CLI paths.

@@ -24,6 +24,7 @@
 - Step frame-by-frame (-10, -1, +1, +10)
 - Drag scrubber to any position
 - **Mouse wheel** on the video to step frames
+- **Per-video mouse-wheel step** — configure 1–1000 frames per notch from Edit → Set Mouse-Wheel Step
 - **Drag-and-drop queue** — drop several videos at once, then move through the queue with the
   previous/next controls while reusing marks and export settings
 - Recent files menu for quick access
