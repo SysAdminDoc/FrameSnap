@@ -1327,6 +1327,72 @@ def hamming_distance(left: int, right: int) -> int:
     return (int(left) ^ int(right)).bit_count()
 
 
+def _code_points(points) -> list[list[float]]:
+    if points is None:
+        return []
+    try:
+        return [
+            [round(float(point[0]), 2), round(float(point[1]), 2)]
+            for point in np.asarray(points).reshape(-1, 2)
+        ]
+    except (TypeError, ValueError):
+        return []
+
+
+def detect_codes(frame: np.ndarray) -> list[dict]:
+    """Decode QR and supported 1-D barcodes from one BGR frame."""
+    if frame is None or frame.size == 0:
+        return []
+    detected: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_code(kind: str, value: str, points=None, code_type: str = ""):
+        value = str(value or "").strip()
+        if not value:
+            return
+        label = code_type.strip() or kind
+        key = (label, value)
+        if key in seen:
+            return
+        seen.add(key)
+        detected.append({
+            "type": label,
+            "data": value,
+            "points": _code_points(points),
+        })
+
+    try:
+        qr_detector = cv2.QRCodeDetector()
+        multi = qr_detector.detectAndDecodeMulti(frame)
+        if len(multi) == 4:
+            found, values, points, _ = multi
+            if found:
+                for index, value in enumerate(values if values is not None else []):
+                    polygon = points[index] if points is not None else None
+                    add_code("QR", value, polygon)
+        else:
+            value, points, _ = qr_detector.detectAndDecode(frame)
+            add_code("QR", value, points)
+    except (AttributeError, cv2.error, TypeError, ValueError):
+        pass
+
+    barcode_detector_type = getattr(cv2, "barcode_BarcodeDetector", None)
+    if barcode_detector_type is not None:
+        try:
+            barcode_detector = barcode_detector_type()
+            found, values, types, points = barcode_detector.detectAndDecodeWithType(frame)
+            if found:
+                values = values if values is not None else []
+                types = types if types is not None else []
+                for index, value in enumerate(values):
+                    code_type = types[index] if index < len(types) else "Barcode"
+                    polygon = points[index] if points is not None else None
+                    add_code("Barcode", value, polygon, code_type)
+        except (AttributeError, cv2.error, TypeError, ValueError):
+            pass
+    return detected
+
+
 class _HammingHashIndex:
     """Small BK-tree index for bounded-distance integer hash lookups."""
 
@@ -2349,6 +2415,9 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self._make_act("Auto-mark Scene Cuts", self.auto_mark_scenes))
         edit_menu.addAction(self._make_act("Auto-mark Chapters", self.auto_mark_chapters))
         edit_menu.addAction(self._make_act("Find Similar Frames...", self.find_similar_frames))
+        edit_menu.addAction(self._make_act(
+            "Detect QR/Barcodes in Current Frame", self.detect_codes_current_frame
+        ))
         edit_menu.addAction(self._make_act("Clear All Marks",    self.clear_marks))
         edit_menu.addSeparator()
         edit_menu.addAction(self._make_act("Copy Current Frame to Clipboard",
@@ -3438,6 +3507,26 @@ class MainWindow(QMainWindow):
     def _on_similarity_failed(self, path: str, error: str):
         if path == self._video_path:
             self._set_status(f"Similarity search failed: {error}", YELLOW)
+
+    # ── QR and barcode detection ────────────────────────────────────────────
+
+    def detect_codes_current_frame(self):
+        if self._last_bgr is None:
+            QMessageBox.information(
+                self, "No Frame", "Open a video before detecting codes."
+            )
+            return
+        codes = detect_codes(self._last_bgr)
+        if not codes:
+            self._set_status("No QR codes or barcodes detected in the current frame.", YELLOW)
+            return
+        lines = [f"Detected {len(codes)} code{'s' if len(codes) != 1 else ''}:", ""]
+        lines.extend(f"{code['type']}: {code['data']}" for code in codes)
+        QMessageBox.information(self, "QR/Barcode Detection", "\n".join(lines))
+        self._set_status(
+            f"Detected {len(codes)} QR/barcode{'s' if len(codes) != 1 else ''}.",
+            GREEN,
+        )
 
     def auto_mark_chapters(self):
         if not self.cap or not self._video_path:

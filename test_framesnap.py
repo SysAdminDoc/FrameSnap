@@ -18,6 +18,7 @@ from framesnap import (
     build_video_proxy,
     crop_frame,
     detect_scene_cuts,
+    detect_codes,
     extract_audio_waveform,
     extract_chapters,
     find_similar_frames,
@@ -317,6 +318,21 @@ def test_perceptual_hashes_and_similarity_search(tmp_path):
     assert result["scanned"] == 5
     assert result["matches"]
     assert all(match["frame"] > match["similar_to"] for match in result["matches"])
+
+
+def test_qr_detection_decodes_current_frame():
+    if not hasattr(cv2, "QRCodeEncoder_create"):
+        pytest.skip("OpenCV QR encoder is unavailable")
+    encoded = cv2.QRCodeEncoder_create().encode("framesnap-test")
+    encoded = cv2.copyMakeBorder(
+        encoded, 4, 4, 4, 4, cv2.BORDER_CONSTANT, value=255
+    )
+    encoded = cv2.resize(encoded, None, fx=12, fy=12,
+                         interpolation=cv2.INTER_NEAREST)
+    frame = cv2.cvtColor(encoded, cv2.COLOR_GRAY2BGR)
+    codes = detect_codes(frame)
+    assert any(code["type"] == "QR" and code["data"] == "framesnap-test"
+               for code in codes)
 
 
 def test_chapter_extraction_handles_container_without_chapters(tmp_path):
