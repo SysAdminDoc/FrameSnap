@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FrameSnap v2.1.0
+FrameSnap v2.2.0
 Browse any video, mark frames, and export screenshots — all formats, all features.
 """
 
@@ -479,7 +479,7 @@ def export_sequence(marked: dict, group: str = "All") -> dict[int, int]:
     }
 
 
-SESSION_VERSION = "2.1"
+SESSION_VERSION = "2.2"
 TEMPLATE_VERSION = "1"
 
 
@@ -2503,7 +2503,7 @@ class FrameItemWidget(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("FrameSnap v2.1.0")
+        self.setWindowTitle("FrameSnap v2.2.0")
         self.setMinimumSize(1100, 680)
         self.resize(1380, 860)
         self.setAcceptDrops(True)
@@ -4667,7 +4667,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--crop", nargs=4, type=int, metavar=("X", "Y", "W", "H"),
     )
-    parser.add_argument("--version", action="version", version="FrameSnap 2.1.0")
+    parser.add_argument("--version", action="version", version="FrameSnap 2.2.0")
     return parser
 
 
@@ -4708,7 +4708,7 @@ def main(argv: list[str] | None = None):
     branding_icon = QIcon(str(_branding_icon_path()))
     app.setWindowIcon(branding_icon)
     app.setApplicationName("FrameSnap")
-    app.setApplicationVersion("2.1.0")
+    app.setApplicationVersion("2.2.0")
     app.setStyleSheet(stylesheet_for_theme(THEME_NAMES[0]))
 
     icon_path = Path(__file__).parent / "icon.svg"

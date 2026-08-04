@@ -11,5 +11,13 @@
   <project_license>MIT</project_license>
   <url type="homepage">https://github.com/SysAdminDoc/FrameSnap</url>
   <launchable type="desktop-id">com.sysadmindoc.FrameSnap.desktop</launchable>
+  <releases>
+    <release version="2.2.0" date="2026-08-03">
+      <description>
+        <p>Added perceptual search, code detection, configurable scrubber steps, and
+        side-by-side frame comparison.</p>
+      </description>
+    </release>
+  </releases>
   <content_rating type="oars-1.1"/>
 </component>

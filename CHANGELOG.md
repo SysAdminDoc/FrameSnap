@@ -2,7 +2,7 @@
 
 All notable changes to FrameSnap will be documented in this file.
 
-## [Unreleased] - 2026-08-03
+## [v2.2.0] - 2026-08-03
 
 - Added: optional PyAV decoding with OpenCV fallback, hardware-decode requests, and audio-track metadata.
 - Added: background audio waveform analysis and a timeline waveform track under the scrubber.
