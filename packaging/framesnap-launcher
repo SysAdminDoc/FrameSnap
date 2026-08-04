@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+export PYTHONPATH="/app/lib/python3.13/site-packages${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 /app/share/framesnap/framesnap.py "$@"

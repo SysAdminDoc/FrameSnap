@@ -1,6 +1,7 @@
 import os
 import math
 import json
+import sys
 import numpy as np
 import pytest
 import wave
@@ -153,6 +154,14 @@ def test_batch_marker_export_supports_csv_json_and_cli(tmp_path):
         "--format", "JPEG",
     ]) == 0
     assert len(list(json_output.glob("*.jpg"))) == 1
+
+
+def test_windowed_cli_version_handles_missing_streams(monkeypatch):
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    with pytest.raises(SystemExit) as error:
+        main(["--version"])
+    assert error.value.code == 0
 
 
 def test_alternative_theme_stylesheets_are_available():

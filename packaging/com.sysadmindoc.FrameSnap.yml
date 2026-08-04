@@ -1,0 +1,54 @@
+app-id: com.sysadmindoc.FrameSnap
+runtime: org.kde.Platform
+runtime-version: "6.10"
+sdk: org.kde.Sdk
+command: framesnap
+finish-args:
+  - --share=ipc
+  - --socket=x11
+  - --socket=wayland
+  - --socket=pulseaudio
+  - --device=dri
+  - --filesystem=home
+modules:
+  - name: framesnap
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 framesnap-launcher /app/bin/framesnap
+      - install -Dm644 framesnap.py /app/share/framesnap/framesnap.py
+      - install -Dm644 com.sysadmindoc.FrameSnap.512.png /app/share/icons/hicolor/512x512/apps/com.sysadmindoc.FrameSnap.png
+      - install -Dm644 com.sysadmindoc.FrameSnap.desktop /app/share/applications/com.sysadmindoc.FrameSnap.desktop
+      - install -Dm644 com.sysadmindoc.FrameSnap.metainfo.xml /app/share/metainfo/com.sysadmindoc.FrameSnap.metainfo.xml
+      - "python3 -m pip install --no-index --find-links=. --no-cache-dir --no-compile --only-binary=:all: --prefix=/app PyQt6 opencv-python-headless numpy Pillow av"
+    sources:
+      - type: file
+        path: ../framesnap.py
+      - type: file
+        path: ../packaging/framesnap-launcher
+      - type: file
+        path: ../packaging/com.sysadmindoc.FrameSnap.512.png
+      - type: file
+        path: ../packaging/com.sysadmindoc.FrameSnap.desktop
+      - type: file
+        path: ../packaging/com.sysadmindoc.FrameSnap.metainfo.xml
+      - type: file
+        url: https://files.pythonhosted.org/packages/d5/78/92f3c46440a83ebe22ae614bd6792e7b052bcb58ff128f677f5662015184/pyqt6-6.9.1-cp39-abi3-manylinux_2_28_x86_64.whl
+        sha256: 37884df27f774e2e1c0c96fa41e817a222329b80ffc6241725b0dc8c110acb35
+      - type: file
+        url: https://files.pythonhosted.org/packages/a8/07/21f7dc188e35b46631707f3b40ace5643a0e03a8e1e446854826d08a04ae/pyqt6_qt6-6.9.2-py3-none-manylinux_2_28_x86_64.whl
+        sha256: 9abfc0ee4a8293a6442128ae3f87f68e82e2a949d7b9caabd98c86ba5679ab48
+      - type: file
+        url: https://files.pythonhosted.org/packages/34/9a/3f8127196bb2e303914c92670590633a7b3141aca640dc0122c326366c3d/pyqt6_sip-13.12.0-cp313-cp313-manylinux1_x86_64.manylinux_2_5_x86_64.whl
+        sha256: 5b5610a21401dbf97eaa82a2d35e727d3269ef370f299a892ff154f4b6f338ca
+      - type: file
+        url: https://files.pythonhosted.org/packages/9b/21/f6ef335f6e65724aa78b8d792b48d40a48c381715f1e62f5a5049e09d07e/opencv_python_headless-5.0.0.93-cp37-abi3-manylinux_2_28_x86_64.whl
+        sha256: ed709fdf9aa0bd1f2ed8549e71d19449b03a675bb581eb292285f6861953be37
+      - type: file
+        url: https://files.pythonhosted.org/packages/ed/a7/2bcd3fdbb87804755c35b729bf8709d62025c5f4cfd7d5b2415997097515/numpy-2.5.1-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+        sha256: 9726558e8db4a5bf7929a70ae50f63abda4daf0efe810e3bfbab95976f75fc1a
+      - type: file
+        url: https://files.pythonhosted.org/packages/f7/62/de5bdd77d935331f4f802edc11e4d82950f642caad6cb2f949837b8560e2/pillow-12.3.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+        sha256: 0847a763afefb695bc912d7c131e7e0632d4edc1d8698f58ddabec8e46b8b6d3
+      - type: file
+        url: https://files.pythonhosted.org/packages/6d/b9/7708c43fed7ae28b4a1bad060b4221e3334cd827cec24f7165902a6ac1f4/av-18.0.0-cp311-abi3-manylinux_2_28_x86_64.whl
+        sha256: ae56b40b6f8b067a8ad2dac664fbfbabac7f7a55b9a7bb031eb99289252bc017

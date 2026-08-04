@@ -9,6 +9,7 @@ import os
 import json
 import argparse
 import csv
+import multiprocessing
 import subprocess
 import math
 import hashlib
@@ -4103,6 +4104,10 @@ def _run_batch_cli(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None):
     argv = sys.argv[1:] if argv is None else argv
     if argv:
+        if sys.stdout is None:
+            sys.stdout = open(os.devnull, "w", encoding="utf-8")
+        if sys.stderr is None:
+            sys.stderr = open(os.devnull, "w", encoding="utf-8")
         parser = _build_cli_parser()
         args = parser.parse_args(argv)
         if not args.marker_path:
@@ -4130,4 +4135,5 @@ def main(argv: list[str] | None = None):
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     sys.exit(main())

@@ -23,6 +23,10 @@ All notable changes to FrameSnap will be documented in this file.
 - Added: multi-video drag-and-drop/open queues with mark reuse and previous/next navigation.
 - Added: noninteractive CSV/JSON marker-list export with frame/time selection and transforms.
 - Added: Windows per-monitor-v2 DPI setup and Latte, GitHub Dark, and AMOLED themes.
+- Added: native Linux AppImage and Flatpak bundles with desktop metadata and pinned runtime wheels.
+- Added: `multiprocessing.freeze_support()` for frozen OpenCV/PyAV entry points.
+- Fixed: Windows PyInstaller builds include NumPy’s frozen exception module and tolerate missing
+  standard streams in windowed CLI paths.
 - Fixed: frozen PyInstaller builds no longer recursively invoke the dependency bootstrapper.
 
 ## [v2.1.0] - %Y->- (HEAD -> main, origin/main)

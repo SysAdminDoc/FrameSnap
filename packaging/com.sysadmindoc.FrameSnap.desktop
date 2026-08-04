@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=FrameSnap
+Comment=Browse videos, mark frames, and export precise stills
+Exec=framesnap %U
+Icon=com.sysadmindoc.FrameSnap
+Terminal=false
+Type=Application
+Categories=AudioVideo;Graphics;Video;
+MimeType=video/mp4;video/quicktime;video/x-matroska;video/webm;video/x-msvideo;
+X-Flatpak=com.sysadmindoc.FrameSnap

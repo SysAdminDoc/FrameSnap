@@ -24,3 +24,11 @@ AGENTS.md
 .ai/
 PROJECT_CONTEXT.md
 CONTINUATION_PROMPT.md
+
+# Local distribution build artifacts
+.linux-wheels*/
+.flatpak-repo/
+*.flatpak
+*.AppImage
+.appimage-venv/
+.appimage-build/

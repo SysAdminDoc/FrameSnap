@@ -96,6 +96,8 @@ python framesnap.py
 
 On first launch, missing packages are installed automatically via pip. No manual setup required.
 
+To build the unsigned Windows executable from source, run `pwsh packaging/build-windows.ps1`.
+
 ### Noninteractive batch export
 
 Use a CSV or JSON marker list without opening the GUI. Rows may contain `frame` or `time_ms` (or
@@ -108,6 +110,12 @@ python framesnap.py --batch-markers markers.csv --video clip.mp4 \
 ```
 
 The command returns a nonzero exit code if any listed frame cannot be read or written.
+
+### Linux packages
+
+Release builds include an unsigned `FrameSnap.AppImage` for portable Linux use and an unsigned
+`FrameSnap.flatpak` bundle for Flatpak-based desktops. Run the AppImage directly, or install the
+Flatpak bundle with `flatpak install --user ./FrameSnap.flatpak`.
 
 ---
 

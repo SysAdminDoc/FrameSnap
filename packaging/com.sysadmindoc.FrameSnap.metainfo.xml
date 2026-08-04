@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.sysadmindoc.FrameSnap</id>
+  <name>FrameSnap</name>
+  <summary>Browse videos, mark frames, and export precise stills</summary>
+  <description>
+    <p>FrameSnap is a local desktop video browser for precise frame marking,
+    portable sessions, contact sheets, and still-image exports.</p>
+  </description>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <url type="homepage">https://github.com/SysAdminDoc/FrameSnap</url>
+  <launchable type="desktop-id">com.sysadmindoc.FrameSnap.desktop</launchable>
+  <content_rating type="oars-1.1"/>
+</component>
