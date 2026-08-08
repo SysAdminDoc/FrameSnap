@@ -15,6 +15,8 @@ All notable changes to FrameSnap will be documented in this file.
   shutdown without force termination.
 - Added: transactional still, animation, contact-sheet, and batch outputs with explicit collision
   policies plus hash-verified resumable export manifests.
+- Added: bounded marker parsing, Unicode/reserved-name filename sanitization, and output-root/
+  reparse-point checks for safer local media exports.
 
 ## [v2.2.0] - 2026-08-03
 

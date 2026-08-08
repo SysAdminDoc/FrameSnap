@@ -39,8 +39,10 @@ from framesnap import (
     hamming_distance,
     main,
     load_config,
+    load_marker_list,
     diff_session_data,
     default_export_manifest_path,
+    ensure_output_path,
     merge_session_data,
     ms_to_ts,
     session_template_from_data,
@@ -53,6 +55,7 @@ from framesnap import (
     normalize_session_data,
     normalize_template_data,
     save_config,
+    safe_filename,
     set_wheel_step_for_video,
     wheel_step_for_video,
     proxy_cache_path,
@@ -299,6 +302,41 @@ def test_collision_policy_and_transactional_export(tmp_path, monkeypatch):
     assert not atomic_write_export_frame(target, frame, "PNG")
     assert target.read_bytes() == b"original"
     assert not list(tmp_path.glob(".frame.*.png"))
+
+
+def test_marker_validation_and_output_containment(tmp_path):
+    marker_path = tmp_path / "markers.json"
+    marker_path.write_text(
+        json.dumps({"video_path": "clip.mp4", "marks": [{"frame": 100_000_001}]}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="between 0"):
+        load_marker_list(marker_path)
+
+    marker_path.write_text(
+        json.dumps({"video_path": "clip.mp4", "marks": [{"time_ms": "NaN"}]}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="invalid time_ms"):
+        load_marker_list(marker_path)
+
+    marker_path.write_text(
+        json.dumps({
+            "video_path": "clip.mp4",
+            "marks": [{"frame": 0, "label": "x" * 513}],
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="label exceeds"):
+        load_marker_list(marker_path)
+
+    assert safe_filename("CON.txt") == "_CON.txt"
+    assert safe_filename("bad\x00name/with\\separators") == "bad_name_with_separators"
+    assert len(safe_filename("x" * 500)) == 180
+
+    output = tmp_path / "exports"
+    with pytest.raises(ValueError, match="escapes"):
+        ensure_output_path(output, output / ".." / "outside.png")
 
 
 def test_windowed_cli_version_handles_missing_streams(monkeypatch):

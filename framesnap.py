@@ -17,6 +17,7 @@ import shutil
 import tempfile
 import time
 import threading
+import unicodedata
 from pathlib import Path
 
 from framesnap_version import __version__
@@ -445,9 +446,20 @@ def sizeof_fmt(num: float) -> str:
 
 
 def safe_filename(name: str) -> str:
-    for ch in r'\/:*?"<>|':
-        name = name.replace(ch, "_")
-    return name.strip(". ") or "frame"
+    name = unicodedata.normalize("NFC", str(name or ""))
+    name = "".join(
+        "_" if ord(ch) < 32 or ch in r'\/:*?"<>|' else ch
+        for ch in name
+    )
+    name = name.strip(". ")[:180].rstrip(". ")
+    reserved = {
+        "CON", "PRN", "AUX", "NUL",
+        *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10)),
+    }
+    if name.split(".", 1)[0].upper() in reserved:
+        name = f"_{name}"
+    return name or "frame"
 
 
 def apply_template(template: str, stem: str, frame_idx: int,
@@ -459,7 +471,7 @@ def apply_template(template: str, stem: str, frame_idx: int,
             stem=stem, frame=f"{frame_idx:06d}",
             ts=ts, label=lbl, n=f"{n:03d}",
         )
-    except (KeyError, ValueError):
+    except (AttributeError, IndexError, KeyError, ValueError):
         result = f"{stem}_{frame_idx:06d}_{ts}"
     return safe_filename(result)
 
@@ -821,6 +833,57 @@ def ffmpeg_extract_command(video_path: str, frame_idx: int, fps: float,
     return f'ffmpeg -ss {seconds:.3f} -i "{video}" -frames:v 1 -y "{output}"'
 
 
+MAX_MARKER_FILE_BYTES = 32 * 1024 * 1024
+MAX_MARKERS = 100_000
+MAX_MARKER_FRAME = 100_000_000
+MAX_MARKER_TIME_MS = 31 * 24 * 60 * 60 * 1000.0
+MAX_MARKER_PATH_LENGTH = 4096
+MAX_MARKER_LABEL_LENGTH = 512
+MAX_MARKER_TEXT_LENGTH = 4096
+MAX_MARKER_FIELD_BYTES = 1 * 1024 * 1024
+REPARSE_POINT_ATTRIBUTE = 0x0400
+
+
+def _is_reparse_point(path: str | Path) -> bool:
+    target = os.fspath(path)
+    if not os.path.lexists(target):
+        return False
+    if os.path.islink(target):
+        return True
+    try:
+        attributes = getattr(os.lstat(target), "st_file_attributes", 0)
+    except OSError:
+        return True
+    return bool(attributes & REPARSE_POINT_ATTRIBUTE)
+
+
+def ensure_output_path(output_dir: str | Path, path: str | Path) -> Path:
+    """Reject generated paths that escape the selected output directory."""
+    root = Path(output_dir).expanduser().resolve()
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    candidate = Path(os.path.abspath(str(candidate)))
+    try:
+        common = os.path.commonpath((str(root), str(candidate)))
+    except ValueError as exc:
+        raise ValueError("Output path is on a different filesystem root") from exc
+    if os.path.normcase(common) != os.path.normcase(str(root)):
+        raise ValueError("Output path escapes the selected output directory")
+    if _is_reparse_point(candidate):
+        raise ValueError(f"Output path is a reparse point: {candidate.name}")
+    return candidate
+
+
+def _bounded_marker_text(value, limit: int, field: str, number: int) -> str:
+    text = str(value or "").strip()
+    if len(text) > limit:
+        raise ValueError(
+            f"Marker {number} {field} exceeds the {limit}-character limit"
+        )
+    return text
+
+
 def _value_present(value) -> bool:
     return value is not None and str(value).strip() != ""
 
@@ -829,14 +892,21 @@ def _parse_marker_time_ms(value) -> float | None:
     if not _value_present(value):
         return None
     text = str(value).strip()
-    if ":" not in text:
-        return float(text) * 1000.0
-    parts = text.split(":")
-    if len(parts) != 3:
-        raise ValueError(f"Invalid timestamp: {value}")
-    hours, minutes, seconds = parts
-    return (float(hours) * 3600.0 + float(minutes) * 60.0
-            + float(seconds)) * 1000.0
+    try:
+        if ":" not in text:
+            result = float(text) * 1000.0
+        else:
+            parts = text.split(":")
+            if len(parts) != 3:
+                raise ValueError
+            hours, minutes, seconds = parts
+            result = (float(hours) * 3600.0 + float(minutes) * 60.0
+                      + float(seconds)) * 1000.0
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"Invalid timestamp: {value}") from None
+    if not math.isfinite(result) or result < 0 or result > MAX_MARKER_TIME_MS:
+        raise ValueError(f"Timestamp is outside the supported range: {value}")
+    return result
 
 
 def _resolve_marker_video(value: str, default_video: str,
@@ -844,6 +914,8 @@ def _resolve_marker_video(value: str, default_video: str,
     raw = str(value or default_video).strip()
     if not raw:
         raise ValueError("Each marker needs a video_path or --video")
+    if len(raw) > MAX_MARKER_PATH_LENGTH:
+        raise ValueError("Marker video_path is too long")
     path = Path(raw).expanduser()
     if not path.is_absolute():
         path = base_dir / path
@@ -852,13 +924,33 @@ def _resolve_marker_video(value: str, default_video: str,
 
 def load_marker_list(path: str | Path, video_path: str = "") -> list[dict]:
     """Load CSV/JSON frame markers for noninteractive batch export."""
-    marker_path = Path(path)
+    marker_path = Path(path).expanduser()
+    if marker_path.suffix.casefold() not in (".csv", ".json"):
+        raise ValueError("Marker list must be a .csv or .json file")
+    try:
+        marker_size = marker_path.stat().st_size
+    except OSError:
+        raise
+    if marker_size > MAX_MARKER_FILE_BYTES:
+        raise ValueError(
+            f"Marker list exceeds the {MAX_MARKER_FILE_BYTES // (1024 * 1024)} MB limit"
+        )
     if marker_path.suffix.casefold() == ".csv":
-        with marker_path.open(newline="", encoding="utf-8-sig") as handle:
-            payload = list(csv.DictReader(handle))
+        previous_limit = csv.field_size_limit()
+        try:
+            csv.field_size_limit(MAX_MARKER_FIELD_BYTES)
+            with marker_path.open(newline="", encoding="utf-8-sig") as handle:
+                payload = list(csv.DictReader(handle))
+        except (csv.Error, UnicodeDecodeError) as exc:
+            raise ValueError(f"Could not parse marker CSV: {exc}") from exc
+        finally:
+            csv.field_size_limit(previous_limit)
         default_video = video_path
     else:
-        raw = json.loads(marker_path.read_text(encoding="utf-8"))
+        try:
+            raw = json.loads(marker_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ValueError(f"Could not parse marker JSON: {exc}") from exc
         if isinstance(raw, dict):
             default_video = str(raw.get("video_path", raw.get("video", video_path)))
             payload = raw.get("marks", raw.get("markers", []))
@@ -867,6 +959,8 @@ def load_marker_list(path: str | Path, video_path: str = "") -> list[dict]:
             payload = raw
     if not isinstance(payload, list):
         raise ValueError("Marker list must be a JSON array or an object with marks")
+    if len(payload) > MAX_MARKERS:
+        raise ValueError(f"Marker list exceeds the {MAX_MARKERS:,}-item limit")
 
     entries = []
     base_dir = marker_path.parent.resolve()
@@ -875,20 +969,43 @@ def load_marker_list(path: str | Path, video_path: str = "") -> list[dict]:
             raise ValueError(f"Marker {number} must be an object")
         frame = None
         if _value_present(raw_entry.get("frame")):
-            frame = int(float(raw_entry["frame"]))
-            if frame < 0:
-                raise ValueError(f"Marker {number} has a negative frame")
+            try:
+                numeric_frame = float(raw_entry["frame"])
+                if not math.isfinite(numeric_frame):
+                    raise ValueError
+                frame = int(numeric_frame)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(f"Marker {number} has an invalid frame") from None
+            if frame < 0 or frame > MAX_MARKER_FRAME:
+                raise ValueError(
+                    f"Marker {number} frame must be between 0 and {MAX_MARKER_FRAME:,}"
+                )
         time_ms = None
         if frame is None:
             if _value_present(raw_entry.get("time_ms")):
-                time_ms = float(raw_entry["time_ms"])
+                try:
+                    time_ms = float(raw_entry["time_ms"])
+                except (TypeError, ValueError, OverflowError):
+                    raise ValueError(f"Marker {number} has an invalid time_ms") from None
             else:
                 time_ms = _parse_marker_time_ms(
                     raw_entry.get("seconds", raw_entry.get("time",
                                                raw_entry.get("timestamp")))
                 )
-            if time_ms is None or time_ms < 0:
+            if time_ms is None:
                 raise ValueError(f"Marker {number} needs frame or timestamp")
+            if (not math.isfinite(time_ms) or time_ms < 0
+                    or time_ms > MAX_MARKER_TIME_MS):
+                raise ValueError(f"Marker {number} has an invalid time_ms")
+        label = _bounded_marker_text(
+            raw_entry.get("label", ""), MAX_MARKER_LABEL_LENGTH, "label", number
+        )
+        tags = _bounded_marker_text(
+            raw_entry.get("tags", ""), MAX_MARKER_TEXT_LENGTH, "tags", number
+        )
+        comment = _bounded_marker_text(
+            raw_entry.get("comment", ""), MAX_MARKER_TEXT_LENGTH, "comment", number
+        )
         entries.append({
             "video_path": _resolve_marker_video(
                 raw_entry.get("video_path", raw_entry.get("video",
@@ -897,9 +1014,9 @@ def load_marker_list(path: str | Path, video_path: str = "") -> list[dict]:
             ),
             "frame": frame,
             "time_ms": time_ms,
-            "label": str(raw_entry.get("label", "")).strip(),
-            "tags": ", ".join(parse_tags(str(raw_entry.get("tags", "")))),
-            "comment": str(raw_entry.get("comment", "")).strip(),
+            "label": label,
+            "tags": ", ".join(parse_tags(tags)),
+            "comment": comment,
         })
     if not entries:
         raise ValueError("Marker list is empty")
@@ -1032,6 +1149,8 @@ def atomic_write_generated(path: str | Path, writer) -> bool:
     target = Path(path)
     temporary: Path | None = None
     try:
+        if _is_reparse_point(target):
+            return False
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = _temporary_output_path(target)
         if not writer(temporary):
@@ -1211,9 +1330,13 @@ def batch_export_markers(marker_path: str | Path, output_dir: str | Path,
     extension = export_extension(fmt)
     for source, source_entries in by_video.items():
         reader = open_cap(source, "Auto", False, True)
-        reader_open = reader is not None and reader.isOpened()
+        if reader is not None and reader.isOpened():
+            reader_open = True
+            fps = reader.get(cv2.CAP_PROP_FPS) or 30.0
+        else:
+            reader_open = False
+            fps = 30.0
         try:
-            fps = reader.get(cv2.CAP_PROP_FPS) or 30.0 if reader_open else 30.0
             resolved = []
             for entry in source_entries:
                 frame = entry["frame"]
@@ -1241,7 +1364,13 @@ def batch_export_markers(marker_path: str | Path, output_dir: str | Path,
                 base_name = apply_template(
                     template, stem, frame_idx, fps, entry["label"], sequence
                 ) + extension
-                target = resolve_collision_path(output / base_name, collision)
+                try:
+                    base_path = ensure_output_path(output, output / base_name)
+                    target = resolve_collision_path(base_path, collision)
+                except (OSError, ValueError) as exc:
+                    raise ValueError(
+                        f"Could not prepare output for {source}: {exc}"
+                    ) from exc
                 if target is None:
                     skipped += 1
                     record = {
@@ -1272,7 +1401,7 @@ def batch_export_markers(marker_path: str | Path, output_dir: str | Path,
                     **record, "status": "running", "error": "", "sha256": ""
                 }
                 _save_export_manifest(manifest_target, manifest)
-                if not reader_open:
+                if not reader_open or reader is None:
                     error = f"Could not open {source}"
                     failures.append(error)
                     update_record(record, "failed", error)
@@ -4686,6 +4815,7 @@ class MainWindow(QMainWindow):
         )
         try:
             out_dir_path.mkdir(parents=True, exist_ok=True)
+            out_dir_path = out_dir_path.resolve()
         except OSError as exc:
             self._set_status(f"Cannot create output folder: {exc}", YELLOW)
             return
@@ -4728,7 +4858,12 @@ class MainWindow(QMainWindow):
             fname = apply_template(
                 template, stem, idx, self.fps, label, sequence[idx]
             ) + ext
-            target = resolve_collision_path(out_dir_path / fname, collision)
+            try:
+                base_path = ensure_output_path(out_dir_path, out_dir_path / fname)
+                target = resolve_collision_path(base_path, collision)
+            except (OSError, ValueError):
+                errors += 1
+                continue
             if target is None:
                 skipped += 1
                 continue
@@ -4801,7 +4936,13 @@ class MainWindow(QMainWindow):
         group = self._group_combo.currentText()
         suffix = "" if group == "All" else f"_{safe_filename(group)}"
         extension = "gif" if fmt == "GIF" else "webp"
-        out_path = Path(out_dir) / f"{safe_filename(stem)}{suffix}_marks.{extension}"
+        try:
+            out_path = ensure_output_path(
+                out_dir,
+                Path(out_dir) / f"{safe_filename(stem)}{suffix}_marks.{extension}",
+            )
+        except (OSError, ValueError):
+            return 0, 0, 1
         target = resolve_collision_path(out_path, collision)
         if target is None:
             return 0, 1, 0
@@ -4836,6 +4977,7 @@ class MainWindow(QMainWindow):
         )
         try:
             out_dir_path.mkdir(parents=True, exist_ok=True)
+            out_dir_path = out_dir_path.resolve()
         except OSError as exc:
             self._set_status(f"Cannot create output folder: {exc}", YELLOW)
             return
@@ -4896,7 +5038,14 @@ class MainWindow(QMainWindow):
 
         stem     = Path(self._video_path).stem
         suffix = "" if group == "All" else f"_{safe_filename(group)}"
-        base_png = out_dir_path / f"{safe_filename(stem)}{suffix}_contact_sheet.png"
+        try:
+            base_png = ensure_output_path(
+                out_dir_path,
+                out_dir_path / f"{safe_filename(stem)}{suffix}_contact_sheet.png",
+            )
+        except (OSError, ValueError) as exc:
+            self._set_status(f"Contact sheet output path rejected: {exc}", YELLOW)
+            return
         base_paths = [base_png]
         if self._sheet_pdf.isChecked():
             base_paths.append(base_png.with_suffix(".pdf"))
