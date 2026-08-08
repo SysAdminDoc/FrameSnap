@@ -15,6 +15,8 @@ import math
 import hashlib
 from pathlib import Path
 
+from framesnap_version import __version__
+
 
 # codex-branding:start
 def _branding_icon_path() -> Path:
@@ -34,15 +36,14 @@ def _branding_icon_path() -> Path:
 # codex-branding:end
 
 
-# ── Bootstrap ─────────────────────────────────────────────────────────────────
+# ── Dependency checks ─────────────────────────────────────────────────────────
 
 def _bootstrap():
-    # PyInstaller bundles the dependencies; running the installer from a
-    # frozen executable would recurse through sys.executable indefinitely.
+    """Fail with an install hint instead of mutating the user's environment."""
     if getattr(sys, "frozen", False):
         return
     import importlib
-    to_install = []
+    missing = []
     for mod, pkg in [
         ("cv2",   "opencv-python"),
         ("numpy", "numpy"),
@@ -51,19 +52,28 @@ def _bootstrap():
         try:
             importlib.import_module(mod)
         except ImportError:
-            to_install.append(pkg)
+            missing.append(pkg)
     try:
         importlib.import_module("PyQt6")
     except ImportError:
-        to_install.append("PyQt6")
-    if to_install:
-        print(f"Installing: {', '.join(to_install)}")
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install",
-             "--break-system-packages"] + to_install,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        missing.append("PyQt6")
+    if not missing:
+        return
+    project_root = Path(__file__).resolve().parent
+    lock_path = project_root / "packaging" / "requirements-win-py312.txt"
+    if lock_path.exists():
+        install_hint = (
+            f"python -m pip install --require-hashes --only-binary=:all: "
+            f"-r {lock_path}"
         )
+    else:
+        install_hint = "python -m pip install -e ."
+    raise RuntimeError(
+        "FrameSnap cannot start because these dependencies are missing: "
+        f"{', '.join(missing)}.\n"
+        "Install the declared dependencies in a virtual environment, then retry:\n"
+        f"  {install_hint}"
+    )
 
 
 _bootstrap()
@@ -2503,7 +2513,7 @@ class FrameItemWidget(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("FrameSnap v2.2.0")
+        self.setWindowTitle(f"FrameSnap v{__version__}")
         self.setMinimumSize(1100, 680)
         self.resize(1380, 860)
         self.setAcceptDrops(True)
@@ -4667,7 +4677,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--crop", nargs=4, type=int, metavar=("X", "Y", "W", "H"),
     )
-    parser.add_argument("--version", action="version", version="FrameSnap 2.2.0")
+    parser.add_argument("--version", action="version", version=f"FrameSnap {__version__}")
     return parser
 
 
@@ -4708,7 +4718,7 @@ def main(argv: list[str] | None = None):
     branding_icon = QIcon(str(_branding_icon_path()))
     app.setWindowIcon(branding_icon)
     app.setApplicationName("FrameSnap")
-    app.setApplicationVersion("2.2.0")
+    app.setApplicationVersion(__version__)
     app.setStyleSheet(stylesheet_for_theme(THEME_NAMES[0]))
 
     icon_path = Path(__file__).parent / "icon.svg"

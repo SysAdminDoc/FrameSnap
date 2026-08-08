@@ -85,8 +85,10 @@
 ## Requirements
 
 - Python 3.10+
-- Dependencies are **auto-installed on first run**: `PyQt6`, `opencv-python`, `numpy`, `Pillow`
-- Optional `PyAV` enables the alternate decoder and audio-track metadata path
+- PyQt6, opencv-python, numpy, and Pillow
+- Optional PyAV enables the alternate decoder and audio-track metadata path
+- Windows CPython 3.12 x64 releases can use the hash-locked runtime manifest at
+  packaging/requirements-win-py312.txt
 
 ---
 
@@ -98,7 +100,26 @@ cd FrameSnap
 python framesnap.py
 ```
 
-On first launch, missing packages are installed automatically via pip. No manual setup required.
+FrameSnap does not install packages at runtime or modify the active Python environment. For a
+regular development install, create a virtual environment and install the project:
+
+```bash
+python -m venv .venv
+# Windows:
+.venv\Scripts\python -m pip install -e ".[pyav]"
+# macOS/Linux:
+.venv/bin/python -m pip install -e ".[pyav]"
+```
+
+For a clean Windows CPython 3.12 x64 runtime, install the pinned, hash-verified manifest instead:
+
+```bash
+.venv\Scripts\python -m pip install --require-hashes --only-binary=:all: \
+  -r packaging/requirements-win-py312.txt
+```
+
+If a dependency is missing, the application exits with the exact installation command rather than
+silently changing the interpreter.
 
 To build the unsigned Windows executable from source, run `pwsh packaging/build-windows.ps1`.
 

@@ -2,6 +2,12 @@
 
 All notable changes to FrameSnap will be documented in this file.
 
+## [Unreleased] - 2026-08-08
+
+- Changed: removed first-run package installation and added explicit dependency diagnostics.
+- Added: pyproject metadata, a single version source, and a hash-locked Windows CPython 3.12
+  runtime manifest for reproducible local setup.
+
 ## [v2.2.0] - 2026-08-03
 
 - Added: optional PyAV decoding with OpenCV fallback, hardware-decode requests, and audio-track metadata.

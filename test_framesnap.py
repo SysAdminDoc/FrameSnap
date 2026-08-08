@@ -2,6 +2,7 @@ import os
 import math
 import json
 import sys
+import importlib
 import numpy as np
 import pytest
 import wave
@@ -12,6 +13,7 @@ import cv2  # noqa: E402
 
 from framesnap import av as pyav
 from framesnap import (
+    _bootstrap,
     apply_template,
     ab_frame_limit,
     batch_export_markers,
@@ -46,6 +48,21 @@ from framesnap import (
     thumbnail_frame_indices,
     to_uint16_frame,
 )
+
+
+def test_missing_dependency_check_is_actionable(monkeypatch):
+    real_import_module = importlib.import_module
+
+    def missing_qt(module_name):
+        if module_name == "PyQt6":
+            raise ImportError("test-missing")
+        return real_import_module(module_name)
+
+    monkeypatch.setattr(importlib, "import_module", missing_qt)
+    with pytest.raises(RuntimeError) as error:
+        _bootstrap()
+    assert "PyQt6" in str(error.value)
+    assert "requirements-win-py312" in str(error.value)
 
 
 def _write_test_video(path):

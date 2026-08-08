@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "framesnap"
+dynamic = ["version"]
+description = "Browse video, mark precise frames, and export screenshots locally."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "SysAdminDoc", email = "matt_parker@outlook.com" },
+]
+dependencies = [
+    "PyQt6>=6.8,<7",
+    "numpy>=1.26,<3",
+    "opencv-python>=4.10,<5",
+    "Pillow>=10,<13",
+]
+
+[project.optional-dependencies]
+pyav = [
+    "av>=14,<18; python_version < '3.11'",
+    "av>=14; python_version >= '3.11'",
+]
+dev = [
+    "pytest>=8",
+    "ruff>=0.9",
+    "mypy>=1.13",
+    "pyinstaller>=6.10",
+]
+
+[project.scripts]
+framesnap = "framesnap:main"
+
+[tool.setuptools]
+py-modules = ["framesnap", "framesnap_version"]
+
+[tool.setuptools.dynamic]
+version = { attr = "framesnap_version.__version__" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
