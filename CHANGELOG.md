@@ -7,6 +7,8 @@ All notable changes to FrameSnap will be documented in this file.
 - Changed: removed first-run package installation and added explicit dependency diagnostics.
 - Added: pyproject metadata, a single version source, and a hash-locked Windows CPython 3.12
   runtime manifest for reproducible local setup.
+- Added: headless cross-platform CI, Windows package smoke coverage, lock validation, dependency
+  auditing, and version-metadata synchronization tests.
 
 ## [v2.2.0] - 2026-08-03
 

@@ -3,6 +3,8 @@ import math
 import json
 import sys
 import importlib
+import re
+from pathlib import Path
 import numpy as np
 import pytest
 import wave
@@ -63,6 +65,21 @@ def test_missing_dependency_check_is_actionable(monkeypatch):
         _bootstrap()
     assert "PyQt6" in str(error.value)
     assert "requirements-win-py312" in str(error.value)
+
+
+def test_version_metadata_is_synced():
+    version = importlib.import_module("framesnap_version").__version__
+    root = Path(__file__).resolve().parent
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    source = (root / "framesnap.py").read_text(encoding="utf-8")
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    metainfo = (
+        root / "packaging" / "com.sysadmindoc.FrameSnap.metainfo.xml"
+    ).read_text(encoding="utf-8")
+    assert f"version-{version}-" in readme
+    assert f"FrameSnap v{version}" in source
+    assert f"## [v{version}]" in changelog
+    assert re.search(rf'<release version="{re.escape(version)}"', metainfo)
 
 
 def _write_test_video(path):
