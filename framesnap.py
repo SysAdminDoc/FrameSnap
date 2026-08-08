@@ -964,31 +964,256 @@ def write_export_frame(path: str, frame: np.ndarray, fmt: str,
         return False
 
 
+EXPORT_MANIFEST_VERSION = 1
+COLLISION_POLICIES = ("suffix", "skip", "overwrite")
+
+
+def normalize_collision_policy(policy: str) -> str:
+    value = str(policy or "suffix").strip().casefold()
+    if value not in COLLISION_POLICIES:
+        choices = ", ".join(COLLISION_POLICIES)
+        raise ValueError(f"Unknown collision policy {policy!r}; choose {choices}.")
+    return value
+
+
+def resolve_collision_path(path: str | Path, policy: str = "suffix") -> Path | None:
+    """Choose an output path without silently replacing an existing file."""
+    policy = normalize_collision_policy(policy)
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if policy == "overwrite" or not target.exists():
+        return target
+    if policy == "skip":
+        return None
+    number = 1
+    while True:
+        candidate = target.with_name(
+            f"{target.stem} ({number}){target.suffix}"
+        )
+        if not candidate.exists():
+            return candidate
+        number += 1
+
+
+def resolve_collision_bundle(paths: list[str | Path],
+                             policy: str = "suffix") -> list[Path] | None:
+    """Resolve a group of related outputs using one shared collision suffix."""
+    policy = normalize_collision_policy(policy)
+    targets = [Path(path) for path in paths]
+    for target in targets:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    if policy == "overwrite":
+        return targets
+    if policy == "skip":
+        return None if any(target.exists() for target in targets) else targets
+    number = 0
+    while True:
+        candidates = targets if number == 0 else [
+            target.with_name(f"{target.stem} ({number}){target.suffix}")
+            for target in targets
+        ]
+        if all(not candidate.exists() for candidate in candidates):
+            return candidates
+        number += 1
+
+
+def _temporary_output_path(target: Path) -> Path:
+    descriptor, name = tempfile.mkstemp(
+        prefix=f".{target.stem}.",
+        suffix=target.suffix or ".tmp",
+        dir=str(target.parent),
+    )
+    os.close(descriptor)
+    return Path(name)
+
+
+def atomic_write_generated(path: str | Path, writer) -> bool:
+    """Write one generated file beside its target, then atomically publish it."""
+    target = Path(path)
+    temporary: Path | None = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = _temporary_output_path(target)
+        if not writer(temporary):
+            return False
+        os.replace(temporary, target)
+        temporary = None
+        return True
+    except Exception:
+        return False
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+
+def atomic_write_export_frame(path: str | Path, frame: np.ndarray,
+                              fmt: str, quality: int = 90) -> bool:
+    return atomic_write_generated(
+        path,
+        lambda temporary: write_export_frame(
+            str(temporary), frame, fmt, quality
+        ),
+    )
+
+
+def sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with Path(path).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return ""
+    return digest.hexdigest()
+
+
+def default_export_manifest_path(marker_path: str | Path,
+                                 output_dir: str | Path) -> Path:
+    marker_stem = safe_filename(Path(marker_path).stem)
+    output = Path(output_dir).expanduser().resolve()
+    return output / f".framesnap-{marker_stem}.export.json"
+
+
+def _export_settings(fmt: str, quality: int, scale: str, template: str,
+                     burn_overlay: bool,
+                     crop: tuple[int, int, int, int] | None,
+                     collision: str) -> dict:
+    return {
+        "format": fmt,
+        "quality": int(quality),
+        "scale": scale,
+        "template": template,
+        "burn_overlay": bool(burn_overlay),
+        "crop": list(crop) if crop is not None else None,
+        "collision": collision,
+    }
+
+
+def _export_settings_hash(settings: dict) -> str:
+    encoded = json.dumps(settings, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _export_item_id(source: str, frame_idx: int, entry: dict,
+                    settings_hash: str, sequence: int) -> str:
+    payload = {
+        "source": source,
+        "frame": frame_idx,
+        "label": entry.get("label", ""),
+        "tags": entry.get("tags", ""),
+        "comment": entry.get("comment", ""),
+        "settings_hash": settings_hash,
+        "sequence": sequence,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _new_export_manifest(marker_path: str | Path, video_path: str,
+                         settings: dict) -> dict:
+    return {
+        "version": EXPORT_MANIFEST_VERSION,
+        "job": {
+            "marker_path": str(Path(marker_path).expanduser().resolve()),
+            "default_video": video_path,
+            "settings": settings,
+        },
+        "items": {},
+    }
+
+
+def _load_export_manifest(path: Path, marker_path: str | Path,
+                          video_path: str, settings: dict,
+                          resume: bool) -> dict:
+    if not resume or not path.exists():
+        return _new_export_manifest(marker_path, video_path, settings)
+    payload = _read_json_file(path, "export manifest")
+    try:
+        version = int(payload.get("version", 0))
+    except (TypeError, ValueError):
+        raise PersistenceError("Export manifest has an invalid schema version.") from None
+    if version > EXPORT_MANIFEST_VERSION:
+        raise PersistenceError(
+            f"Export manifest version {version} is newer than this FrameSnap release."
+        )
+    items = payload.get("items", {})
+    if not isinstance(items, dict):
+        raise PersistenceError("Export manifest items must be a JSON object.")
+    payload["version"] = EXPORT_MANIFEST_VERSION
+    payload["job"] = {
+        "marker_path": str(Path(marker_path).expanduser().resolve()),
+        "default_video": video_path,
+        "settings": settings,
+    }
+    payload["items"] = items
+    return payload
+
+
+def _save_export_manifest(path: Path, manifest: dict) -> None:
+    atomic_write_json(path, manifest)
+
+
 def batch_export_markers(marker_path: str | Path, output_dir: str | Path,
                          video_path: str = "", fmt: str = "PNG",
                          quality: int = 90, scale: str = "100%",
                          template: str = DEFAULT_TEMPLATE,
                          burn_overlay: bool = False,
-                         crop: tuple[int, int, int, int] | None = None) -> dict:
+                         crop: tuple[int, int, int, int] | None = None,
+                         collision: str = "suffix", resume: bool = True,
+                         manifest_path: str | Path | None = None,
+                         progress=None) -> dict:
     if fmt in ("GIF", "WebP Animation"):
         raise ValueError("Batch marker export supports still-image formats only")
+    collision = normalize_collision_policy(collision)
     entries = load_marker_list(marker_path, video_path)
-    output = Path(output_dir)
+    output = Path(output_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
+    settings = _export_settings(
+        fmt, quality, scale, template, burn_overlay, crop, collision
+    )
+    settings_hash = _export_settings_hash(settings)
+    manifest_target = Path(manifest_path).expanduser().resolve() if manifest_path else (
+        default_export_manifest_path(marker_path, output)
+    )
+    manifest = _load_export_manifest(
+        manifest_target, marker_path, video_path, settings, resume
+    )
+    _save_export_manifest(manifest_target, manifest)
     by_video: dict[str, list[dict]] = {}
     for entry in entries:
         by_video.setdefault(entry["video_path"], []).append(entry)
 
     exported = 0
+    resumed_count = 0
+    skipped = 0
     failures = []
+    completed = 0
+    total = len(entries)
+
+    def update_record(record: dict, status: str, error: str = "") -> None:
+        nonlocal completed
+        record["status"] = status
+        record["error"] = error
+        record["sha256"] = (
+            sha256_file(record["output_path"])
+            if status in ("complete", "skipped")
+            else ""
+        )
+        manifest["items"][record["id"]] = record
+        _save_export_manifest(manifest_target, manifest)
+        completed += 1
+        if progress is not None:
+            progress(completed, total, dict(record))
+
     extension = export_extension(fmt)
     for source, source_entries in by_video.items():
         reader = open_cap(source, "Auto", False, True)
-        if reader is None or not reader.isOpened():
-            failures.append(f"Could not open {source}")
-            continue
+        reader_open = reader is not None and reader.isOpened()
         try:
-            fps = reader.get(cv2.CAP_PROP_FPS) or 30.0
+            fps = reader.get(cv2.CAP_PROP_FPS) or 30.0 if reader_open else 30.0
             resolved = []
             for entry in source_entries:
                 frame = entry["frame"]
@@ -998,26 +1223,89 @@ def batch_export_markers(marker_path: str | Path, output_dir: str | Path,
             resolved.sort(key=lambda item: item[0])
             stem = Path(source).stem
             for sequence, (frame_idx, entry) in enumerate(resolved, 1):
+                item_id = _export_item_id(
+                    source, frame_idx, entry, settings_hash, sequence
+                )
+                previous = manifest["items"].get(item_id)
+                if (isinstance(previous, dict)
+                        and previous.get("settings_hash") == settings_hash
+                        and previous.get("status") == "complete"):
+                    previous_path = Path(previous.get("output_path", ""))
+                    if (previous_path.is_file()
+                            and sha256_file(previous_path) == previous.get("sha256")):
+                        resumed_count += 1
+                        completed += 1
+                        if progress is not None:
+                            progress(completed, total, dict(previous))
+                        continue
+                base_name = apply_template(
+                    template, stem, frame_idx, fps, entry["label"], sequence
+                ) + extension
+                target = resolve_collision_path(output / base_name, collision)
+                if target is None:
+                    skipped += 1
+                    record = {
+                        "id": item_id,
+                        "source_path": source,
+                        "frame": frame_idx,
+                        "label": entry["label"],
+                        "tags": entry["tags"],
+                        "comment": entry["comment"],
+                        "settings": settings,
+                        "settings_hash": settings_hash,
+                        "output_path": str(output / base_name),
+                    }
+                    update_record(record, "skipped", "collision policy skipped existing output")
+                    continue
+                record = {
+                    "id": item_id,
+                    "source_path": source,
+                    "frame": frame_idx,
+                    "label": entry["label"],
+                    "tags": entry["tags"],
+                    "comment": entry["comment"],
+                    "settings": settings,
+                    "settings_hash": settings_hash,
+                    "output_path": str(target),
+                }
+                manifest["items"][item_id] = {
+                    **record, "status": "running", "error": "", "sha256": ""
+                }
+                _save_export_manifest(manifest_target, manifest)
+                if not reader_open:
+                    error = f"Could not open {source}"
+                    failures.append(error)
+                    update_record(record, "failed", error)
+                    continue
                 reader.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
                 ret, frame = reader.read()
-                if not ret:
-                    failures.append(f"{source}: could not read frame {frame_idx}")
+                if not ret or frame is None:
+                    error = f"{source}: could not read frame {frame_idx}"
+                    failures.append(error)
+                    update_record(record, "failed", error)
                     continue
                 frame = transform_export_frame(
                     frame, frame_idx, fps, entry["label"], scale,
                     burn_overlay, crop,
                 )
-                name = apply_template(
-                    template, stem, frame_idx, fps, entry["label"], sequence
-                ) + extension
-                path = output / name
-                if write_export_frame(str(path), frame, fmt, quality):
+                if atomic_write_export_frame(target, frame, fmt, quality):
                     exported += 1
+                    update_record(record, "complete")
                 else:
-                    failures.append(f"{source}: could not write {path}")
+                    error = f"{source}: could not write {target}"
+                    failures.append(error)
+                    update_record(record, "failed", error)
         finally:
-            reader.release()
-    return {"exported": exported, "failed": failures, "videos": len(by_video)}
+            if reader is not None:
+                reader.release()
+    return {
+        "exported": exported,
+        "failed": failures,
+        "videos": len(by_video),
+        "skipped": skipped,
+        "resumed": resumed_count,
+        "manifest": str(manifest_target),
+    }
 
 
 BACKEND_OPTIONS = ["Auto", "OpenCV"] + (["PyAV"] if av is not None else [])
@@ -1679,6 +1967,7 @@ def _config_defaults() -> dict:
         "export_quality": 90,
         "export_scale": "100%",
         "export_group": "All",
+        "collision_policy": "suffix",
         "burn_overlay": False,
         "crop_enabled": False,
         "crop_x": 0,
@@ -3296,6 +3585,18 @@ class MainWindow(QMainWindow):
         dir_row.addWidget(browse_btn)
         oi.addLayout(dir_row)
 
+        collision_row = QHBoxLayout()
+        collision_row.addWidget(QLabel("If a file exists:"))
+        self._collision_combo = QComboBox()
+        self._collision_combo.addItem("Create numbered copy", "suffix")
+        self._collision_combo.addItem("Skip existing file", "skip")
+        self._collision_combo.addItem("Overwrite existing file", "overwrite")
+        self._collision_combo.setToolTip(
+            "Choose how exports handle a filename that already exists."
+        )
+        collision_row.addWidget(self._collision_combo, 1)
+        oi.addLayout(collision_row)
+
         export_row = QHBoxLayout()
         self._export_btn = QPushButton("Export All Frames")
         self._export_btn.setObjectName("exportBtn")
@@ -3373,6 +3674,11 @@ class MainWindow(QMainWindow):
         self._qual_spin.setValue(cfg.get("export_quality", 90))
         self._scale_combo.setCurrentText(cfg.get("export_scale", "100%"))
         self._group_combo.setCurrentText(cfg.get("export_group", "All"))
+        collision = cfg.get("collision_policy", "suffix")
+        if collision not in COLLISION_POLICIES:
+            collision = "suffix"
+        collision_index = self._collision_combo.findData(collision)
+        self._collision_combo.setCurrentIndex(max(0, collision_index))
         self._burn_check.setChecked(cfg.get("burn_overlay", False))
         self._crop_check.setChecked(cfg.get("crop_enabled", False))
         self._crop_x.setValue(cfg.get("crop_x", 0))
@@ -4361,34 +4667,28 @@ class MainWindow(QMainWindow):
     def _write_export_frame(self, path: str, frame: np.ndarray,
                             fmt: str, quality: int,
                             enc_flags: list) -> bool:
-        try:
-            if fmt == "AVIF":
-                if not PilFeatures.check("avif"):
-                    return False
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                PilImage.fromarray(rgb).save(path, format="AVIF", quality=quality)
-                return True
-            if fmt == "TIFF 16-bit":
-                return bool(cv2.imwrite(path, to_uint16_frame(frame)))
-            if fmt == "EXR":
-                float_frame = frame.astype(np.float32) / 255.0
-                flags = [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT]
-                return bool(cv2.imwrite(path, float_frame, flags))
-            return bool(cv2.imwrite(path, frame, enc_flags))
-        except (OSError, ValueError, cv2.error):
-            return False
+        del enc_flags
+        return atomic_write_export_frame(path, frame, fmt, quality)
 
     def export_frames(self):
         if not self.cap or not self.marked:
             return
         out_dir  = self._dir_edit.text().strip() or str(Path.home() / "Desktop")
+        out_dir_path = Path(out_dir).expanduser()
         fmt      = self._fmt_combo.currentText()
         quality  = self._qual_spin.value()
         scale    = self._scale_combo.currentText()
         template = self._name_edit.text().strip() or DEFAULT_TEMPLATE
         group    = self._group_combo.currentText()
         stem     = Path(self._video_path).stem
-        os.makedirs(out_dir, exist_ok=True)
+        collision = normalize_collision_policy(
+            self._collision_combo.currentData() or "suffix"
+        )
+        try:
+            out_dir_path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._set_status(f"Cannot create output folder: {exc}", YELLOW)
+            return
 
         ext_map  = {
             "PNG": ".png", "JPEG": ".jpg", "WebP": ".webp",
@@ -4397,21 +4697,29 @@ class MainWindow(QMainWindow):
             "EXR": ".exr",
         }
         ext      = ext_map.get(fmt, ".png")
-        enc_flags: list = []
-        if fmt == "JPEG":
-            enc_flags = [cv2.IMWRITE_JPEG_QUALITY, quality]
-        elif fmt in ("WebP", "WebP Animation", "AVIF"):
-            enc_flags = [cv2.IMWRITE_WEBP_QUALITY, quality]
 
         frames_data = self._collect_frames(group)
         if not frames_data:
             self._set_status(f"No marks in export group: {group}", YELLOW)
             return
-        exported, errors = 0, 0
+        exported, errors, skipped = 0, 0, 0
 
         if fmt in ("GIF", "WebP Animation"):
-            self._export_animation(frames_data, out_dir, stem, fmt, quality)
-            self._update_export_config(out_dir, fmt, quality, scale, template, group)
+            exported, skipped, errors = self._export_animation(
+                frames_data, str(out_dir_path), stem, fmt, quality, collision
+            )
+            self._update_export_config(
+                str(out_dir_path), fmt, quality, scale, template, group, collision
+            )
+            color = GREEN if not (errors or skipped) else YELLOW
+            suffix = " (skipped: existing output)" if skipped else ""
+            failure = " (failed)" if errors else ""
+            status = (
+                f"Exported animated {fmt} ({len(frames_data)} frames)"
+                if exported else f"Skipped animated {fmt}"
+            )
+            self._set_status(f"{status}{failure}{suffix}\n{out_dir_path}", color)
+            self._tabs.setCurrentIndex(1)
             return
 
         sequence = export_sequence(self.marked, group)
@@ -4420,21 +4728,28 @@ class MainWindow(QMainWindow):
             fname = apply_template(
                 template, stem, idx, self.fps, label, sequence[idx]
             ) + ext
+            target = resolve_collision_path(out_dir_path / fname, collision)
+            if target is None:
+                skipped += 1
+                continue
             ok = self._write_export_frame(
-                os.path.join(out_dir, fname), frame, fmt, quality, enc_flags
+                str(target), frame, fmt, quality, []
             )
             if ok:
                 exported += 1
             else:
                 errors += 1
 
-        self._update_export_config(out_dir, fmt, quality, scale, template, group)
-        color = YELLOW if errors else GREEN
+        self._update_export_config(
+            str(out_dir_path), fmt, quality, scale, template, group, collision
+        )
+        color = YELLOW if errors or skipped else GREEN
         self._set_status(
             f"Exported {exported} frame{'s' if exported != 1 else ''}"
             + (f" ({errors} failed)" if errors else "")
+            + (f" ({skipped} skipped: existing output)" if skipped else "")
             + (f" [{group}]" if group != "All" else "")
-            + f"\n{out_dir}", color
+            + f"\n{out_dir_path}", color
         )
         self._tabs.setCurrentIndex(1)
 
@@ -4471,9 +4786,10 @@ class MainWindow(QMainWindow):
         )
 
     def _export_animation(self, frames_data: list, out_dir: str, stem: str,
-                          fmt: str, quality: int):
+                          fmt: str, quality: int,
+                          collision: str = "suffix") -> tuple[int, int, int]:
         if not frames_data:
-            return
+            return 0, 0, 1
         pil_frames = []
         for idx, bgr, label in frames_data:
             bgr = self._apply_export_transform(bgr, idx, label)
@@ -4485,7 +4801,10 @@ class MainWindow(QMainWindow):
         group = self._group_combo.currentText()
         suffix = "" if group == "All" else f"_{safe_filename(group)}"
         extension = "gif" if fmt == "GIF" else "webp"
-        out_path = os.path.join(out_dir, f"{safe_filename(stem)}{suffix}_marks.{extension}")
+        out_path = Path(out_dir) / f"{safe_filename(stem)}{suffix}_marks.{extension}"
+        target = resolve_collision_path(out_path, collision)
+        if target is None:
+            return 0, 1, 0
         save_kwargs = {
             "save_all": True,
             "append_images": pil_frames[1:],
@@ -4497,17 +4816,29 @@ class MainWindow(QMainWindow):
         else:
             save_kwargs["quality"] = quality
             save_kwargs["method"] = 6
-        pil_frames[0].save(out_path, format=extension.upper(), **save_kwargs)
-        self._set_status(
-            f"Exported animated {fmt} ({len(pil_frames)} frames)\n{out_dir}", GREEN
-        )
-        self._tabs.setCurrentIndex(1)
+        def save_animation(temporary: Path) -> bool:
+            pil_frames[0].save(
+                str(temporary), format=extension.upper(), **save_kwargs
+            )
+            return True
+
+        if not atomic_write_generated(target, save_animation):
+            return 0, 0, 1
+        return len(pil_frames), 0, 0
 
     def export_contact_sheet(self):
         if not self.cap or not self.marked:
             return
         out_dir = self._dir_edit.text().strip() or str(Path.home() / "Desktop")
-        os.makedirs(out_dir, exist_ok=True)
+        out_dir_path = Path(out_dir).expanduser()
+        collision = normalize_collision_policy(
+            self._collision_combo.currentData() or "suffix"
+        )
+        try:
+            out_dir_path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._set_status(f"Cannot create output folder: {exc}", YELLOW)
+            return
 
         group = self._group_combo.currentText()
         frames_data = self._collect_frames(group)
@@ -4565,30 +4896,57 @@ class MainWindow(QMainWindow):
 
         stem     = Path(self._video_path).stem
         suffix = "" if group == "All" else f"_{safe_filename(group)}"
-        out_path = os.path.join(out_dir, f"{safe_filename(stem)}{suffix}_contact_sheet.png")
-        cv2.imwrite(out_path, sheet)
-        pdf_path = ""
+        base_png = out_dir_path / f"{safe_filename(stem)}{suffix}_contact_sheet.png"
+        base_paths = [base_png]
         if self._sheet_pdf.isChecked():
-            pdf_path = os.path.join(
-                out_dir, f"{safe_filename(stem)}{suffix}_contact_sheet.pdf"
+            base_paths.append(base_png.with_suffix(".pdf"))
+        resolved_paths = resolve_collision_bundle(base_paths, collision)
+        if resolved_paths is None:
+            self._set_status(
+                "Contact sheet skipped: output already exists.", YELLOW
             )
-            with PilImage.open(out_path) as image:
-                image.convert("RGB").save(pdf_path, "PDF", resolution=150.0)
+            return
+        out_path = resolved_paths[0]
+        png_ok = atomic_write_generated(
+            out_path,
+            lambda temporary: bool(cv2.imwrite(str(temporary), sheet)),
+        )
+        if not png_ok:
+            self._set_status("Contact sheet failed: could not write PNG.", YELLOW)
+            return
+        pdf_path = ""
+        pdf_failed = False
+        if self._sheet_pdf.isChecked():
+            pdf_target = resolved_paths[1]
+            pdf_image = PilImage.fromarray(cv2.cvtColor(sheet, cv2.COLOR_BGR2RGB))
+
+            def save_pdf(temporary: Path) -> bool:
+                pdf_image.save(str(temporary), "PDF", resolution=150.0)
+                return True
+
+            if atomic_write_generated(pdf_target, save_pdf):
+                pdf_path = str(pdf_target)
+            else:
+                pdf_failed = True
         self._cfg.update({
             "sheet_title": title,
             "sheet_watermark": watermark,
             "sheet_columns": configured_cols,
             "sheet_pdf": self._sheet_pdf.isChecked(),
+            "collision_policy": collision,
         })
         self._save_config()
         group_note = f" [{group}]" if group != "All" else ""
         output_note = f"\n{pdf_path}" if pdf_path else ""
+        pdf_note = " (PDF failed)" if pdf_failed else ""
         self._set_status(
-            f"Contact sheet saved ({n} frames){group_note}\n{out_path}{output_note}", TEAL
+            f"Contact sheet saved ({n} frames){pdf_note}{group_note}\n"
+            f"{out_path}{output_note}", YELLOW if pdf_failed else TEAL
         )
         self._tabs.setCurrentIndex(1)
 
-    def _update_export_config(self, out_dir, fmt, quality, scale, template, group="All"):
+    def _update_export_config(self, out_dir, fmt, quality, scale, template,
+                              group="All", collision="suffix"):
         self._cfg.update({
             "last_output_dir": out_dir,
             "export_format":   fmt,
@@ -4596,6 +4954,7 @@ class MainWindow(QMainWindow):
             "export_scale":    scale,
             "naming_template": template,
             "export_group":     group,
+            "collision_policy": collision,
             "burn_overlay":     self._burn_check.isChecked(),
             "crop_enabled":     self._crop_check.isChecked(),
             "crop_x":            self._crop_x.value(),
@@ -4949,6 +5308,18 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--crop", nargs=4, type=int, metavar=("X", "Y", "W", "H"),
     )
+    parser.add_argument(
+        "--collision", choices=list(COLLISION_POLICIES), default="suffix",
+        help="How batch export handles an existing output filename.",
+    )
+    parser.add_argument(
+        "--manifest", default="",
+        help="Path for the resumable export manifest (default: hidden file in output-dir).",
+    )
+    parser.add_argument(
+        "--no-resume", action="store_true",
+        help="Ignore completed records in an existing export manifest.",
+    )
     parser.add_argument("--version", action="version", version=f"FrameSnap {__version__}")
     return parser
 
@@ -4959,12 +5330,16 @@ def _run_batch_cli(args: argparse.Namespace) -> int:
         result = batch_export_markers(
             args.marker_path, args.output_dir, args.video, args.format,
             args.quality, args.scale, args.template, args.burn_in, crop,
+            collision=args.collision,
+            resume=not args.no_resume,
+            manifest_path=args.manifest or None,
         )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"Batch export failed: {exc}", file=sys.stderr)
         return 2
     print(
-        f"Exported {result['exported']} frame(s) from {result['videos']} video(s)"
+        f"Exported {result['exported']} frame(s) from {result['videos']} video(s); "
+        f"resumed {result['resumed']}, skipped {result['skipped']}"
     )
     for failure in result["failed"]:
         print(f"Warning: {failure}", file=sys.stderr)

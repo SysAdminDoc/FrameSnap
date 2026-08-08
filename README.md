@@ -134,7 +134,12 @@ python framesnap.py --batch-markers markers.csv --video clip.mp4 \
   --output-dir exports --format PNG --burn-in
 ```
 
-The command returns a nonzero exit code if any listed frame cannot be read or written.
+Batch export writes a hidden, atomic `.framesnap-<markers>.export.json` manifest in the output
+folder. Re-running the same command resumes only after each completed output's SHA-256 matches the
+manifest. Use `--manifest path.json` to choose another manifest, `--no-resume` to reprocess the
+list, and `--collision suffix|skip|overwrite` to choose the existing-file policy. The default
+`suffix` policy creates a numbered copy and never silently overwrites an existing export. The
+command returns a nonzero exit code if any listed frame cannot be read or written.
 
 ### Linux packages
 

@@ -13,6 +13,8 @@ All notable changes to FrameSnap will be documented in this file.
   reject unsupported future schemas with actionable errors.
 - Added: generation-aware cooperative cancellation for analysis workers and bounded, acknowledged
   shutdown without force termination.
+- Added: transactional still, animation, contact-sheet, and batch outputs with explicit collision
+  policies plus hash-verified resumable export manifests.
 
 ## [v2.2.0] - 2026-08-03
 

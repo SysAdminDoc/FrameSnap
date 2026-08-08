@@ -22,6 +22,7 @@ from framesnap import (
     PersistenceError,
     apply_template,
     atomic_write_json,
+    atomic_write_export_frame,
     ab_frame_limit,
     batch_export_markers,
     burn_in_overlay,
@@ -39,6 +40,7 @@ from framesnap import (
     main,
     load_config,
     diff_session_data,
+    default_export_manifest_path,
     merge_session_data,
     ms_to_ts,
     session_template_from_data,
@@ -54,6 +56,8 @@ from framesnap import (
     set_wheel_step_for_video,
     wheel_step_for_video,
     proxy_cache_path,
+    resolve_collision_path,
+    sha256_file,
     export_sequence,
     ordered_mark_indices,
     thumbnail_frame_indices,
@@ -249,8 +253,25 @@ def test_batch_marker_export_supports_csv_json_and_cli(tmp_path):
     csv_path.write_text("frame,label\n0,first\n3,last\n", encoding="utf-8")
     csv_output = tmp_path / "csv-output"
     result = batch_export_markers(csv_path, csv_output, str(video), "PNG")
-    assert result == {"exported": 2, "failed": [], "videos": 1}
+    assert result["exported"] == 2
+    assert result["failed"] == []
+    assert result["videos"] == 1
+    assert result["resumed"] == 0
+    assert result["skipped"] == 0
     assert len(list(csv_output.glob("*.png"))) == 2
+    manifest = Path(result["manifest"])
+    assert manifest == default_export_manifest_path(csv_path, csv_output)
+    records = json.loads(manifest.read_text(encoding="utf-8"))["items"]
+    assert len(records) == 2
+    assert all(
+        record["status"] == "complete"
+        and record["source_path"] == str(video.resolve())
+        and record["sha256"] == sha256_file(record["output_path"])
+        for record in records.values()
+    )
+    resumed = batch_export_markers(csv_path, csv_output, str(video), "PNG")
+    assert resumed["exported"] == 0
+    assert resumed["resumed"] == 2
 
     json_path = tmp_path / "markers.json"
     json_path.write_text(
@@ -264,6 +285,20 @@ def test_batch_marker_export_supports_csv_json_and_cli(tmp_path):
         "--format", "JPEG",
     ]) == 0
     assert len(list(json_output.glob("*.jpg"))) == 1
+
+
+def test_collision_policy_and_transactional_export(tmp_path, monkeypatch):
+    target = tmp_path / "frame.png"
+    target.write_bytes(b"original")
+    assert resolve_collision_path(target, "skip") is None
+    assert resolve_collision_path(target, "suffix") == tmp_path / "frame (1).png"
+    assert resolve_collision_path(target, "overwrite") == target
+
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+    monkeypatch.setattr(framesnap_module, "write_export_frame", lambda *args: False)
+    assert not atomic_write_export_frame(target, frame, "PNG")
+    assert target.read_bytes() == b"original"
+    assert not list(tmp_path.glob(".frame.*.png"))
 
 
 def test_windowed_cli_version_handles_missing_streams(monkeypatch):
