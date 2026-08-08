@@ -17,6 +17,8 @@ import framesnap as framesnap_module  # noqa: E402
 from framesnap import av as pyav
 from framesnap import (
     _bootstrap,
+    CancellationToken,
+    JobCancelled,
     PersistenceError,
     apply_template,
     atomic_write_json,
@@ -384,6 +386,32 @@ def test_proxy_generation_is_cached_and_downscaled(tmp_path):
     assert int(reader.get(cv2.CAP_PROP_FRAME_HEIGHT)) == 12
     reader.release()
     assert proxy_cache_path(source) == proxy_cache_path(source)
+
+
+def test_analysis_jobs_abort_without_leaving_partial_proxy(tmp_path):
+    source = tmp_path / "cancel.mp4"
+    output = tmp_path / "cache" / "proxy.mp4"
+    _write_test_video(source)
+
+    def cancelled():
+        return True
+
+    with pytest.raises(JobCancelled):
+        build_video_proxy(source, output, max_width=16, cancelled=cancelled)
+    with pytest.raises(JobCancelled):
+        detect_scene_cuts(str(source), "OpenCV", cancelled=cancelled)
+    with pytest.raises(JobCancelled):
+        find_similar_frames(str(source), "OpenCV", cancelled=cancelled)
+
+    assert not output.exists()
+    assert not list(output.parent.glob(".*.partial.mp4"))
+
+
+def test_cancellation_token_is_one_way():
+    token = CancellationToken()
+    assert not token.is_cancelled()
+    token.cancel()
+    assert token.is_cancelled()
 
 
 def test_thumbnail_indices_cover_the_full_video():

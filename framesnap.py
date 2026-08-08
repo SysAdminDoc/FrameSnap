@@ -15,6 +15,8 @@ import math
 import hashlib
 import shutil
 import tempfile
+import time
+import threading
 from pathlib import Path
 
 from framesnap_version import __version__
@@ -498,6 +500,10 @@ CONFIG_VERSION = 1
 
 class PersistenceError(ValueError):
     """Raised when a FrameSnap JSON document cannot be safely read or written."""
+
+
+class JobCancelled(RuntimeError):
+    """Raised internally when a background job is superseded or stopped."""
 
 
 def _schema_version(value, default: str, kind: str) -> tuple[int, ...]:
@@ -1233,7 +1239,8 @@ def open_cap(path: str, backend: str = "Auto",
         return None
 
 
-def extract_audio_waveform(path: str, bucket_count: int = 1200) -> tuple[list[float], float]:
+def extract_audio_waveform(path: str, bucket_count: int = 1200,
+                           cancelled=None) -> tuple[list[float], float]:
     """Return normalized RMS buckets and duration for the first audio track."""
     if av is None or bucket_count <= 0:
         return [], 0.0
@@ -1252,6 +1259,8 @@ def extract_audio_waveform(path: str, bucket_count: int = 1200) -> tuple[list[fl
             cursor = 0.0
             last_bucket = -1
             for frame in container.decode(stream):
+                if cancelled is not None and cancelled():
+                    raise JobCancelled()
                 raw = np.asarray(frame.to_ndarray())
                 if raw.size == 0:
                     continue
@@ -1290,6 +1299,8 @@ def extract_audio_waveform(path: str, bucket_count: int = 1200) -> tuple[list[fl
             if peak > 0:
                 levels /= peak
             return levels.tolist(), duration
+    except JobCancelled:
+        raise
     except Exception:
         return [], 0.0
 
@@ -1307,7 +1318,8 @@ def proxy_cache_path(path: str, max_width: int = PROXY_MAX_WIDTH) -> Path:
 
 
 def build_video_proxy(source_path: str, output_path: str | Path,
-                      max_width: int = PROXY_MAX_WIDTH) -> tuple[int, int]:
+                      max_width: int = PROXY_MAX_WIDTH,
+                      cancelled=None) -> tuple[int, int]:
     """Create a silent, low-resolution MP4 proxy and return its dimensions."""
     if max_width <= 0:
         raise ValueError("max_width must be positive")
@@ -1342,8 +1354,11 @@ def build_video_proxy(source_path: str, output_path: str | Path,
         raise RuntimeError("could not create proxy video")
 
     frames = 0
+    cancelled_job = False
     try:
         while True:
+            if cancelled is not None and cancelled():
+                raise JobCancelled()
             ok, frame = source.read()
             if not ok:
                 break
@@ -1352,10 +1367,15 @@ def build_video_proxy(source_path: str, output_path: str | Path,
                                    interpolation=cv2.INTER_AREA)
             writer.write(frame)
             frames += 1
+    except JobCancelled:
+        cancelled_job = True
     finally:
         source.release()
         writer.release()
 
+    if cancelled_job:
+        temporary.unlink(missing_ok=True)
+        raise JobCancelled()
     if frames == 0:
         temporary.unlink(missing_ok=True)
         raise RuntimeError("source video contained no decodable frames")
@@ -1378,7 +1398,8 @@ def detect_scene_cuts(path: str, backend: str = "Auto",
                       hardware_accel: bool = False,
                       exact_seek: bool = True,
                       threshold: float = 0.45,
-                      min_gap_frames: int = 1) -> list[int]:
+                      min_gap_frames: int = 1,
+                      cancelled=None) -> list[int]:
     """Find content cuts using histogram distance between consecutive frames."""
     reader = open_cap(path, backend, hardware_accel, exact_seek)
     if reader is None or not reader.isOpened():
@@ -1391,6 +1412,8 @@ def detect_scene_cuts(path: str, backend: str = "Auto",
     frame_idx = 0
     try:
         while True:
+            if cancelled is not None and cancelled():
+                raise JobCancelled()
             ok, frame = reader.read()
             if not ok or frame is None:
                 break
@@ -1549,7 +1572,8 @@ def find_similar_frames(path: str, backend: str = "Auto",
                         threshold: int = 8,
                         sample_step: int = 5,
                         hash_size: int = 8,
-                        max_matches: int = 2000) -> dict:
+                        max_matches: int = 2000,
+                        cancelled=None) -> dict:
     """Scan sampled frames and return earlier near-duplicate matches."""
     hash_size = max(2, min(16, int(hash_size)))
     threshold = max(0, min(hash_size * hash_size, int(threshold)))
@@ -1564,6 +1588,8 @@ def find_similar_frames(path: str, backend: str = "Auto",
     frame_idx = 0
     try:
         while True:
+            if cancelled is not None and cancelled():
+                raise JobCancelled()
             ok, frame = reader.read()
             if not ok or frame is None:
                 break
@@ -1729,9 +1755,51 @@ class FrameCache:
 
 # ── Preview Thread ────────────────────────────────────────────────────────────
 
-class PreviewThread(QThread):
+class CancellationToken:
+    def __init__(self):
+        self._event = threading.Event()
+
+    def cancel(self) -> None:
+        self._event.set()
+
+    def is_cancelled(self) -> bool:
+        return self._event.is_set()
+
+
+class CancellableWorker(QThread):
+    """QThread helper for cooperative cancellation and superseded jobs."""
+    _cond: QWaitCondition
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._job_lock = threading.Lock()
+        self._job_token = CancellationToken()
+        self._running = True
+
+    def _new_job_token(self) -> CancellationToken:
+        with self._job_lock:
+            self._job_token.cancel()
+            self._job_token = CancellationToken()
+            return self._job_token
+
+    def cancel_current(self) -> None:
+        with self._job_lock:
+            self._job_token.cancel()
+        self._cond.wakeAll()
+
+    def _cancelled(self, token: CancellationToken) -> bool:
+        return token.is_cancelled()
+
+    def stop(self) -> None:
+        with self._job_lock:
+            self._running = False
+            self._job_token.cancel()
+        self._cond.wakeAll()
+
+
+class PreviewThread(CancellableWorker):
     """Decodes single frames in background for hover-scrubber preview."""
-    preview_ready = pyqtSignal(int, object)   # frame_idx, ndarray
+    preview_ready = pyqtSignal(int, int, object)   # generation, frame_idx, ndarray
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1743,31 +1811,36 @@ class PreviewThread(QThread):
         self._pending_backend = "Auto"
         self._pending_hardware = False
         self._pending_exact_seek = True
+        self._pending_generation = 0
+        self._pending_token = self._job_token
         self._running = True
 
     def open_video(self, path: str, backend: str = "Auto",
                    hardware_accel: bool = False,
-                   exact_seek: bool = True) -> None:
+                   exact_seek: bool = True,
+                   generation: int = 0) -> None:
+        token = self._new_job_token()
         self._mutex.lock()
         self._pending_path = path
         self._pending_backend = backend
         self._pending_hardware = hardware_accel
         self._pending_exact_seek = exact_seek
+        self._pending_generation = generation
+        self._pending_token = token
         self._mutex.unlock()
         self._cond.wakeOne()
 
-    def request(self, frame_idx: int) -> None:
+    def request(self, frame_idx: int, generation: int = 0) -> None:
+        token = self._new_job_token()
         self._mutex.lock()
         self._pending_frame = frame_idx   # overwrites previous; only latest matters
+        self._pending_generation = generation
+        self._pending_token = token
         self._mutex.unlock()
         self._cond.wakeOne()
 
     def stop(self) -> None:
-        self._mutex.lock()
-        self._running = False
-        self._mutex.unlock()
-        self._cond.wakeOne()
-        self.wait(3000)
+        super().stop()
 
     def run(self) -> None:
         while True:
@@ -1784,48 +1857,54 @@ class PreviewThread(QThread):
             backend = self._pending_backend
             hardware_accel = self._pending_hardware
             exact_seek = self._pending_exact_seek
+            generation = self._pending_generation
+            token = self._pending_token
             self._pending_path  = None
             self._pending_frame = -1
             self._mutex.unlock()
 
+            if self._cancelled(token):
+                continue
             if path is not None:
                 if self._cap:
                     self._cap.release()
                 self._cap = open_cap(path, backend, hardware_accel, exact_seek)
 
-            if idx >= 0 and self._cap and self._cap.isOpened():
+            if (idx >= 0 and not self._cancelled(token)
+                    and self._cap and self._cap.isOpened()):
                 self._cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
                 ret, frame = self._cap.read()
-                if ret:
-                    self.preview_ready.emit(idx, frame.copy())
+                if ret and not self._cancelled(token):
+                    self.preview_ready.emit(generation, idx, frame.copy())
 
         if self._cap:
             self._cap.release()
 
 
-class WaveformThread(QThread):
+class WaveformThread(CancellableWorker):
     """Build an audio waveform without blocking playback or scrubbing."""
-    waveform_ready = pyqtSignal(str, object, float)
+    waveform_ready = pyqtSignal(int, str, object, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._mutex = QMutex()
         self._cond = QWaitCondition()
         self._pending_path: str | None = None
+        self._pending_generation = 0
+        self._pending_token = self._job_token
         self._running = True
 
-    def request(self, path: str) -> None:
+    def request(self, path: str, generation: int = 0) -> None:
+        token = self._new_job_token()
         self._mutex.lock()
         self._pending_path = path
+        self._pending_generation = generation
+        self._pending_token = token
         self._mutex.unlock()
         self._cond.wakeOne()
 
     def stop(self) -> None:
-        self._mutex.lock()
-        self._running = False
-        self._mutex.unlock()
-        self._cond.wakeOne()
-        self.wait(3000)
+        super().stop()
 
     def run(self) -> None:
         while True:
@@ -1836,39 +1915,45 @@ class WaveformThread(QThread):
                 self._mutex.unlock()
                 break
             path = self._pending_path
+            generation = self._pending_generation
+            token = self._pending_token
             self._pending_path = None
             self._mutex.unlock()
 
-            if path is not None:
-                samples, duration = extract_audio_waveform(path)
-                self.waveform_ready.emit(path, samples, duration)
+            if path is not None and not self._cancelled(token):
+                try:
+                    samples, duration = extract_audio_waveform(
+                        path, cancelled=token.is_cancelled
+                    )
+                except JobCancelled:
+                    continue
+                if not self._cancelled(token):
+                    self.waveform_ready.emit(generation, path, samples, duration)
 
 
-class ProxyThread(QThread):
+class ProxyThread(CancellableWorker):
     """Generate one playback proxy at a time outside the GUI thread."""
-    proxy_ready = pyqtSignal(str, str, int, int)
-    proxy_failed = pyqtSignal(str, str)
+    proxy_ready = pyqtSignal(int, str, str, int, int)
+    proxy_failed = pyqtSignal(int, str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._mutex = QMutex()
         self._cond = QWaitCondition()
-        self._pending: tuple[str, str, int] | None = None
+        self._pending: tuple[str, str, int, int, CancellationToken] | None = None
         self._running = True
 
     def request(self, source_path: str, output_path: str,
-                max_width: int = PROXY_MAX_WIDTH) -> None:
+                max_width: int = PROXY_MAX_WIDTH,
+                generation: int = 0) -> None:
+        token = self._new_job_token()
         self._mutex.lock()
-        self._pending = (source_path, output_path, max_width)
+        self._pending = (source_path, output_path, max_width, generation, token)
         self._mutex.unlock()
         self._cond.wakeOne()
 
     def stop(self) -> None:
-        self._mutex.lock()
-        self._running = False
-        self._mutex.unlock()
-        self._cond.wakeOne()
-        self.wait(3000)
+        super().stop()
 
     def run(self) -> None:
         while True:
@@ -1884,43 +1969,49 @@ class ProxyThread(QThread):
 
             if pending is None:
                 continue
-            source_path, output_path, max_width = pending
+            source_path, output_path, max_width, generation, token = pending
+            if self._cancelled(token):
+                continue
             try:
                 width, height = build_video_proxy(
-                    source_path, output_path, max_width
+                    source_path, output_path, max_width,
+                    cancelled=token.is_cancelled,
                 )
-                self.proxy_ready.emit(source_path, output_path, width, height)
+                if not self._cancelled(token):
+                    self.proxy_ready.emit(
+                        generation, source_path, output_path, width, height
+                    )
+            except JobCancelled:
+                continue
             except Exception as exc:
                 Path(output_path).with_name(
                     f".{Path(output_path).stem}.partial.mp4"
                 ).unlink(missing_ok=True)
-                self.proxy_failed.emit(source_path, str(exc))
+                if not self._cancelled(token):
+                    self.proxy_failed.emit(generation, source_path, str(exc))
 
 
-class ThumbnailStripThread(QThread):
+class ThumbnailStripThread(CancellableWorker):
     """Decode evenly-spaced scrubber thumbnails away from the UI thread."""
-    thumbnails_ready = pyqtSignal(str, object)
+    thumbnails_ready = pyqtSignal(int, str, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._mutex = QMutex()
         self._cond = QWaitCondition()
-        self._pending: tuple[str, str, bool, bool] | None = None
+        self._pending: tuple[str, str, bool, bool, int, CancellationToken] | None = None
         self._running = True
 
     def request(self, path: str, backend: str, hardware_accel: bool,
-                exact_seek: bool) -> None:
+                exact_seek: bool, generation: int = 0) -> None:
+        token = self._new_job_token()
         self._mutex.lock()
-        self._pending = (path, backend, hardware_accel, exact_seek)
+        self._pending = (path, backend, hardware_accel, exact_seek, generation, token)
         self._mutex.unlock()
         self._cond.wakeOne()
 
     def stop(self) -> None:
-        self._mutex.lock()
-        self._running = False
-        self._mutex.unlock()
-        self._cond.wakeOne()
-        self.wait(3000)
+        super().stop()
 
     def run(self) -> None:
         while True:
@@ -1936,12 +2027,16 @@ class ThumbnailStripThread(QThread):
 
             if pending is None:
                 continue
-            path, backend, hardware_accel, exact_seek = pending
+            path, backend, hardware_accel, exact_seek, generation, token = pending
+            if self._cancelled(token):
+                continue
             reader = open_cap(path, backend, hardware_accel, exact_seek)
             frames = []
             if reader is not None and reader.isOpened():
                 try:
                     for idx in thumbnail_frame_indices(reader.frame_count):
+                        if self._cancelled(token):
+                            break
                         reader.set(cv2.CAP_PROP_POS_FRAMES, idx)
                         ok, frame = reader.read()
                         if ok and frame is not None:
@@ -1956,36 +2051,36 @@ class ThumbnailStripThread(QThread):
                             frames.append((idx, frame.copy()))
                 finally:
                     reader.release()
-            self.thumbnails_ready.emit(path, frames)
+            if not self._cancelled(token):
+                self.thumbnails_ready.emit(generation, path, frames)
 
 
-class SceneDetectThread(QThread):
+class SceneDetectThread(CancellableWorker):
     """Run histogram-based scene detection off the GUI thread."""
-    scenes_ready = pyqtSignal(str, object)
-    scenes_failed = pyqtSignal(str, str)
+    scenes_ready = pyqtSignal(int, str, object)
+    scenes_failed = pyqtSignal(int, str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._mutex = QMutex()
         self._cond = QWaitCondition()
-        self._pending: tuple[str, str, bool, bool, float, int] | None = None
+        self._pending: tuple[
+            str, str, bool, bool, float, int, int, CancellationToken
+        ] | None = None
         self._running = True
 
     def request(self, path: str, backend: str, hardware_accel: bool,
                 exact_seek: bool, threshold: float,
-                min_gap_frames: int) -> None:
+                min_gap_frames: int, generation: int = 0) -> None:
+        token = self._new_job_token()
         self._mutex.lock()
         self._pending = (path, backend, hardware_accel, exact_seek,
-                         threshold, min_gap_frames)
+                         threshold, min_gap_frames, generation, token)
         self._mutex.unlock()
         self._cond.wakeOne()
 
     def stop(self) -> None:
-        self._mutex.lock()
-        self._running = False
-        self._mutex.unlock()
-        self._cond.wakeOne()
-        self.wait(3000)
+        super().stop()
 
     def run(self) -> None:
         while True:
@@ -2001,43 +2096,49 @@ class SceneDetectThread(QThread):
 
             if pending is None:
                 continue
-            path, backend, hardware_accel, exact_seek, threshold, min_gap = pending
+            path, backend, hardware_accel, exact_seek, threshold, min_gap, generation, token = pending
+            if self._cancelled(token):
+                continue
             try:
                 cuts = detect_scene_cuts(
                     path, backend, hardware_accel, exact_seek,
-                    threshold, min_gap,
+                    threshold, min_gap, cancelled=token.is_cancelled,
                 )
-                self.scenes_ready.emit(path, cuts)
+                if not self._cancelled(token):
+                    self.scenes_ready.emit(generation, path, cuts)
+            except JobCancelled:
+                continue
             except Exception as exc:
-                self.scenes_failed.emit(path, str(exc))
+                if not self._cancelled(token):
+                    self.scenes_failed.emit(generation, path, str(exc))
 
 
-class SimilarityThread(QThread):
+class SimilarityThread(CancellableWorker):
     """Search perceptual hashes away from the UI thread."""
-    similar_ready = pyqtSignal(str, object)
-    similar_failed = pyqtSignal(str, str)
+    similar_ready = pyqtSignal(int, str, object)
+    similar_failed = pyqtSignal(int, str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._mutex = QMutex()
         self._cond = QWaitCondition()
-        self._pending: tuple[str, str, bool, bool, int, int] | None = None
+        self._pending: tuple[
+            str, str, bool, bool, int, int, int, CancellationToken
+        ] | None = None
         self._running = True
 
     def request(self, path: str, backend: str, hardware_accel: bool,
-                exact_seek: bool, threshold: int, sample_step: int) -> None:
+                exact_seek: bool, threshold: int, sample_step: int,
+                generation: int = 0) -> None:
+        token = self._new_job_token()
         self._mutex.lock()
         self._pending = (path, backend, hardware_accel, exact_seek,
-                         threshold, sample_step)
+                         threshold, sample_step, generation, token)
         self._mutex.unlock()
         self._cond.wakeOne()
 
     def stop(self) -> None:
-        self._mutex.lock()
-        self._running = False
-        self._mutex.unlock()
-        self._cond.wakeOne()
-        self.wait(3000)
+        super().stop()
 
     def run(self) -> None:
         while True:
@@ -2053,15 +2154,21 @@ class SimilarityThread(QThread):
 
             if pending is None:
                 continue
-            path, backend, hardware_accel, exact_seek, threshold, sample_step = pending
+            path, backend, hardware_accel, exact_seek, threshold, sample_step, generation, token = pending
+            if self._cancelled(token):
+                continue
             try:
                 matches = find_similar_frames(
                     path, backend, hardware_accel, exact_seek,
-                    threshold, sample_step,
+                    threshold, sample_step, cancelled=token.is_cancelled,
                 )
-                self.similar_ready.emit(path, matches)
+                if not self._cancelled(token):
+                    self.similar_ready.emit(generation, path, matches)
+            except JobCancelled:
+                continue
             except Exception as exc:
-                self.similar_failed.emit(path, str(exc))
+                if not self._cancelled(token):
+                    self.similar_failed.emit(generation, path, str(exc))
 
 
 # ── Mark Slider ───────────────────────────────────────────────────────────────
@@ -2641,6 +2748,7 @@ class MainWindow(QMainWindow):
         self.cap: VideoReader | None = None
         self._ab_dialog: ABViewerDialog | None = None
         self._video_path = ""
+        self._job_generation = 0
         self._playback_path = ""
         self._video_queue: list[str] = []
         self._queue_index = -1
@@ -3472,6 +3580,13 @@ class MainWindow(QMainWindow):
                                  "File may be unsupported or missing codec.")
             return False
 
+        self._job_generation += 1
+        for worker in (
+            self._preview_thread, self._waveform_thread, self._proxy_thread,
+            self._thumbnail_thread, self._scene_thread, self._similarity_thread,
+        ):
+            worker.cancel_current()
+
         source_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         source_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         proxy_candidate: Path | None = None
@@ -3566,19 +3681,21 @@ class MainWindow(QMainWindow):
 
         self._preview_thread.open_video(
             playback_path, self._backend, self._hardware_accel,
-            self._seek_mode == "Exact frame",
+            self._seek_mode == "Exact frame", self._job_generation,
         )
         self._waveform.set_loading()
-        self._waveform_thread.request(path)
+        self._waveform_thread.request(path, self._job_generation)
         self._thumbnail_strip.set_loading()
         self._thumbnail_thread.request(
             playback_path, self._backend, self._hardware_accel,
-            self._seek_mode == "Exact frame",
+            self._seek_mode == "Exact frame", self._job_generation,
         )
         self._show(target_frame)
         if proxy_candidate is not None and playback_path == path:
             self._set_status("Building playback proxy...", BLUE)
-            self._proxy_thread.request(path, str(proxy_candidate))
+            self._proxy_thread.request(
+                path, str(proxy_candidate), generation=self._job_generation
+            )
         elif playback_path != path:
             self._set_status("Using cached playback proxy; exports remain full resolution.", BLUE)
         if record_recent:
@@ -3746,20 +3863,22 @@ class MainWindow(QMainWindow):
         if not self.cap:
             return
         self._pending_hover_pos = global_pos
-        self._preview_thread.request(frame_idx)
+        self._preview_thread.request(frame_idx, self._job_generation)
 
     def _slider_hover_left(self):
         self._hover_popup.hide()
 
-    def _on_waveform_ready(self, path: str, samples, duration: float):
-        if path != self._video_path:
+    def _on_waveform_ready(self, generation: int, path: str, samples,
+                           duration: float):
+        if generation != self._job_generation or path != self._video_path:
             return
         self._waveform.set_waveform(samples, duration)
         self._waveform.set_position(frame_to_ms(self.current_frame, self.fps) / 1000.0)
 
-    def _on_proxy_ready(self, source_path: str, output_path: str,
-                        width: int, height: int):
-        if (not self._proxy_enabled or source_path != self._video_path
+    def _on_proxy_ready(self, generation: int, source_path: str,
+                        output_path: str, width: int, height: int):
+        if (generation != self._job_generation or not self._proxy_enabled
+                or source_path != self._video_path
                 or not os.path.isfile(output_path)):
             return
         position = self.current_frame
@@ -3772,15 +3891,19 @@ class MainWindow(QMainWindow):
                 BLUE,
             )
 
-    def _on_proxy_failed(self, source_path: str, error: str):
-        if source_path == self._video_path and self._proxy_enabled:
+    def _on_proxy_failed(self, generation: int, source_path: str, error: str):
+        if (generation == self._job_generation
+                and source_path == self._video_path and self._proxy_enabled):
             self._set_status(f"Proxy unavailable; using full-resolution playback. {error}", YELLOW)
 
-    def _on_thumbnails_ready(self, path: str, frames):
-        if path == self._playback_path:
+    def _on_thumbnails_ready(self, generation: int, path: str, frames):
+        if generation == self._job_generation and path == self._playback_path:
             self._thumbnail_strip.set_frames(frames)
 
-    def _on_preview_ready(self, frame_idx: int, bgr: np.ndarray):
+    def _on_preview_ready(self, generation: int, frame_idx: int,
+                          bgr: np.ndarray):
+        if generation != self._job_generation:
+            return
         px = bgr_to_pixmap(bgr).scaled(
             184, 104,
             Qt.AspectRatioMode.KeepAspectRatio,
@@ -3809,10 +3932,11 @@ class MainWindow(QMainWindow):
         self._scene_thread.request(
             self._video_path, self._backend, self._hardware_accel,
             self._seek_mode == "Exact frame", 0.45, min_gap,
+            generation=self._job_generation,
         )
 
-    def _on_scenes_ready(self, path: str, cuts):
-        if path != self._video_path:
+    def _on_scenes_ready(self, generation: int, path: str, cuts):
+        if generation != self._job_generation or path != self._video_path:
             return
         if not cuts:
             self._set_status("No scene cuts detected.", YELLOW)
@@ -3824,8 +3948,8 @@ class MainWindow(QMainWindow):
         self._show(original_position)
         self._set_status(f"Auto-marked {len(cuts)} scene cut{'s' if len(cuts) != 1 else ''}.", GREEN)
 
-    def _on_scenes_failed(self, path: str, error: str):
-        if path == self._video_path:
+    def _on_scenes_failed(self, generation: int, path: str, error: str):
+        if generation == self._job_generation and path == self._video_path:
             self._set_status(f"Scene detection failed: {error}", YELLOW)
 
     # ── Similarity search ────────────────────────────────────────────────────
@@ -3863,10 +3987,11 @@ class MainWindow(QMainWindow):
         self._similarity_thread.request(
             self._video_path, self._backend, self._hardware_accel,
             self._seek_mode == "Exact frame", threshold, sample_step,
+            generation=self._job_generation,
         )
 
-    def _on_similarity_ready(self, path: str, result: dict):
-        if path != self._video_path:
+    def _on_similarity_ready(self, generation: int, path: str, result: dict):
+        if generation != self._job_generation or path != self._video_path:
             return
         matches = result.get("matches", [])
         if not matches:
@@ -3894,8 +4019,8 @@ class MainWindow(QMainWindow):
             GREEN,
         )
 
-    def _on_similarity_failed(self, path: str, error: str):
-        if path == self._video_path:
+    def _on_similarity_failed(self, generation: int, path: str, error: str):
+        if generation == self._job_generation and path == self._video_path:
             self._set_status(f"Similarity search failed: {error}", YELLOW)
 
     # ── QR and barcode detection ────────────────────────────────────────────
@@ -4750,14 +4875,27 @@ class MainWindow(QMainWindow):
         if self._ab_dialog is not None:
             self._ab_dialog.close()
             self._ab_dialog = None
-        self._preview_thread.stop()
-        self._waveform_thread.stop()
-        self._proxy_thread.stop()
-        self._thumbnail_thread.stop()
-        self._scene_thread.stop()
-        self._similarity_thread.stop()
+        workers = (
+            self._preview_thread, self._waveform_thread, self._proxy_thread,
+            self._thumbnail_thread, self._scene_thread, self._similarity_thread,
+        )
+        for worker in workers:
+            worker.stop()
+        deadline = time.monotonic() + 5.0
+        for worker in workers:
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if not worker.wait(remaining_ms):
+                QMessageBox.warning(
+                    self,
+                    "Background Work Still Running",
+                    "FrameSnap is still stopping background work. "
+                    "Retry close in a moment.",
+                )
+                event.ignore()
+                return
         if self.cap:
             self.cap.release()
+        event.accept()
         super().closeEvent(event)
 
 

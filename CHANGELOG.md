@@ -11,6 +11,8 @@ All notable changes to FrameSnap will be documented in this file.
   auditing, and version-metadata synchronization tests.
 - Changed: session, template, and preference writes are atomic, keep one rolling backup, and
   reject unsupported future schemas with actionable errors.
+- Added: generation-aware cooperative cancellation for analysis workers and bounded, acknowledged
+  shutdown without force termination.
 
 ## [v2.2.0] - 2026-08-03
 
