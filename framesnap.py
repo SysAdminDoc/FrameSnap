@@ -13,6 +13,8 @@ import multiprocessing
 import subprocess
 import math
 import hashlib
+import shutil
+import tempfile
 from pathlib import Path
 
 from framesnap_version import __version__
@@ -491,6 +493,88 @@ def export_sequence(marked: dict, group: str = "All") -> dict[int, int]:
 
 SESSION_VERSION = "2.2"
 TEMPLATE_VERSION = "1"
+CONFIG_VERSION = 1
+
+
+class PersistenceError(ValueError):
+    """Raised when a FrameSnap JSON document cannot be safely read or written."""
+
+
+def _schema_version(value, default: str, kind: str) -> tuple[int, ...]:
+    text = str(value if value is not None else default).strip()
+    try:
+        parts = tuple(int(part) for part in text.split("."))
+    except (TypeError, ValueError):
+        raise PersistenceError(f"{kind} has an invalid schema version: {text!r}") from None
+    if not parts or any(part < 0 for part in parts):
+        raise PersistenceError(f"{kind} has an invalid schema version: {text!r}")
+    return parts
+
+
+def _check_schema_version(value, current: str, default: str, kind: str) -> None:
+    if _schema_version(value, default, kind) > _schema_version(current, current, kind):
+        raise PersistenceError(
+            f"{kind} version {value!s} is newer than this FrameSnap release "
+            f"({current}); open it with a newer version."
+        )
+
+
+def _read_json_file(path: str | Path, kind: str) -> dict:
+    target = Path(path)
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise PersistenceError(
+            f"Could not read {kind} {target.name}: invalid JSON at line "
+            f"{exc.lineno}, column {exc.colno}."
+        ) from exc
+    except OSError as exc:
+        raise PersistenceError(
+            f"Could not read {kind} {target.name}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise PersistenceError(f"{kind} {target.name} must contain a JSON object.")
+    return payload
+
+
+def atomic_write_json(path: str | Path, payload: dict) -> None:
+    """Write JSON beside its target, preserving the old file and one backup."""
+    target = Path(path).expanduser()
+    temp_path: Path | None = None
+    backup_temp: Path | None = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temp_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+        )
+        temp_path = Path(temp_name)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        backup = target.with_name(f"{target.name}.bak")
+        if target.exists():
+            backup_descriptor, backup_name = tempfile.mkstemp(
+                prefix=f".{backup.name}.", suffix=".tmp", dir=str(target.parent)
+            )
+            os.close(backup_descriptor)
+            backup_temp = Path(backup_name)
+            shutil.copy2(target, backup_temp)
+            os.replace(backup_temp, backup)
+            backup_temp = None
+        os.replace(temp_path, target)
+        temp_path = None
+    except (OSError, TypeError, ValueError) as exc:
+        raise PersistenceError(f"Could not write {target.name}: {exc}") from exc
+    finally:
+        for leftover in (temp_path, backup_temp):
+            if leftover is not None:
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
 
 
 def _clean_session_mark(entry: dict, frame: int) -> dict:
@@ -507,6 +591,9 @@ def normalize_session_data(data: dict) -> dict:
     """Validate and normalize a .fsnap payload for interchange operations."""
     if not isinstance(data, dict):
         raise ValueError("Session payload must be a JSON object")
+    _check_schema_version(
+        data.get("version"), SESSION_VERSION, "2.1", "Session"
+    )
     marks = {}
     for entry in data.get("marks", []):
         if not isinstance(entry, dict):
@@ -523,7 +610,7 @@ def normalize_session_data(data: dict) -> dict:
     except (TypeError, ValueError):
         position = 0
     return {
-        "version": str(data.get("version", SESSION_VERSION)),
+        "version": SESSION_VERSION,
         "video_path": str(data.get("video_path", "")),
         "position": position,
         "marks": [marks[idx] for idx in sorted(marks)],
@@ -531,9 +618,7 @@ def normalize_session_data(data: dict) -> dict:
 
 
 def read_session_file(path: str | Path) -> dict:
-    return normalize_session_data(
-        json.loads(Path(path).read_text(encoding="utf-8"))
-    )
+    return normalize_session_data(_read_json_file(path, "session"))
 
 
 def session_data_from_marks(video_path: str, position: int,
@@ -632,6 +717,9 @@ def session_template_from_data(data: dict, fps: float) -> dict:
 def normalize_template_data(data: dict) -> dict:
     if not isinstance(data, dict):
         raise ValueError("Template payload must be a JSON object")
+    _check_schema_version(
+        data.get("version"), TEMPLATE_VERSION, TEMPLATE_VERSION, "Template"
+    )
     marks = []
     for entry in data.get("marks", []):
         if not isinstance(entry, dict):
@@ -646,13 +734,11 @@ def normalize_template_data(data: dict) -> dict:
             "time_ms": time_ms,
             **_clean_session_mark(entry, 0),
         })
-    return {"version": str(data.get("version", TEMPLATE_VERSION)), "marks": marks}
+    return {"version": TEMPLATE_VERSION, "marks": marks}
 
 
 def read_template_file(path: str | Path) -> dict:
-    return normalize_template_data(
-        json.loads(Path(path).read_text(encoding="utf-8"))
-    )
+    return normalize_template_data(_read_json_file(path, "template"))
 
 
 def template_to_marks(template: dict, fps: float,
@@ -1557,8 +1643,9 @@ def set_wheel_step_for_video(cfg: dict, path: str, step: int) -> int:
     return value
 
 
-def load_config() -> dict:
-    defaults = {
+def _config_defaults() -> dict:
+    return {
+        "config_version": CONFIG_VERSION,
         "recent": [],
         "theme": "Catppuccin Mocha",
         "last_output_dir": str(Path.home() / "Desktop"),
@@ -1587,20 +1674,33 @@ def load_config() -> dict:
         "similarity_step": 5,
         "wheel_steps": {},
     }
-    if CONFIG_PATH.exists():
-        try:
-            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            defaults.update(data)
-        except Exception:
-            pass
+
+
+def normalize_config(data: dict) -> dict:
+    if not isinstance(data, dict):
+        raise PersistenceError("Configuration must be a JSON object.")
+    try:
+        version = int(data.get("config_version", 1))
+    except (TypeError, ValueError):
+        raise PersistenceError("Configuration has an invalid schema version.") from None
+    if version < 0 or version > CONFIG_VERSION:
+        raise PersistenceError(
+            f"Configuration version {version} is not supported by this release."
+        )
+    defaults = _config_defaults()
+    defaults.update(data)
+    defaults["config_version"] = CONFIG_VERSION
     return defaults
 
 
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        return normalize_config(_read_json_file(CONFIG_PATH, "configuration"))
+    return _config_defaults()
+
+
 def save_config(cfg: dict) -> None:
-    try:
-        CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+    atomic_write_json(CONFIG_PATH, normalize_config(cfg))
 
 
 # ── Frame Cache ───────────────────────────────────────────────────────────────
@@ -2518,7 +2618,12 @@ class MainWindow(QMainWindow):
         self.resize(1380, 860)
         self.setAcceptDrops(True)
 
-        self._cfg = load_config()
+        try:
+            self._cfg = load_config()
+            self._config_load_error = None
+        except PersistenceError as exc:
+            self._cfg = _config_defaults()
+            self._config_load_error = str(exc)
         self._theme = self._cfg.get("theme", THEME_NAMES[0])
         if self._theme not in THEME_NAMES:
             self._theme = THEME_NAMES[0]
@@ -2581,6 +2686,8 @@ class MainWindow(QMainWindow):
         self._build_timer()
         self._build_hover_popup()
         self._apply_config()
+        if self._config_load_error:
+            QTimer.singleShot(0, self._show_config_load_error)
 
     # ── Menu ──────────────────────────────────────────────────────────────────
 
@@ -2673,8 +2780,27 @@ class MainWindow(QMainWindow):
             recents.remove(path)
         recents.insert(0, path)
         self._cfg["recent"] = recents[:MAX_RECENT]
-        save_config(self._cfg)
+        self._save_config()
         self._refresh_recent_menu()
+
+    def _save_config(self):
+        try:
+            save_config(self._cfg)
+        except PersistenceError as exc:
+            self._set_status(f"Preferences not saved: {exc}", RED)
+
+    def _show_config_load_error(self):
+        if not self._config_load_error:
+            return
+        QMessageBox.warning(
+            self,
+            "Preferences Reset",
+            "FrameSnap could not load its preferences and is using defaults.\n\n"
+            f"{self._config_load_error}\n\n"
+            "Your previous file was left untouched. Save a preference to create "
+            "a new file and backup.",
+        )
+        self._set_status("Preferences reset to defaults; review the warning.", PEACH)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -3173,7 +3299,7 @@ class MainWindow(QMainWindow):
         previous = self._backend
         self._backend = backend
         self._cfg["backend"] = backend
-        save_config(self._cfg)
+        self._save_config()
         if self._video_path and self.cap:
             if not self._open_path(self._video_path,
                                    start_frame=self.current_frame,
@@ -3181,7 +3307,7 @@ class MainWindow(QMainWindow):
                                    record_recent=False):
                 self._backend = previous
                 self._cfg["backend"] = previous
-                save_config(self._cfg)
+                self._save_config()
                 self._backend_combo.blockSignals(True)
                 self._backend_combo.setCurrentText(previous)
                 self._backend_combo.blockSignals(False)
@@ -3192,7 +3318,7 @@ class MainWindow(QMainWindow):
         previous = self._hardware_accel
         self._hardware_accel = enabled
         self._cfg["hardware_accel"] = enabled
-        save_config(self._cfg)
+        self._save_config()
         if self._video_path and self.cap:
             if not self._open_path(self._video_path,
                                    start_frame=self.current_frame,
@@ -3200,7 +3326,7 @@ class MainWindow(QMainWindow):
                                    record_recent=False):
                 self._hardware_accel = previous
                 self._cfg["hardware_accel"] = previous
-                save_config(self._cfg)
+                self._save_config()
                 self._hardware_check.blockSignals(True)
                 self._hardware_check.setChecked(previous)
                 self._hardware_check.blockSignals(False)
@@ -3213,7 +3339,7 @@ class MainWindow(QMainWindow):
         previous = self._seek_mode
         self._seek_mode = mode
         self._cfg["seek_mode"] = mode
-        save_config(self._cfg)
+        self._save_config()
         if self._video_path and self.cap:
             if not self._open_path(self._video_path,
                                    start_frame=self.current_frame,
@@ -3221,7 +3347,7 @@ class MainWindow(QMainWindow):
                                    record_recent=False):
                 self._seek_mode = previous
                 self._cfg["seek_mode"] = previous
-                save_config(self._cfg)
+                self._save_config()
                 self._seek_combo.blockSignals(True)
                 self._seek_combo.setCurrentText(previous)
                 self._seek_combo.blockSignals(False)
@@ -3231,7 +3357,7 @@ class MainWindow(QMainWindow):
     def _proxy_toggled(self, enabled: bool):
         self._proxy_enabled = enabled
         self._cfg["proxy_enabled"] = enabled
-        save_config(self._cfg)
+        self._save_config()
         if self._video_path and self.cap:
             self._open_path(self._video_path,
                             start_frame=self.current_frame,
@@ -3570,7 +3696,7 @@ class MainWindow(QMainWindow):
         self._wheel_step = set_wheel_step_for_video(
             self._cfg, self._video_path, step
         )
-        save_config(self._cfg)
+        self._save_config()
         self._set_status(
             f"Mouse wheel moves {self._wheel_step} frame"
             f"{'s' if self._wheel_step != 1 else ''} for this video.",
@@ -3606,7 +3732,7 @@ class MainWindow(QMainWindow):
             interval = max(1, int(1000.0 / (self.fps * self._speed)))
             self._timer.setInterval(interval)
         self._cfg["speed"] = text
-        save_config(self._cfg)
+        self._save_config()
 
     def _loop_toggled(self, checked: bool):
         self._loop_mode = checked
@@ -3728,7 +3854,7 @@ class MainWindow(QMainWindow):
             "similarity_threshold": threshold,
             "similarity_step": sample_step,
         })
-        save_config(self._cfg)
+        self._save_config()
         if self.is_playing:
             self.toggle_play()
         self._set_status(
@@ -3918,7 +4044,7 @@ class MainWindow(QMainWindow):
 
     def _group_changed(self, group: str):
         self._cfg["export_group"] = group
-        save_config(self._cfg)
+        self._save_config()
 
     def _marks_context_menu(self, pos):
         item = self._marks_list.itemAt(pos)
@@ -4329,7 +4455,7 @@ class MainWindow(QMainWindow):
             "sheet_columns": configured_cols,
             "sheet_pdf": self._sheet_pdf.isChecked(),
         })
-        save_config(self._cfg)
+        self._save_config()
         group_note = f" [{group}]" if group != "All" else ""
         output_note = f"\n{pdf_path}" if pdf_path else ""
         self._set_status(
@@ -4352,7 +4478,7 @@ class MainWindow(QMainWindow):
             "crop_width":        self._crop_w.value(),
             "crop_height":       self._crop_h.value(),
         })
-        save_config(self._cfg)
+        self._save_config()
 
     # ── Session ───────────────────────────────────────────────────────────────
 
@@ -4413,7 +4539,11 @@ class MainWindow(QMainWindow):
         data = session_data_from_marks(
             self._video_path, self.current_frame, self.marked
         )
-        Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+        try:
+            atomic_write_json(path, data)
+        except PersistenceError as exc:
+            QMessageBox.critical(self, "Session Save Failed", str(exc))
+            return
         self._set_status(f"Session saved: {Path(path).name}", GREEN)
 
     def load_session(self):
@@ -4511,7 +4641,11 @@ class MainWindow(QMainWindow):
         data = session_template_from_data(
             session_data_from_marks(self._video_path, 0, self.marked), self.fps
         )
-        Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+        try:
+            atomic_write_json(path, data)
+        except PersistenceError as exc:
+            QMessageBox.critical(self, "Template Save Failed", str(exc))
+            return
         self._set_status(f"Template saved: {Path(path).name}", GREEN)
 
     def apply_session_template(self):
@@ -4572,12 +4706,12 @@ class MainWindow(QMainWindow):
             action.blockSignals(False)
         if persist:
             self._cfg["theme"] = theme
-            save_config(self._cfg)
+            self._save_config()
 
     def _toggle_overlay(self, checked: bool):
         self.display.set_show_overlay(checked)
         self._cfg["show_overlay"] = checked
-        save_config(self._cfg)
+        self._save_config()
 
     def _fmt_changed(self, fmt: str):
         lossy = fmt in ("JPEG", "WebP", "WebP Animation", "AVIF")

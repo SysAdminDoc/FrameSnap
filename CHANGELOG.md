@@ -9,6 +9,8 @@ All notable changes to FrameSnap will be documented in this file.
   runtime manifest for reproducible local setup.
 - Added: headless cross-platform CI, Windows package smoke coverage, lock validation, dependency
   auditing, and version-metadata synchronization tests.
+- Changed: session, template, and preference writes are atomic, keep one rolling backup, and
+  reject unsupported future schemas with actionable errors.
 
 ## [v2.2.0] - 2026-08-03
 

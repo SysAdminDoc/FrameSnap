@@ -12,11 +12,14 @@ from PIL import Image
 
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 import cv2  # noqa: E402
+import framesnap as framesnap_module  # noqa: E402
 
 from framesnap import av as pyav
 from framesnap import (
     _bootstrap,
+    PersistenceError,
     apply_template,
+    atomic_write_json,
     ab_frame_limit,
     batch_export_markers,
     burn_in_overlay,
@@ -32,6 +35,7 @@ from framesnap import (
     frame_to_ms,
     hamming_distance,
     main,
+    load_config,
     diff_session_data,
     merge_session_data,
     ms_to_ts,
@@ -42,6 +46,9 @@ from framesnap import (
     open_cap,
     parse_tags,
     perceptual_hash,
+    normalize_session_data,
+    normalize_template_data,
+    save_config,
     set_wheel_step_for_video,
     wheel_step_for_video,
     proxy_cache_path,
@@ -173,6 +180,48 @@ def test_session_merge_and_diff_preserve_mark_metadata():
     assert [change["kind"] for change in differences] == [
         "changed", "only-left", "only-right"
     ]
+
+
+def test_json_persistence_is_atomic_and_keeps_one_backup(tmp_path):
+    target = tmp_path / "session.fsnap"
+    target.write_text(json.dumps({"version": "2.1", "marks": []}), encoding="utf-8")
+
+    atomic_write_json(target, {"version": "2.2", "marks": [{"frame": 4}]})
+    assert json.loads(target.read_text(encoding="utf-8"))["version"] == "2.2"
+
+    atomic_write_json(target, {"version": "2.2", "marks": [{"frame": 8}]})
+    backup = target.with_name("session.fsnap.bak")
+    assert json.loads(backup.read_text(encoding="utf-8"))["marks"][0]["frame"] == 4
+    assert not list(tmp_path.glob(".session.fsnap.*.tmp"))
+
+    with pytest.raises(PersistenceError):
+        atomic_write_json(target, {"invalid": object()})
+    assert json.loads(target.read_text(encoding="utf-8"))["marks"][0]["frame"] == 8
+
+
+def test_persistence_migrations_normalize_legacy_and_reject_future_versions():
+    session = normalize_session_data({
+        "version": "2.1",
+        "video_path": "clip.mp4",
+        "marks": [{"frame": 3}],
+    })
+    assert session["version"] == "2.2"
+    assert normalize_template_data({"marks": []})["version"] == "1"
+    with pytest.raises(PersistenceError, match="newer"):
+        normalize_session_data({"version": "99.0", "marks": []})
+
+
+def test_config_persistence_has_schema_and_backup(tmp_path, monkeypatch):
+    config_path = tmp_path / "framesnap-config.json"
+    monkeypatch.setattr(framesnap_module, "CONFIG_PATH", config_path)
+    save_config({"theme": "GitHub Dark"})
+    assert load_config()["config_version"] == 1
+    save_config({"theme": "Catppuccin Latte"})
+    backup = config_path.with_name("framesnap-config.json.bak")
+    assert json.loads(backup.read_text(encoding="utf-8"))["theme"] == "GitHub Dark"
+    config_path.write_text("{not-json", encoding="utf-8")
+    with pytest.raises(PersistenceError, match="invalid JSON"):
+        load_config()
 
 
 def test_session_template_round_trips_relative_timestamps():
