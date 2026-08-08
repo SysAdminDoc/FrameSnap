@@ -101,12 +101,12 @@ def test_version_metadata_is_synced():
     assert re.search(rf'<release version="{re.escape(version)}"', metainfo)
 
 
-def _write_test_video(path):
+def _write_test_video(path, count=5, fps=10.0):
     writer = cv2.VideoWriter(
-        str(path), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (32, 24)
+        str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (32, 24)
     )
     assert writer.isOpened()
-    for index in range(5):
+    for index in range(count):
         writer.write(np.full((24, 32, 3), index * 40, dtype=np.uint8))
     writer.release()
 
@@ -141,6 +141,66 @@ def test_ab_viewer_frame_position_helpers():
     assert clamp_frame_position(-4, 10) == 0
     assert clamp_frame_position(20, 10) == 9
     assert clamp_frame_position(20, 0) == 20
+
+
+def test_ab_viewer_supports_time_alignment_offsets_and_boundaries(tmp_path):
+    app = framesnap_module.QApplication.instance()
+    if app is None:
+        app = framesnap_module.QApplication([])
+    left = tmp_path / "ab-left.mp4"
+    right = tmp_path / "ab-right.mp4"
+    _write_test_video(left)
+    _write_test_video(right, count=3)
+
+    dialog = framesnap_module.ABViewerDialog(
+        None, str(left), str(right), "OpenCV", False, True,
+    )
+    assert [
+        dialog._alignment_combo.itemText(index)
+        for index in range(dialog._alignment_combo.count())
+    ] == ["Frame index", "Presentation time"]
+    assert dialog._slider.maximum() == 4
+    assert "Frame index alignment" in dialog._status_label.text()
+
+    dialog._offset_spin.setValue(-2)
+    assert "offset B -2 frames" in dialog._status_label.text()
+    dialog._show_position(0)
+    assert "No frame at -2 in video B" in dialog._right_display.text()
+
+    dialog._alignment_combo.setCurrentText("Presentation time")
+    assert dialog._slider.maximum() == 500
+    assert dialog._offset_label.text() == "Offset B (ms):"
+    dialog._offset_spin.setValue(0)
+    dialog._show_position(400)
+    assert "No frame at 00:00:00.400 in video B" in dialog._status_label.text()
+    dialog._offset_spin.setValue(100)
+    dialog._show_position(200)
+    assert "Presentation time alignment" in dialog._status_label.text()
+    assert "offset B +100 ms" in dialog._status_label.text()
+    assert "No frame at 00:00:00.300 in video B" in dialog._status_label.text()
+
+    dialog._show_position(500)
+    assert dialog._position == 500
+    assert "No frame at 00:00:00.500 in video A" in dialog._status_label.text()
+    dialog.close()
+
+
+def test_pyav_time_seek_uses_presentation_timestamp(tmp_path):
+    if pyav is None:
+        pytest.skip("PyAV is optional")
+    path = tmp_path / "timestamp-seek.mp4"
+    _write_test_video(path)
+    reader = open_cap(str(path), "PyAV", exact_seek=True)
+    assert reader is not None and reader.isOpened()
+    assert reader.seek_time_ms(350)
+    ok, frame = reader.read()
+    identity = reader.last_frame_info
+    duration_ms = reader.duration_ms
+    reader.release()
+    assert ok and frame is not None
+    assert identity["timestamp_source"] == "pts"
+    assert identity["display_time_ms"] >= 350
+    assert duration_ms >= 500
 
 
 def test_export_transforms_preserve_expected_dimensions_and_metadata():

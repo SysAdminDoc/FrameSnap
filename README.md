@@ -25,7 +25,7 @@
 - Drag scrubber to any position
 - **Mouse wheel** on the video to step frames
 - **Per-video mouse-wheel step** — configure 1–1000 frames per notch from Edit → Set Mouse-Wheel Step
-- **Side-by-side A/B viewer** — compare two files at the same frame index from File → Open Side-by-Side A/B Viewer
+- **Side-by-side A/B viewer** — compare two files by frame index or presentation time, with signed B offsets and per-source identity overlays
 - **Frame/time identity** — marks retain frame index plus presentation timestamp/time base when the decoder provides them; Exact frame, Approximate keyframe, and Nearest timestamp seeking are explicit
 - **Drag-and-drop queue** — drop several videos at once, then move through the queue with the
   previous/next controls while reusing marks and export settings

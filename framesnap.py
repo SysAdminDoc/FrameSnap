@@ -1584,6 +1584,7 @@ class VideoReader:
         self._decoder = None
         self._presentation_origin = 0.0
         self._seek_target: int | None = None
+        self._seek_time_target_ms: float | None = None
         self._current_frame = -1
         self._decode_index = 0
         self._last_frame_info = frame_time_identity(0, 0.0)
@@ -1664,6 +1665,8 @@ class VideoReader:
             self._container = None
         self._stream = None
         self._decoder = None
+        self._seek_target = None
+        self._seek_time_target_ms = None
 
     def _pyav_frame_index(self, frame) -> int:
         if frame.pts is not None and self._stream is not None:
@@ -1704,14 +1707,29 @@ class VideoReader:
                 return False, None
             idx = self._pyav_frame_index(frame)
             self._decode_index = idx + 1
-            if self._seek_target is not None and idx < self._seek_target:
-                continue
-            self._seek_target = None
             self._current_frame = idx
             time_base = self._stream.time_base if self._stream is not None else None
             raw_seconds = None
             if frame.pts is not None and time_base is not None:
                 raw_seconds = float(frame.pts * time_base)
+            display_ms_value = (
+                (raw_seconds - self._presentation_origin) * 1000.0
+                if raw_seconds is not None else None
+            )
+            candidate_time_ms = (
+                display_ms_value
+                if display_ms_value is not None
+                else frame_to_ms(idx, self.fps)
+            )
+            if self._seek_target is not None and idx < self._seek_target:
+                continue
+            if (
+                self._seek_time_target_ms is not None
+                and candidate_time_ms + 0.001 < self._seek_time_target_ms
+            ):
+                continue
+            self._seek_target = None
+            self._seek_time_target_ms = None
             self._last_frame_info = frame_time_identity(
                 idx,
                 self.source_fps,
@@ -1721,8 +1739,8 @@ class VideoReader:
                     raw_seconds * 1000.0 if raw_seconds is not None else None
                 ),
                 display_time_ms=(
-                    (raw_seconds - self._presentation_origin) * 1000.0
-                    if raw_seconds is not None else None
+                    display_ms_value
+                    if display_ms_value is not None else None
                 ),
                 timestamp_source="pts" if raw_seconds is not None else None,
             )
@@ -1742,9 +1760,43 @@ class VideoReader:
             self._seek_frame(max(0, int(value)))
             return True
         if prop == cv2.CAP_PROP_POS_MSEC:
-            self._seek_frame(max(0, int(round(value * self.fps / 1000.0))))
-            return True
+            return self.seek_time_ms(value)
         return False
+
+    def seek_time_ms(self, value: float) -> bool:
+        """Seek to the first decoded frame at or after a display timestamp."""
+        try:
+            target_ms = float(value)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(target_ms) or target_ms < 0:
+            return False
+        if self._cv_cap is not None:
+            ok = bool(self._cv_cap.set(cv2.CAP_PROP_POS_MSEC, target_ms))
+            if ok:
+                self._decode_index = max(
+                    0, round(target_ms * self.fps / 1000.0)
+                )
+            return ok
+        if self._container is None or self._stream is None:
+            return False
+        time_base = self._stream.time_base
+        if time_base is None:
+            self._seek_frame(max(0, int(round(target_ms * self.fps / 1000.0))))
+            self._seek_time_target_ms = target_ms
+            return True
+        absolute_seconds = self._presentation_origin + target_ms / 1000.0
+        timestamp = int(absolute_seconds / float(time_base))
+        self._container.seek(
+            max(0, timestamp), stream=self._stream,
+            any_frame=not self.exact_seek, backward=True,
+        )
+        self._decoder = self._container.decode(self._stream)
+        self._seek_target = None
+        self._seek_time_target_ms = target_ms
+        self._current_frame = -1
+        self._decode_index = 0
+        return True
 
     def _seek_frame(self, idx: int) -> None:
         if self._container is None or self._stream is None:
@@ -1756,6 +1808,7 @@ class VideoReader:
                              backward=self.exact_seek)
         self._decoder = self._container.decode(self._stream)
         self._seek_target = idx if self.exact_seek else None
+        self._seek_time_target_ms = None
         self._current_frame = idx - 1
         self._decode_index = max(0, idx - 1)
 
@@ -1788,6 +1841,23 @@ class VideoReader:
                 and self.source_fps > 0):
             return max(0, int(round(float(duration * self._stream.time_base)
                                      * self.source_fps)))
+        return 0
+
+    @property
+    def duration_ms(self) -> int:
+        """Return the best available stream duration in display milliseconds."""
+        if self._cv_cap is not None:
+            count = self.frame_count
+            fps = self.source_fps
+            return max(0, int(round(frame_to_ms(count, fps)))) if fps > 0 else 0
+        if self._stream is not None:
+            duration = self._stream.duration
+            time_base = self._stream.time_base
+            if duration is not None and time_base is not None:
+                return max(
+                    0,
+                    int(round(float(duration * time_base) * 1000.0)),
+                )
         return 0
 
     def get(self, prop: int) -> float:
@@ -3058,11 +3128,11 @@ class VideoDisplay(QLabel):
 # ── A/B Viewer ───────────────────────────────────────────────────────────────
 
 class ABViewerDialog(QDialog):
-    """Compare two videos at the same numeric frame position."""
+    """Compare two videos by frame index or presentation time."""
 
     def __init__(self, parent, left_path: str, right_path: str,
                  backend: str, hardware_accel: bool, exact_seek: bool,
-                 start_frame: int = 0):
+                 start_frame: int = 0, seek_mode: str = "Exact frame"):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle("FrameSnap · Side-by-Side A/B Viewer")
@@ -3071,8 +3141,15 @@ class ABViewerDialog(QDialog):
 
         self._left_path = left_path
         self._right_path = right_path
-        self._left_reader = open_cap(left_path, backend, hardware_accel, exact_seek)
-        self._right_reader = open_cap(right_path, backend, hardware_accel, exact_seek)
+        self._seek_mode = normalize_seek_mode(seek_mode, exact_seek)
+        self._left_reader = open_cap(
+            left_path, backend, hardware_accel, exact_seek,
+            seek_mode=self._seek_mode,
+        )
+        self._right_reader = open_cap(
+            right_path, backend, hardware_accel, exact_seek,
+            seek_mode=self._seek_mode,
+        )
         if self._left_reader is None or self._right_reader is None:
             if self._left_reader is not None:
                 self._left_reader.release()
@@ -3083,7 +3160,19 @@ class ABViewerDialog(QDialog):
         self._left_count = max(0, self._left_reader.frame_count)
         self._right_count = max(0, self._right_reader.frame_count)
         self._max_count = max(self._left_count, self._right_count)
+        self._left_fps = self._left_reader.source_fps or 30.0
+        self._right_fps = self._right_reader.source_fps or 30.0
+        self._left_duration_ms = (
+            self._left_reader.duration_ms
+            or self._duration_ms(self._left_count, self._left_fps)
+        )
+        self._right_duration_ms = (
+            self._right_reader.duration_ms
+            or self._duration_ms(self._right_count, self._right_fps)
+        )
         self._position = 0
+        self._alignment = "Frame index"
+        self._start_frame = max(0, int(start_frame))
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -3104,19 +3193,21 @@ class ABViewerDialog(QDialog):
 
         control_row = QHBoxLayout()
         previous = QPushButton("−1")
-        previous.setToolTip("Show the previous frame position in both videos")
-        previous.clicked.connect(lambda: self._show_position(self._position - 1))
+        previous.setToolTip("Show the previous aligned position")
+        previous.clicked.connect(lambda: self._show_position(
+            self._position - self._step_size()
+        ))
         next_button = QPushButton("+1")
-        next_button.setToolTip("Show the next frame position in both videos")
-        next_button.clicked.connect(lambda: self._show_position(self._position + 1))
+        next_button.setToolTip("Show the next aligned position")
+        next_button.clicked.connect(lambda: self._show_position(
+            self._position + self._step_size()
+        ))
         self._position_label = QLabel("Frame 0")
-        self._position_label.setMinimumWidth(90)
+        self._position_label.setMinimumWidth(120)
         self._position_label.setStyleSheet(
             f"color: {MAUVE}; font-family: Consolas, monospace;"
         )
         self._slider = QSlider(Qt.Orientation.Horizontal)
-        self._slider.setRange(0, ab_frame_limit(self._left_count, self._right_count))
-        self._slider.setEnabled(self._max_count > 0)
         self._slider.valueChanged.connect(self._show_position)
         control_row.addWidget(previous)
         control_row.addWidget(next_button)
@@ -3124,10 +3215,28 @@ class ABViewerDialog(QDialog):
         control_row.addWidget(self._slider, 1)
         root.addLayout(control_row)
 
+        alignment_row = QHBoxLayout()
+        alignment_row.addWidget(QLabel("Alignment:"))
+        self._alignment_combo = QComboBox()
+        self._alignment_combo.addItems(["Frame index", "Presentation time"])
+        self._alignment_combo.currentTextChanged.connect(self._alignment_changed)
+        alignment_row.addWidget(self._alignment_combo)
+        self._offset_label = QLabel("Offset B (frames):")
+        alignment_row.addWidget(self._offset_label)
+        self._offset_spin = QSpinBox()
+        self._offset_spin.setRange(-100_000_000, 100_000_000)
+        self._offset_spin.setValue(0)
+        self._offset_spin.setToolTip(
+            "Signed offset applied to video B; negative values show B earlier."
+        )
+        self._offset_spin.valueChanged.connect(self._offset_changed)
+        alignment_row.addWidget(self._offset_spin)
+        alignment_row.addStretch()
+        root.addLayout(alignment_row)
+
         count_text = (
             f"A: {self._count_text(self._left_count)} frames  ·  "
-            f"B: {self._count_text(self._right_count)} frames  ·  "
-            "Frame positions are compared by index"
+            f"B: {self._count_text(self._right_count)} frames"
         )
         self._status_label = QLabel(count_text)
         self._status_label.setStyleSheet(f"color: {SUBTEXT0}; font-size: 11px;")
@@ -3137,7 +3246,13 @@ class ABViewerDialog(QDialog):
         close_button.clicked.connect(self.close)
         root.addWidget(close_button, 0, Qt.AlignmentFlag.AlignRight)
 
-        self._show_position(start_frame)
+        self._configure_alignment(self._start_frame)
+
+    @staticmethod
+    def _duration_ms(count: int, fps: float) -> int:
+        if count <= 0 or fps <= 0:
+            return 0
+        return max(0, int(round(frame_to_ms(count, fps))))
 
     @staticmethod
     def _count_text(count: int) -> str:
@@ -3158,38 +3273,130 @@ class ABViewerDialog(QDialog):
         layout.addWidget(display, 1)
         return panel, display
 
-    def _read_at(self, reader: VideoReader, count: int,
-                 position: int) -> np.ndarray | None:
-        if count > 0 and position >= count:
-            return None
+    def _step_size(self) -> int:
+        if self._alignment == "Frame index":
+            return 1
+        return max(1, int(round(1000.0 / self._left_fps)))
+
+    def _configure_alignment(self, start_value: int):
+        self._slider.blockSignals(True)
+        if self._alignment == "Frame index":
+            maximum = ab_frame_limit(self._left_count, self._right_count)
+            self._slider.setRange(0, maximum)
+            self._position = max(0, min(maximum, int(start_value)))
+            self._offset_label.setText("Offset B (frames):")
+        else:
+            maximum = max(self._left_duration_ms, self._right_duration_ms)
+            maximum = max(0, maximum)
+            self._slider.setRange(0, maximum)
+            self._position = max(0, min(maximum, int(start_value)))
+            self._offset_label.setText("Offset B (ms):")
+        self._slider.setEnabled(self._slider.maximum() > 0)
+        self._slider.setValue(self._position)
+        self._slider.blockSignals(False)
+        self._show_position(self._position)
+
+    def _alignment_changed(self, alignment: str):
+        self._alignment = alignment
+        start = (
+            self._start_frame if alignment == "Frame index"
+            else int(round(frame_to_ms(self._start_frame, self._left_fps)))
+        )
+        self._configure_alignment(start)
+
+    def _offset_changed(self, _value: int):
+        self._show_position(self._position)
+
+    def _read_at(self, reader: VideoReader | None, count: int,
+                 position: int) -> tuple[np.ndarray | None, dict | None]:
+        if reader is None or position < 0 or (count > 0 and position >= count):
+            return None, None
         if not reader.set(cv2.CAP_PROP_POS_FRAMES, position):
-            return None
+            return None, None
         ok, frame = reader.read()
-        return frame if ok else None
+        return (frame, reader.last_frame_info) if ok else (None, None)
+
+    def _read_at_time(self, reader: VideoReader | None, count: int, time_ms: int,
+                      fps: float) -> tuple[np.ndarray | None, dict | None]:
+        if reader is None or time_ms < 0:
+            return None, None
+        duration = reader.duration_ms or self._duration_ms(count, fps)
+        if duration > 0 and time_ms >= duration:
+            return None, None
+        if not reader.seek_time_ms(time_ms):
+            return None, None
+        ok, frame = reader.read()
+        return (frame, reader.last_frame_info) if ok else (None, None)
+
+    @staticmethod
+    def _time_text(identity: dict | None, fallback_frame: int,
+                   fps: float) -> str:
+        if identity is None:
+            return "--:--:--.---"
+        timestamp = display_time_ms(identity, fallback_frame, fps)
+        text = ms_to_ts(timestamp)
+        if identity.get("pts") is not None and identity.get("time_base"):
+            text += f"  PTS {identity['pts']}@{identity['time_base']}"
+        return text
+
+    def _render_side(self, display: VideoDisplay, frame, identity,
+                     side: str, requested: int, fps: float):
+        if frame is None or identity is None:
+            message = (
+                f"No frame at {requested:,} in video {side}"
+                if self._alignment == "Frame index"
+                else f"No frame at {ms_to_ts(max(0, requested))} in video {side}"
+            )
+            display.show_message(message)
+            return message
+        actual = int(identity.get("frame", requested))
+        time_text = self._time_text(identity, actual, fps)
+        display.show_frame(frame)
+        display.set_overlay(f"Frame {actual:,}  |  {time_text}")
+        return f"{side} frame {actual:,} @ {time_text}"
 
     def _show_position(self, position: int):
-        if self._max_count > 0:
-            position = clamp_frame_position(position, self._max_count)
+        if self._alignment == "Frame index":
+            maximum = ab_frame_limit(self._left_count, self._right_count)
+            position = max(0, min(maximum, int(position)))
+            offset = self._offset_spin.value()
+            left_frame, left_info = self._read_at(
+                self._left_reader, self._left_count, position
+            )
+            right_frame, right_info = self._read_at(
+                self._right_reader, self._right_count, position + offset
+            )
+            self._position_label.setText(f"Frame {position:,}")
+            offset_text = f"offset B {offset:+d} frames"
         else:
-            position = max(0, int(position))
+            maximum = max(self._left_duration_ms, self._right_duration_ms)
+            position = max(0, min(maximum, int(position)))
+            offset = self._offset_spin.value()
+            left_frame, left_info = self._read_at_time(
+                self._left_reader, self._left_count, position, self._left_fps
+            )
+            right_frame, right_info = self._read_at_time(
+                self._right_reader, self._right_count, position + offset,
+                self._right_fps,
+            )
+            self._position_label.setText(f"Time {ms_to_ts(position)}")
+            offset_text = f"offset B {offset:+d} ms"
         self._position = position
         self._slider.blockSignals(True)
         self._slider.setValue(position)
         self._slider.blockSignals(False)
-        self._position_label.setText(f"Frame {position:,}")
-
-        left_frame = self._read_at(self._left_reader, self._left_count, position)
-        right_frame = self._read_at(self._right_reader, self._right_count, position)
-        if left_frame is None:
-            self._left_display.show_message(f"No frame {position:,} in video A")
-        else:
-            self._left_display.show_frame(left_frame)
-            self._left_display.set_overlay(f"Frame {position:,}")
-        if right_frame is None:
-            self._right_display.show_message(f"No frame {position:,} in video B")
-        else:
-            self._right_display.show_frame(right_frame)
-            self._right_display.set_overlay(f"Frame {position:,}")
+        left_text = self._render_side(
+            self._left_display, left_frame, left_info, "A", position,
+            self._left_fps,
+        )
+        right_requested = position + self._offset_spin.value()
+        right_text = self._render_side(
+            self._right_display, right_frame, right_info, "B", right_requested,
+            self._right_fps,
+        )
+        self._status_label.setText(
+            f"{self._alignment} alignment · {offset_text} · {left_text} · {right_text}"
+        )
 
     def closeEvent(self, event):
         self._left_reader.release()
@@ -4123,7 +4330,7 @@ class MainWindow(QMainWindow):
             dialog = ABViewerDialog(
                 self, first_path, second_path, self._backend,
                 self._hardware_accel, self._seek_mode == "Exact frame",
-                self.current_frame,
+                self.current_frame, seek_mode=self._seek_mode,
             )
         except RuntimeError as exc:
             QMessageBox.critical(self, "A/B Viewer Failed", str(exc))

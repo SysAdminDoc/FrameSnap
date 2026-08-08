@@ -19,6 +19,8 @@ All notable changes to FrameSnap will be documented in this file.
   reparse-point checks for safer local media exports.
 - Added: frame/time identities for marks and manifests, including decoder PTS/time-base metadata
   when available and explicit Exact, Approximate, and Nearest timestamp seek modes.
+- Added: A/B comparison by frame index or presentation time, signed offsets, per-source frame/time
+  overlays, and deterministic mismatched-boundary handling.
 
 ## [v2.2.0] - 2026-08-03
 
