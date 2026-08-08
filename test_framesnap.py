@@ -35,6 +35,7 @@ from framesnap import (
     extract_chapters,
     find_similar_frames,
     ffmpeg_extract_command,
+    frame_time_identity,
     frame_to_ms,
     hamming_distance,
     main,
@@ -53,9 +54,11 @@ from framesnap import (
     parse_tags,
     perceptual_hash,
     normalize_session_data,
+    normalize_seek_mode,
     normalize_template_data,
     save_config,
     safe_filename,
+    SEEK_OPTIONS,
     set_wheel_step_for_video,
     wheel_step_for_video,
     proxy_cache_path,
@@ -404,6 +407,63 @@ def test_reader_seek_mode_is_explicit(tmp_path, exact_seek):
     ok, frame = reader.read()
     reader.release()
     assert ok and frame is not None
+
+
+def test_reader_preserves_frame_time_identity_and_final_frame(tmp_path):
+    path = tmp_path / "identity.mp4"
+    _write_test_video(path)
+    reader = open_cap(str(path), "OpenCV")
+    assert reader is not None and reader.isOpened()
+    assert reader.set(cv2.CAP_PROP_POS_FRAMES, 4)
+    ok, frame = reader.read()
+    identity = reader.last_frame_info
+    assert ok and frame is not None
+    assert identity["frame"] == 4
+    assert identity["pts"] is None
+    assert identity["timestamp_source"] == "nominal_fps"
+    assert identity["display_time_ms"] == 400.0
+    reader.release()
+
+    if pyav is not None:
+        reader = open_cap(str(path), "PyAV")
+        assert reader is not None and reader.isOpened()
+        assert reader.set(cv2.CAP_PROP_POS_FRAMES, 4)
+        ok, frame = reader.read()
+        identity = reader.last_frame_info
+        reader.release()
+        assert ok and frame is not None
+        assert identity["timestamp_source"] == "pts"
+        assert identity["pts"] is not None
+        assert identity["time_base"]
+        assert identity["presentation_time_ms"] is not None
+
+
+def test_frame_time_contract_migrates_legacy_marks_and_seek_modes():
+    identity = frame_time_identity(7, 0.0)
+    assert identity["timestamp_source"] == "unknown"
+    assert identity["display_time_ms"] is None
+    assert normalize_seek_mode("Fast keyframe") == "Approximate keyframe"
+    assert normalize_seek_mode("not-a-mode", exact_seek=False) == "Approximate keyframe"
+    assert SEEK_OPTIONS == [
+        "Exact frame", "Approximate keyframe", "Nearest timestamp"
+    ]
+
+    session = normalize_session_data({
+        "video_path": "clip.mp4",
+        "marks": [{
+            "frame": 7,
+            "pts": 231,
+            "time_base": "1/1000",
+            "presentation_time_ms": 231,
+            "display_time_ms": 100.5,
+            "timestamp_source": "pts",
+        }],
+    })
+    mark = session["marks"][0]
+    assert mark["pts"] == 231
+    assert mark["time_base"] == "1/1000"
+    assert mark["display_time_ms"] == 100.5
+    assert mark["timestamp_source"] == "pts"
 
 
 def test_auto_reader_and_hardware_request(tmp_path):

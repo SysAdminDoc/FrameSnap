@@ -18,6 +18,7 @@ import tempfile
 import time
 import threading
 import unicodedata
+from fractions import Fraction
 from pathlib import Path
 
 from framesnap_version import __version__
@@ -406,6 +407,79 @@ def frame_to_ms(idx: int, fps: float) -> float:
     return (idx / fps) * 1000.0 if fps > 0 else 0.0
 
 
+FRAME_TIME_SOURCES = ("pts", "nominal_fps", "unknown")
+
+
+def _time_base_text(value) -> str | None:
+    if value is None:
+        return None
+    try:
+        fraction = Fraction(value)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    if fraction.denominator <= 0:
+        return None
+    return f"{fraction.numerator}/{fraction.denominator}"
+
+
+def frame_time_identity(frame_idx: int, fps: float,
+                        pts: int | None = None,
+                        time_base=None,
+                        presentation_time_ms: float | None = None,
+                        display_time_ms: float | None = None,
+                        timestamp_source: str | None = None) -> dict:
+    """Return the stable frame/time identity stored in marks and manifests."""
+    source = timestamp_source if timestamp_source in FRAME_TIME_SOURCES else None
+    time_base_text = _time_base_text(time_base)
+    if pts is not None:
+        try:
+            pts = int(pts)
+        except (TypeError, ValueError, OverflowError):
+            pts = None
+    if presentation_time_ms is not None:
+        try:
+            presentation_time_ms = float(presentation_time_ms)
+        except (TypeError, ValueError, OverflowError):
+            presentation_time_ms = None
+    if display_time_ms is not None:
+        try:
+            display_time_ms = float(display_time_ms)
+        except (TypeError, ValueError, OverflowError):
+            display_time_ms = None
+    if presentation_time_ms is not None and not math.isfinite(presentation_time_ms):
+        presentation_time_ms = None
+    if display_time_ms is not None and not math.isfinite(display_time_ms):
+        display_time_ms = None
+    if display_time_ms is None and fps > 0:
+        display_time_ms = frame_to_ms(frame_idx, fps)
+    if source is None:
+        source = "pts" if pts is not None and time_base_text else (
+            "nominal_fps" if fps > 0 else "unknown"
+        )
+    return {
+        "frame": max(0, int(frame_idx)),
+        "pts": pts,
+        "time_base": time_base_text,
+        "presentation_time_ms": (
+            round(presentation_time_ms, 3)
+            if presentation_time_ms is not None else None
+        ),
+        "display_time_ms": (
+            round(max(0.0, display_time_ms), 3)
+            if display_time_ms is not None else None
+        ),
+        "timestamp_source": source,
+    }
+
+
+def display_time_ms(identity: dict | None, frame_idx: int, fps: float) -> float:
+    if isinstance(identity, dict):
+        value = identity.get("display_time_ms")
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return max(0.0, float(value))
+    return frame_to_ms(frame_idx, fps)
+
+
 def ab_frame_limit(left_count: int, right_count: int) -> int:
     """Return the last shared A/B slider position for two frame counts."""
     return max(0, max(int(left_count), int(right_count)) - 1)
@@ -463,8 +537,10 @@ def safe_filename(name: str) -> str:
 
 
 def apply_template(template: str, stem: str, frame_idx: int,
-                   fps: float, label: str, n: int) -> str:
-    ts  = ms_to_ts(frame_to_ms(frame_idx, fps)).replace(":", "-").replace(".", "-")
+                   fps: float, label: str, n: int,
+                   timestamp_ms: float | None = None) -> str:
+    ts_ms = frame_to_ms(frame_idx, fps) if timestamp_ms is None else timestamp_ms
+    ts  = ms_to_ts(ts_ms).replace(":", "-").replace(".", "-")
     lbl = label.strip() or "mark"
     try:
         result = template.format(
@@ -596,8 +672,17 @@ def atomic_write_json(path: str | Path, payload: dict) -> None:
 
 
 def _clean_session_mark(entry: dict, frame: int) -> dict:
+    identity = frame_time_identity(
+        frame,
+        0.0,
+        pts=entry.get("pts"),
+        time_base=entry.get("time_base"),
+        presentation_time_ms=entry.get("presentation_time_ms"),
+        display_time_ms=entry.get("display_time_ms"),
+        timestamp_source=entry.get("timestamp_source"),
+    )
     return {
-        "frame": int(frame),
+        **identity,
         "label": str(entry.get("label", "")).strip(),
         "color": str(entry.get("color", MAUVE)),
         "tags": ", ".join(parse_tags(str(entry.get("tags", "")))),
@@ -649,7 +734,12 @@ def session_data_from_marks(video_path: str, position: int,
             {"frame": idx, "label": mark.get("label", ""),
              "color": mark.get("color", MAUVE),
              "tags": mark.get("tags", ""),
-             "comment": mark.get("comment", "")}
+             "comment": mark.get("comment", ""),
+             "pts": mark.get("pts"),
+             "time_base": mark.get("time_base"),
+             "presentation_time_ms": mark.get("presentation_time_ms"),
+             "display_time_ms": mark.get("display_time_ms"),
+             "timestamp_source": mark.get("timestamp_source")}
             for idx, mark in sorted(marked.items())
         ],
     })
@@ -795,10 +885,12 @@ def crop_frame(frame: np.ndarray, x: int, y: int,
 
 
 def burn_in_overlay(frame: np.ndarray, frame_idx: int, fps: float,
-                    label: str = "") -> np.ndarray:
+                    label: str = "", timestamp_ms: float | None = None) -> np.ndarray:
     """Burn frame/timestamp/label metadata into a copy of an 8-bit BGR frame."""
     result = frame.copy()
-    timestamp = ms_to_ts(frame_to_ms(frame_idx, fps))
+    timestamp = ms_to_ts(
+        frame_to_ms(frame_idx, fps) if timestamp_ms is None else timestamp_ms
+    )
     lines = [f"Frame {frame_idx:,}  |  {timestamp}"]
     if label.strip():
         lines.append(label.strip())
@@ -825,9 +917,12 @@ def to_uint16_frame(frame: np.ndarray) -> np.ndarray:
 
 
 def ffmpeg_extract_command(video_path: str, frame_idx: int, fps: float,
-                            output_path: str) -> str:
+                            output_path: str,
+                            timestamp_ms: float | None = None) -> str:
     """Return a reproducible FFmpeg single-frame extraction command."""
-    seconds = frame_to_ms(frame_idx, fps) / 1000.0
+    seconds = (
+        frame_to_ms(frame_idx, fps) if timestamp_ms is None else timestamp_ms
+    ) / 1000.0
     video = str(video_path).replace('"', '\\"')
     output = str(output_path).replace('"', '\\"')
     return f'ffmpeg -ss {seconds:.3f} -i "{video}" -frames:v 1 -y "{output}"'
@@ -1037,12 +1132,13 @@ def scale_export_frame(frame: np.ndarray, scale: str) -> np.ndarray:
 def transform_export_frame(frame: np.ndarray, frame_idx: int, fps: float,
                            label: str, scale: str = "100%",
                            burn_overlay: bool = False,
-                           crop: tuple[int, int, int, int] | None = None) -> np.ndarray:
+                           crop: tuple[int, int, int, int] | None = None,
+                           timestamp_ms: float | None = None) -> np.ndarray:
     if crop is not None:
         frame = crop_frame(frame, *crop)
     frame = scale_export_frame(frame, scale)
     if burn_overlay:
-        frame = burn_in_overlay(frame, frame_idx, fps, label)
+        frame = burn_in_overlay(frame, frame_idx, fps, label, timestamp_ms)
     return frame
 
 
@@ -1362,7 +1458,11 @@ def batch_export_markers(marker_path: str | Path, output_dir: str | Path,
                             progress(completed, total, dict(previous))
                         continue
                 base_name = apply_template(
-                    template, stem, frame_idx, fps, entry["label"], sequence
+                    template, stem, frame_idx, fps, entry["label"], sequence,
+                    timestamp_ms=(
+                        entry["time_ms"] if entry["time_ms"] is not None
+                        else frame_to_ms(frame_idx, fps)
+                    ),
                 ) + extension
                 try:
                     base_path = ensure_output_path(output, output / base_name)
@@ -1383,6 +1483,7 @@ def batch_export_markers(marker_path: str | Path, output_dir: str | Path,
                         "settings": settings,
                         "settings_hash": settings_hash,
                         "output_path": str(output / base_name),
+                        **frame_time_identity(frame_idx, fps),
                     }
                     update_record(record, "skipped", "collision policy skipped existing output")
                     continue
@@ -1396,6 +1497,7 @@ def batch_export_markers(marker_path: str | Path, output_dir: str | Path,
                     "settings": settings,
                     "settings_hash": settings_hash,
                     "output_path": str(target),
+                    **frame_time_identity(frame_idx, fps),
                 }
                 manifest["items"][item_id] = {
                     **record, "status": "running", "error": "", "sha256": ""
@@ -1413,9 +1515,10 @@ def batch_export_markers(marker_path: str | Path, output_dir: str | Path,
                     failures.append(error)
                     update_record(record, "failed", error)
                     continue
+                record.update(reader.last_frame_info)
                 frame = transform_export_frame(
                     frame, frame_idx, fps, entry["label"], scale,
-                    burn_overlay, crop,
+                    burn_overlay, crop, record.get("display_time_ms"),
                 )
                 if atomic_write_export_frame(target, frame, fmt, quality):
                     exported += 1
@@ -1438,7 +1541,19 @@ def batch_export_markers(marker_path: str | Path, output_dir: str | Path,
 
 
 BACKEND_OPTIONS = ["Auto", "OpenCV"] + (["PyAV"] if av is not None else [])
-SEEK_OPTIONS = ["Exact frame", "Fast keyframe"]
+SEEK_OPTIONS = ["Exact frame", "Approximate keyframe", "Nearest timestamp"]
+
+
+def normalize_seek_mode(mode: str | None, exact_seek: bool = True) -> str:
+    aliases = {
+        "Fast keyframe": "Approximate keyframe",
+        "Approximate": "Approximate keyframe",
+        "Nearest": "Nearest timestamp",
+    }
+    value = aliases.get(str(mode or "").strip(), str(mode or "").strip())
+    if value not in SEEK_OPTIONS:
+        return "Exact frame" if exact_seek else "Approximate keyframe"
+    return value
 
 
 def _hardware_backend_name() -> str:
@@ -1454,20 +1569,24 @@ class VideoReader:
 
     def __init__(self, path: str, backend: str = "Auto",
                  hardware_accel: bool = False,
-                 exact_seek: bool = True):
+                 exact_seek: bool = True,
+                 seek_mode: str | None = None):
         self.path = path
         self.backend_name = ""
         self.audio_tracks: int | None = None
         self.hardware_accel = False
         self.hardware_fallback = False
-        self.exact_seek = exact_seek
+        self.seek_mode = normalize_seek_mode(seek_mode, exact_seek)
+        self.exact_seek = self.seek_mode == "Exact frame"
         self._cv_cap: cv2.VideoCapture | None = None
         self._container = None
         self._stream = None
         self._decoder = None
+        self._presentation_origin = 0.0
         self._seek_target: int | None = None
         self._current_frame = -1
         self._decode_index = 0
+        self._last_frame_info = frame_time_identity(0, 0.0)
 
         requested = backend if backend in BACKEND_OPTIONS else "Auto"
         candidates = [requested]
@@ -1518,6 +1637,9 @@ class VideoReader:
         self._stream = next(iter(self._container.streams.video), None)
         if self._stream is None:
             raise RuntimeError("PyAV found no video stream")
+        time_base = self._stream.time_base
+        if self._stream.start_time is not None and time_base is not None:
+            self._presentation_origin = float(self._stream.start_time * time_base)
         try:
             self._stream.thread_type = "AUTO"
         except (AttributeError, ValueError):
@@ -1546,7 +1668,10 @@ class VideoReader:
     def _pyav_frame_index(self, frame) -> int:
         if frame.pts is not None and self._stream is not None:
             try:
-                timestamp = float(frame.pts * self._stream.time_base)
+                timestamp = (
+                    float(frame.pts * self._stream.time_base)
+                    - self._presentation_origin
+                )
                 if timestamp >= 0:
                     return max(0, int(round(timestamp * self.fps)))
             except (TypeError, ValueError, ZeroDivisionError):
@@ -1555,7 +1680,21 @@ class VideoReader:
 
     def read(self) -> tuple[bool, np.ndarray | None]:
         if self._cv_cap is not None:
-            return self._cv_cap.read()
+            ok, frame = self._cv_cap.read()
+            if not ok or frame is None:
+                return False, None
+            position = self._cv_cap.get(cv2.CAP_PROP_POS_FRAMES)
+            if math.isfinite(float(position)) and position >= 1:
+                idx = max(0, int(round(position)) - 1)
+            else:
+                idx = self._decode_index
+            self._current_frame = idx
+            self._decode_index = idx + 1
+            self._last_frame_info = frame_time_identity(
+                idx, self.source_fps,
+                timestamp_source="nominal_fps" if self.source_fps > 0 else "unknown",
+            )
+            return True, frame
         if self._decoder is None:
             return False, None
         while True:
@@ -1569,11 +1708,36 @@ class VideoReader:
                 continue
             self._seek_target = None
             self._current_frame = idx
+            time_base = self._stream.time_base if self._stream is not None else None
+            raw_seconds = None
+            if frame.pts is not None and time_base is not None:
+                raw_seconds = float(frame.pts * time_base)
+            self._last_frame_info = frame_time_identity(
+                idx,
+                self.source_fps,
+                pts=frame.pts,
+                time_base=time_base,
+                presentation_time_ms=(
+                    raw_seconds * 1000.0 if raw_seconds is not None else None
+                ),
+                display_time_ms=(
+                    (raw_seconds - self._presentation_origin) * 1000.0
+                    if raw_seconds is not None else None
+                ),
+                timestamp_source="pts" if raw_seconds is not None else None,
+            )
             return True, frame.to_ndarray(format="bgr24")
 
     def set(self, prop: int, value: float) -> bool:
         if self._cv_cap is not None:
-            return bool(self._cv_cap.set(prop, value))
+            ok = bool(self._cv_cap.set(prop, value))
+            if ok and prop == cv2.CAP_PROP_POS_FRAMES:
+                self._decode_index = max(0, int(value))
+            elif ok and prop == cv2.CAP_PROP_POS_MSEC:
+                self._decode_index = max(
+                    0, round(value * self.fps / 1000.0)
+                )
+            return ok
         if prop == cv2.CAP_PROP_POS_FRAMES:
             self._seek_frame(max(0, int(value)))
             return True
@@ -1596,14 +1760,19 @@ class VideoReader:
         self._decode_index = max(0, idx - 1)
 
     @property
-    def fps(self) -> float:
+    def source_fps(self) -> float:
         if self._cv_cap is not None:
-            return self._cv_cap.get(cv2.CAP_PROP_FPS) or 30.0
+            value = self._cv_cap.get(cv2.CAP_PROP_FPS)
+            return float(value) if value and math.isfinite(float(value)) else 0.0
         if self._stream is not None:
             rate = self._stream.average_rate or self._stream.base_rate
             if rate:
                 return float(rate)
-        return 30.0
+        return 0.0
+
+    @property
+    def fps(self) -> float:
+        return self.source_fps or 30.0
 
     @property
     def frame_count(self) -> int:
@@ -1615,16 +1784,17 @@ class VideoReader:
         if frames > 0:
             return frames
         duration = self._stream.duration
-        if duration is not None and self._stream.time_base is not None:
+        if (duration is not None and self._stream.time_base is not None
+                and self.source_fps > 0):
             return max(0, int(round(float(duration * self._stream.time_base)
-                                     * self.fps)))
+                                     * self.source_fps)))
         return 0
 
     def get(self, prop: int) -> float:
         if self._cv_cap is not None:
             return self._cv_cap.get(prop)
         if prop == cv2.CAP_PROP_FPS:
-            return self.fps
+            return self.source_fps
         if prop == cv2.CAP_PROP_FRAME_COUNT:
             return float(self.frame_count)
         if prop == cv2.CAP_PROP_FRAME_WIDTH:
@@ -1634,6 +1804,10 @@ class VideoReader:
         if prop == cv2.CAP_PROP_POS_FRAMES:
             return float(max(0, self._current_frame))
         return 0.0
+
+    @property
+    def last_frame_info(self) -> dict:
+        return dict(self._last_frame_info)
 
 
 def _probe_audio_tracks(path: str) -> int | None:
@@ -1649,9 +1823,12 @@ def _probe_audio_tracks(path: str) -> int | None:
 
 def open_cap(path: str, backend: str = "Auto",
              hardware_accel: bool = False,
-             exact_seek: bool = True) -> VideoReader | None:
+             exact_seek: bool = True,
+             seek_mode: str | None = None) -> VideoReader | None:
     try:
-        return VideoReader(path, backend, hardware_accel, exact_seek)
+        return VideoReader(
+            path, backend, hardware_accel, exact_seek, seek_mode=seek_mode
+        )
     except (OSError, RuntimeError, ValueError):
         return None
 
@@ -3028,6 +3205,7 @@ class FrameItemWidget(QWidget):
 
     def __init__(self, frame_idx: int, fps: float,
                  thumb: QPixmap | None, label: str = "",
+                 display_time_ms_value: float | None = None,
                  color: str = MAUVE, tags: str = "", comment: str = "",
                  parent=None):
         super().__init__(parent)
@@ -3063,7 +3241,8 @@ class FrameItemWidget(QWidget):
         # Info
         info = QVBoxLayout()
         info.setSpacing(1)
-        ms = frame_to_ms(frame_idx, fps)
+        ms = (display_time_ms_value if display_time_ms_value is not None
+              else frame_to_ms(frame_idx, fps))
         self._ts_lbl    = QLabel(ms_to_ts(ms))
         self._ts_lbl.setStyleSheet(f"color: {TEXT}; font-weight: bold; font-size: 13px;")
         self._frame_lbl = QLabel(f"Frame {frame_idx:,}")
@@ -3157,9 +3336,7 @@ class MainWindow(QMainWindow):
         if self._backend not in BACKEND_OPTIONS:
             self._backend = "Auto"
         self._hardware_accel = bool(self._cfg.get("hardware_accel", False))
-        self._seek_mode = self._cfg.get("seek_mode", "Exact frame")
-        if self._seek_mode not in SEEK_OPTIONS:
-            self._seek_mode = "Exact frame"
+        self._seek_mode = normalize_seek_mode(self._cfg.get("seek_mode"))
         self._proxy_enabled = bool(self._cfg.get("proxy_enabled", False))
 
         # Video state
@@ -3172,7 +3349,10 @@ class MainWindow(QMainWindow):
         self._queue_index = -1
         self.total_frames = 0       # 0 means unknown
         self.fps          = 30.0
+        self._fps_known   = False
         self.current_frame = 0
+        self._current_frame_info = frame_time_identity(0, 0.0)
+        self._frame_metadata: dict[int, dict] = {}
         self.is_playing   = False
         self._loop_mode   = False
         self._speed       = 1.0
@@ -3389,7 +3569,8 @@ class MainWindow(QMainWindow):
         self._seek_combo.addItems(SEEK_OPTIONS)
         self._seek_combo.setFixedHeight(30)
         self._seek_combo.setToolTip(
-            "Exact frame decodes forward from a keyframe; Fast keyframe returns sooner."
+            "Exact frame decodes to the requested index; approximate keyframe favors speed; "
+            "nearest timestamp targets presentation time."
         )
         self._seek_combo.currentTextChanged.connect(self._seek_changed)
         top_bar.addWidget(self._seek_combo)
@@ -4006,7 +4187,7 @@ class MainWindow(QMainWindow):
 
         cap = open_cap(
             path, self._backend, self._hardware_accel,
-            self._seek_mode == "Exact frame",
+            self._seek_mode == "Exact frame", seek_mode=self._seek_mode,
         )
         if cap is None or not cap.isOpened():
             QMessageBox.critical(self, "Error",
@@ -4034,7 +4215,7 @@ class MainWindow(QMainWindow):
                 proxy_cap = open_cap(
                     str(proxy_candidate), self._backend,
                     self._hardware_accel,
-                    self._seek_mode == "Exact frame",
+                    self._seek_mode == "Exact frame", seek_mode=self._seek_mode,
                 )
                 if proxy_cap is not None and proxy_cap.isOpened():
                     cap.release()
@@ -4061,7 +4242,8 @@ class MainWindow(QMainWindow):
 
         # BUG FIX: handle formats where FRAME_COUNT is 0 or -1
         raw_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.fps   = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self._fps_known = cap.source_fps > 0
+        self.fps   = cap.source_fps or 30.0
         if raw_count > 0:
             self.total_frames = raw_count
         else:
@@ -4069,6 +4251,8 @@ class MainWindow(QMainWindow):
 
         self.current_frame = 0
         self._cache.clear()
+        self._frame_metadata.clear()
+        self._current_frame_info = frame_time_identity(0, cap.source_fps)
 
         # Marks remain useful when only the decoder is changed.
         if not preserve_marks:
@@ -4083,7 +4267,7 @@ class MainWindow(QMainWindow):
         self.slider.setEnabled(self.total_frames > 0)
         self.slider.blockSignals(False)
 
-        if self.total_frames > 0:
+        if self.total_frames > 0 and self._fps_known:
             self._dur_lbl.setText(ms_to_ts(frame_to_ms(self.total_frames, self.fps)))
         else:
             self._dur_lbl.setText("--:--:--.---")
@@ -4102,9 +4286,13 @@ class MainWindow(QMainWindow):
             decoder += " (software fallback)"
         if playback_path != path:
             decoder += f" + proxy {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}"
+        fps_text = f"{self.fps:.3f} fps" if self._fps_known else "fps unknown"
+        duration_text = (
+            ms_to_ts(frame_to_ms(self.total_frames, self.fps))
+            if self.total_frames > 0 and self._fps_known else "duration unknown"
+        )
         self._info_bar.setText(
-            f"  {vw}x{vh}  |  {self.fps:.3f} fps  |  "
-            f"{ms_to_ts(frame_to_ms(self.total_frames or 0, self.fps))}  |  "
+            f"  {vw}x{vh}  |  {fps_text}  |  {duration_text}  |  "
             f"{tf} frames  |  {sizeof_fmt(sz)}  |  {decoder}  |  {audio}"
         )
         self._info_bar.show()
@@ -4139,6 +4327,13 @@ class MainWindow(QMainWindow):
 
     # ── Playback ──────────────────────────────────────────────────────────────
 
+    def _seek_reader_frame(self, reader: VideoReader, frame_idx: int) -> bool:
+        if self._seek_mode == "Nearest timestamp":
+            return reader.set(
+                cv2.CAP_PROP_POS_MSEC, frame_to_ms(frame_idx, self.fps)
+            )
+        return reader.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+
     def _show(self, idx: int):
         if not self.cap:
             return
@@ -4150,28 +4345,37 @@ class MainWindow(QMainWindow):
         cached = self._cache.get(idx)
         if cached is not None:
             frame = cached
+            identity = self._frame_metadata.get(
+                idx, frame_time_identity(idx, self.fps)
+            )
             # Only sync cap position when playing so _advance reads correctly
             if self.is_playing:
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx + 1)
         else:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            self._seek_reader_frame(self.cap, idx)
             ret, frame = self.cap.read()
             if not ret:
                 return
             self._cache.put(idx, frame)
+            identity = self.cap.last_frame_info
+            self._frame_metadata[idx] = identity
 
-        self.current_frame = idx
+        shown_idx = int(identity.get("frame", idx)) if (
+            self._seek_mode == "Nearest timestamp"
+        ) else idx
+        self.current_frame = shown_idx
+        self._current_frame_info = identity
         self._last_bgr     = frame
         self.display.show_frame(frame)
-        ms = frame_to_ms(idx, self.fps)
+        ms = display_time_ms(identity, shown_idx, self.fps)
         self._pos_lbl.setText(ms_to_ts(ms))
         tf  = f" / {self.total_frames:,}" if self.total_frames else ""
-        self.display.set_overlay(f"Frame {idx:,}{tf}  |  {ms_to_ts(ms)}")
+        self.display.set_overlay(f"Frame {shown_idx:,}{tf}  |  {ms_to_ts(ms)}")
         self._waveform.set_position(ms / 1000.0)
 
         if not self._slider_held and self.total_frames > 0:
             self.slider.blockSignals(True)
-            self.slider.setValue(idx)
+            self.slider.setValue(shown_idx)
             self.slider.blockSignals(False)
 
     def _advance(self):
@@ -4199,18 +4403,22 @@ class MainWindow(QMainWindow):
                 return
 
         self._cache.put(nxt, frame)
-        self.current_frame = nxt
+        identity = self.cap.last_frame_info
+        self._frame_metadata[nxt] = identity
+        shown_idx = int(identity.get("frame", nxt))
+        self.current_frame = shown_idx
+        self._current_frame_info = identity
         self._last_bgr     = frame
         self.display.show_frame(frame)
-        ms = frame_to_ms(nxt, self.fps)
+        ms = display_time_ms(identity, shown_idx, self.fps)
         self._pos_lbl.setText(ms_to_ts(ms))
         tf = f" / {self.total_frames:,}" if self.total_frames else ""
-        self.display.set_overlay(f"Frame {nxt:,}{tf}  |  {ms_to_ts(ms)}")
+        self.display.set_overlay(f"Frame {shown_idx:,}{tf}  |  {ms_to_ts(ms)}")
         self._waveform.set_position(ms / 1000.0)
 
         if not self._slider_held and self.total_frames > 0:
             self.slider.blockSignals(True)
-            self.slider.setValue(nxt)
+            self.slider.setValue(shown_idx)
             self.slider.blockSignals(False)
 
     def toggle_play(self):
@@ -4308,7 +4516,11 @@ class MainWindow(QMainWindow):
         if generation != self._job_generation or path != self._video_path:
             return
         self._waveform.set_waveform(samples, duration)
-        self._waveform.set_position(frame_to_ms(self.current_frame, self.fps) / 1000.0)
+        self._waveform.set_position(
+            display_time_ms(
+                self._current_frame_info, self.current_frame, self.fps
+            ) / 1000.0
+        )
 
     def _on_proxy_ready(self, generation: int, source_path: str,
                         output_path: str, width: int, height: int):
@@ -4345,7 +4557,9 @@ class MainWindow(QMainWindow):
             Qt.TransformationMode.SmoothTransformation,
         )
         self._hover_thumb_lbl.setPixmap(px)
-        self._hover_ts_lbl.setText(ms_to_ts(frame_to_ms(frame_idx, self.fps)))
+        self._hover_ts_lbl.setText(ms_to_ts(
+            display_time_ms(self._frame_metadata.get(frame_idx), frame_idx, self.fps)
+        ))
         gp = self._pending_hover_pos
         x, y = gp.x() - 96, gp.y() - 148
         screen = QApplication.primaryScreen().availableGeometry()
@@ -4511,12 +4725,26 @@ class MainWindow(QMainWindow):
         idx = self.current_frame
         if idx in self.marked:
             self._marks_list.setCurrentItem(self.marked[idx]["item"])
-            self._set_status(f"Already marked: {ms_to_ts(frame_to_ms(idx, self.fps))}", YELLOW)
+            self._set_status(
+                f"Already marked: {ms_to_ts(display_time_ms(self.marked[idx], idx, self.fps))}",
+                YELLOW,
+            )
             return
 
         thumb  = make_thumb(self._last_bgr) if self._last_bgr is not None else None
         color  = MAUVE
-        widget = FrameItemWidget(idx, self.fps, thumb, color=color)
+        identity = frame_time_identity(idx, self.fps, **{
+            key: self._current_frame_info.get(key)
+            for key in (
+                "pts", "time_base", "presentation_time_ms",
+                "display_time_ms", "timestamp_source",
+            )
+        })
+        widget = FrameItemWidget(
+            idx, self.fps, thumb,
+            display_time_ms_value=display_time_ms(identity, idx, self.fps),
+            color=color,
+        )
         widget.remove_requested.connect(self._remove_mark)
         widget.jump_requested.connect(self._jump_to)
 
@@ -4533,12 +4761,14 @@ class MainWindow(QMainWindow):
         self._marks_list.setItemWidget(list_item, widget)
         self.marked[idx] = {
             "item": list_item, "widget": widget, "label": "",
-            "color": color, "tags": "", "comment": "",
+            "color": color, "tags": "", "comment": "", **identity,
         }
 
         self.slider.set_marks({k: v["color"] for k, v in self.marked.items()})
         self._update_marks_ui()
-        self._set_status(f"Marked: {ms_to_ts(frame_to_ms(idx, self.fps))}", GREEN)
+        self._set_status(
+            f"Marked: {ms_to_ts(display_time_ms(identity, idx, self.fps))}", GREEN
+        )
         self._tabs.setCurrentIndex(0)
 
     def _remove_mark(self, idx: int):
@@ -4752,13 +4982,13 @@ class MainWindow(QMainWindow):
         selected_group = group or self._group_combo.currentText()
         reader = open_cap(
             self._video_path, self._backend, self._hardware_accel,
-            self._seek_mode == "Exact frame",
+            self._seek_mode == "Exact frame", seek_mode=self._seek_mode,
         )
         if reader is None or not reader.isOpened():
             return results
         try:
             for idx in ordered_mark_indices(self.marked, selected_group):
-                reader.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                self._seek_reader_frame(reader, idx)
                 ret, frame = reader.read()
                 if ret:
                     results.append((idx, frame, self.marked[idx]["label"]))
@@ -4790,7 +5020,12 @@ class MainWindow(QMainWindow):
             )
         frame = self._apply_scale(frame, self._scale_combo.currentText())
         if self._burn_check.isChecked():
-            frame = burn_in_overlay(frame, frame_idx, self.fps, label)
+            frame = burn_in_overlay(
+                frame, frame_idx, self.fps, label,
+                display_time_ms(
+                    self.marked.get(frame_idx), frame_idx, self.fps
+                ),
+            )
         return frame
 
     def _write_export_frame(self, path: str, frame: np.ndarray,
@@ -4856,7 +5091,10 @@ class MainWindow(QMainWindow):
         for idx, frame, label in frames_data:
             frame = self._apply_export_transform(frame, idx, label)
             fname = apply_template(
-                template, stem, idx, self.fps, label, sequence[idx]
+                template, stem, idx, self.fps, label, sequence[idx],
+                timestamp_ms=display_time_ms(
+                    self.marked.get(idx), idx, self.fps
+                ),
             ) + ext
             try:
                 base_path = ensure_output_path(out_dir_path, out_dir_path / fname)
@@ -4908,10 +5146,16 @@ class MainWindow(QMainWindow):
             filename = apply_template(
                 template, Path(self._video_path).stem, idx, self.fps,
                 label, sequence.get(idx, position),
+                timestamp_ms=display_time_ms(
+                    self.marked.get(idx), idx, self.fps
+                ),
             ) + ext
             lines.append(ffmpeg_extract_command(
                 self._video_path, idx, self.fps,
                 os.path.join(output_dir, filename),
+                timestamp_ms=display_time_ms(
+                    self.marked.get(idx), idx, self.fps
+                ),
             ))
         if not lines:
             self._set_status(f"No marks in export group: {group}", YELLOW)
@@ -5150,6 +5394,14 @@ class MainWindow(QMainWindow):
             self.marked[fidx]["widget"].update_tags(entry["tags"])
             self.marked[fidx]["comment"] = entry["comment"]
             self.marked[fidx]["widget"].update_comment(entry["comment"])
+            self.marked[fidx].update(frame_time_identity(
+                fidx, self.fps,
+                pts=entry.get("pts"),
+                time_base=entry.get("time_base"),
+                presentation_time_ms=entry.get("presentation_time_ms"),
+                display_time_ms=entry.get("display_time_ms"),
+                timestamp_source=entry.get("timestamp_source"),
+            ))
             self._set_mark_color(fidx, entry["color"])
 
         self._refresh_group_filter()

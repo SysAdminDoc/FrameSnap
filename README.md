@@ -26,6 +26,7 @@
 - **Mouse wheel** on the video to step frames
 - **Per-video mouse-wheel step** — configure 1–1000 frames per notch from Edit → Set Mouse-Wheel Step
 - **Side-by-side A/B viewer** — compare two files at the same frame index from File → Open Side-by-Side A/B Viewer
+- **Frame/time identity** — marks retain frame index plus presentation timestamp/time base when the decoder provides them; Exact frame, Approximate keyframe, and Nearest timestamp seeking are explicit
 - **Drag-and-drop queue** — drop several videos at once, then move through the queue with the
   previous/next controls while reusing marks and export settings
 - Recent files menu for quick access
@@ -41,7 +42,7 @@
 - **Jump to frame** from any mark via "Go" button or right-click menu
 - **Prev / Next mark** navigation buttons for quick cycling
 - **Multi-select** marks with Ctrl/Shift+Click, then bulk delete selected
-- Marks are kept sorted by time and persist in sessions
+- Marks are kept sorted by time and persist in sessions with their available frame/time identity
 - **Find Similar Frames** — perceptual-hash scan with configurable sampling to identify near-duplicates
 - **QR/barcode detection** — decode codes from the current frame through Edit → Detect QR/Barcodes
 

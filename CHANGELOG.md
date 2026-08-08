@@ -17,6 +17,8 @@ All notable changes to FrameSnap will be documented in this file.
   policies plus hash-verified resumable export manifests.
 - Added: bounded marker parsing, Unicode/reserved-name filename sanitization, and output-root/
   reparse-point checks for safer local media exports.
+- Added: frame/time identities for marks and manifests, including decoder PTS/time-base metadata
+  when available and explicit Exact, Approximate, and Nearest timestamp seek modes.
 
 ## [v2.2.0] - 2026-08-03
 
