@@ -78,7 +78,8 @@
 - **Frame overlay** on video display — shows frame number, total frames, and timestamp (toggleable via View menu)
 - **Video info bar** — resolution, FPS, duration, frame count, file size shown on load
 - Preferences auto-saved (output folder, format, quality, scale, template, overlay state, speed)
-- **Themes:** Catppuccin Mocha, Catppuccin Latte, GitHub Dark, and AMOLED Black
+- **Themes:** Catppuccin Mocha, Catppuccin Latte, GitHub Dark, AMOLED Black, and High Contrast
+- **Keyboard/accessibility parity:** named controls, predictable Tab order, keyboard playback/mark navigation, and Shift+F10 mark actions
 - Windows per-monitor-v2 DPI awareness is enabled before Qt creates the application window
 
 ---
@@ -177,7 +178,7 @@ FrameSnap uses OpenCV's FFmpeg backend and accepts any container/codec FFmpeg su
 
 ## Keyboard-Free Design
 
-FrameSnap is designed for pure mouse/GUI operation. All actions are accessible through visible controls, right-click context menus, and the menu bar.
+FrameSnap is designed for direct local GUI operation. All actions are accessible through visible controls, keyboard shortcuts, Shift+F10 mark actions, context menus, and the menu bar.
 
 ---
 

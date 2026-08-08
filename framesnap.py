@@ -99,7 +99,7 @@ from PyQt6.QtWidgets import (  # noqa: E402
     QApplication, QMainWindow, QDialog, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QListWidget, QListWidgetItem,
     QFileDialog, QLineEdit, QGroupBox, QSizePolicy, QFrame, QSplitter,
-    QMenu, QComboBox, QSpinBox, QInputDialog, QMessageBox,
+    QMenu, QComboBox, QSpinBox, QInputDialog, QMessageBox, QScrollArea,
     QStyle, QStyleOptionSlider, QTabWidget, QAbstractItemView, QCheckBox,
 )
 from PyQt6.QtCore import (  # noqa: E402
@@ -108,7 +108,7 @@ from PyQt6.QtCore import (  # noqa: E402
 )
 from PyQt6.QtGui import (  # noqa: E402
     QPixmap, QImage, QIcon, QPainter, QColor, QFont, QAction,
-    QDragEnterEvent, QDropEvent,
+    QDragEnterEvent, QDropEvent, QKeySequence,
 )
 
 
@@ -300,6 +300,7 @@ QFrame[frameShape="4"] {{ color: {SURFACE1}; }}
 
 THEME_NAMES = (
     "Catppuccin Mocha", "Catppuccin Latte", "GitHub Dark", "AMOLED Black",
+    "High Contrast",
 )
 THEME_OVERRIDES = {
     "Catppuccin Mocha": "",
@@ -378,11 +379,47 @@ QPushButton#exportBtn { background-color: #00e676; color: #000000; }
 QPushButton#sheetBtn { background-color: #00e5ff; color: #000000; }
 QPushButton#copyBtn { background-color: #448aff; color: #000000; }
 """,
+    "High Contrast": """
+QMainWindow, QDialog, QWidget { background-color: #000000; color: #ffffff; }
+QLabel { color: #ffffff; }
+QMenuBar, QMenu { background-color: #000000; color: #ffffff; }
+QMenuBar { border-bottom: 2px solid #ffffff; }
+QMenu { border: 2px solid #ffffff; }
+QMenu::item:selected { background-color: #ffff00; color: #000000; }
+QPushButton, QComboBox, QSpinBox, QLineEdit, QListWidget {
+    background-color: #000000; color: #ffffff; border: 2px solid #ffffff;
+}
+QPushButton:hover, QComboBox:hover, QSpinBox:hover, QLineEdit:hover,
+QListWidget:hover { background-color: #202020; border-color: #00ffff; }
+QPushButton:focus, QComboBox:focus, QSpinBox:focus, QLineEdit:focus,
+QListWidget:focus, QSlider:focus, QTabBar:focus { border: 3px solid #00ffff; }
+QPushButton:disabled, QComboBox:disabled, QSpinBox:disabled {
+    color: #888888; border-color: #888888;
+}
+QComboBox QAbstractItemView { background-color: #000000; color: #ffffff; }
+QGroupBox, QTabWidget::pane { border: 2px solid #ffffff; background: #000000; }
+QGroupBox::title { color: #ffff00; }
+QTabBar::tab { background-color: #000000; color: #ffffff; border: 2px solid #ffffff; }
+QTabBar::tab:selected { background-color: #ffff00; color: #000000; }
+QScrollBar:vertical { background-color: #000000; }
+QScrollBar::handle:vertical { background-color: #ffffff; min-height: 24px; }
+QSlider::groove:horizontal { background-color: #ffffff; height: 6px; }
+QSlider::handle:horizontal, QSlider::sub-page:horizontal { background-color: #ffff00; }
+QPushButton#markBtn, QPushButton#exportBtn, QPushButton#sheetBtn,
+QPushButton#copyBtn { background-color: #ffff00; color: #000000; border: 2px solid #ffffff; }
+""",
 }
 
 
 def stylesheet_for_theme(theme: str) -> str:
     return STYLESHEET + THEME_OVERRIDES.get(theme, "")
+
+
+def set_accessible(widget, name: str, description: str = "") -> None:
+    """Give a Qt control a stable screen-reader name and state description."""
+    widget.setAccessibleName(name)
+    if description:
+        widget.setAccessibleDescription(description)
 
 CONFIG_PATH     = Path.home() / ".framesnap_config.json"
 MAX_RECENT      = 10
@@ -2907,6 +2944,10 @@ class WaveformWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        set_accessible(
+            self, "Audio waveform",
+            "Read-only audio waveform aligned with the video timeline.",
+        )
         self.setMinimumHeight(46)
         self.setMaximumHeight(58)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -2979,22 +3020,66 @@ class ThumbnailStripWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        set_accessible(
+            self, "Video thumbnail strip",
+            "Use Left and Right arrows to move through thumbnails, or Enter to jump.",
+        )
         self.setMinimumHeight(60)
         self.setMaximumHeight(78)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._frames: list[tuple[int, QPixmap]] = []
         self._message = "Thumbnail strip loads after opening a video"
+        self._selected_index = 0
 
     def set_loading(self) -> None:
         self._frames = []
+        self._selected_index = 0
         self._message = "Building thumbnail strip..."
+        self.setAccessibleDescription(self._message)
         self.update()
 
     def set_frames(self, frames) -> None:
         self._frames = [
             (idx, bgr_to_pixmap(frame)) for idx, frame in frames
         ]
+        self._selected_index = 0
         self._message = "No video frames available" if not self._frames else ""
+        self.setAccessibleDescription(
+            f"{len(self._frames)} video thumbnails. Use Left and Right arrows to move, "
+            "or Enter to jump."
+            if self._frames else self._message
+        )
+        self.update()
+
+    def _activate_selected(self) -> None:
+        if self._frames:
+            self.frame_clicked.emit(self._frames[self._selected_index][0])
+
+    def keyPressEvent(self, event):
+        if not self._frames:
+            super().keyPressEvent(event)
+            return
+        key = event.key()
+        if key == Qt.Key.Key_Left:
+            self._selected_index = max(0, self._selected_index - 1)
+        elif key == Qt.Key.Key_Right:
+            self._selected_index = min(len(self._frames) - 1, self._selected_index + 1)
+        elif key == Qt.Key.Key_Home:
+            self._selected_index = 0
+        elif key == Qt.Key.Key_End:
+            self._selected_index = len(self._frames) - 1
+        elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self._activate_selected()
+            return
+        else:
+            super().keyPressEvent(event)
+            return
+        frame_idx = self._frames[self._selected_index][0]
+        self.setAccessibleDescription(
+            f"Thumbnail {self._selected_index + 1} of {len(self._frames)}, "
+            f"frame {frame_idx}. Press Enter to jump."
+        )
         self.update()
 
     def paintEvent(self, event):
@@ -3023,7 +3108,13 @@ class ThumbnailStripWidget(QWidget):
         if self._frames and event.button() == Qt.MouseButton.LeftButton:
             tile_width = max(1, self.width() // len(self._frames))
             pos = max(0, min(len(self._frames) - 1, event.position().x() // tile_width))
-            self.frame_clicked.emit(self._frames[int(pos)][0])
+            self._selected_index = int(pos)
+            frame_idx = self._frames[self._selected_index][0]
+            self.setAccessibleDescription(
+                f"Thumbnail {self._selected_index + 1} of {len(self._frames)}, "
+                f"frame {frame_idx}. Press Enter to jump."
+            )
+            self.frame_clicked.emit(frame_idx)
         super().mousePressEvent(event)
 
 
@@ -3035,6 +3126,12 @@ class VideoDisplay(QLabel):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        set_accessible(
+            self, "Video preview",
+            "Current video frame. Use Ctrl+Left and Ctrl+Right to step frames, "
+            "and Ctrl+Space to play or pause.",
+        )
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(640, 360)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -3050,6 +3147,7 @@ class VideoDisplay(QLabel):
             f"color: {SUBTEXT0}; font-size: 16px;"
         )
         self.setText("Open a video file or drop one here")
+        self.setAccessibleDescription("No video loaded. Open a video file or drop one here.")
 
     def show_frame(self, bgr: np.ndarray):
         self._bgr = bgr
@@ -3061,9 +3159,12 @@ class VideoDisplay(QLabel):
         self.clear()
         self._placeholder()
         self.setText(message)
+        self.setAccessibleDescription(message)
 
     def set_overlay(self, text: str):
         self._overlay_text = text
+        if text:
+            self.setAccessibleDescription(f"Current video frame: {text}")
         self.update()
 
     def set_show_overlay(self, val: bool):
@@ -3193,21 +3294,28 @@ class ABViewerDialog(QDialog):
 
         control_row = QHBoxLayout()
         previous = QPushButton("−1")
+        set_accessible(previous, "Previous aligned position")
         previous.setToolTip("Show the previous aligned position")
         previous.clicked.connect(lambda: self._show_position(
             self._position - self._step_size()
         ))
         next_button = QPushButton("+1")
+        set_accessible(next_button, "Next aligned position")
         next_button.setToolTip("Show the next aligned position")
         next_button.clicked.connect(lambda: self._show_position(
             self._position + self._step_size()
         ))
         self._position_label = QLabel("Frame 0")
+        set_accessible(self._position_label, "A/B aligned position")
         self._position_label.setMinimumWidth(120)
         self._position_label.setStyleSheet(
             f"color: {MAUVE}; font-family: Consolas, monospace;"
         )
         self._slider = QSlider(Qt.Orientation.Horizontal)
+        set_accessible(
+            self._slider, "A/B alignment timeline",
+            "Move through the selected frame-index or presentation-time alignment.",
+        )
         self._slider.valueChanged.connect(self._show_position)
         control_row.addWidget(previous)
         control_row.addWidget(next_button)
@@ -3218,12 +3326,21 @@ class ABViewerDialog(QDialog):
         alignment_row = QHBoxLayout()
         alignment_row.addWidget(QLabel("Alignment:"))
         self._alignment_combo = QComboBox()
+        set_accessible(
+            self._alignment_combo, "A/B alignment mode",
+            "Choose frame index or presentation time alignment.",
+        )
         self._alignment_combo.addItems(["Frame index", "Presentation time"])
         self._alignment_combo.currentTextChanged.connect(self._alignment_changed)
         alignment_row.addWidget(self._alignment_combo)
         self._offset_label = QLabel("Offset B (frames):")
+        set_accessible(self._offset_label, "A/B offset units")
         alignment_row.addWidget(self._offset_label)
         self._offset_spin = QSpinBox()
+        set_accessible(
+            self._offset_spin, "Video B alignment offset",
+            "Signed offset applied to video B. Negative values show B earlier.",
+        )
         self._offset_spin.setRange(-100_000_000, 100_000_000)
         self._offset_spin.setValue(0)
         self._offset_spin.setToolTip(
@@ -3243,6 +3360,7 @@ class ABViewerDialog(QDialog):
         root.addWidget(self._status_label)
 
         close_button = QPushButton("Close")
+        set_accessible(close_button, "Close A/B viewer")
         close_button.clicked.connect(self.close)
         root.addWidget(close_button, 0, Qt.AlignmentFlag.AlignRight)
 
@@ -3265,9 +3383,17 @@ class ABViewerDialog(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
         heading = QLabel(f"{title}  ·  {Path(path).name}")
+        set_accessible(
+            heading, f"Video {title} source",
+            f"Video {title}: {Path(path).name}.",
+        )
         heading.setToolTip(path)
         heading.setStyleSheet(f"color: {TEXT}; font-weight: bold;")
         display = VideoDisplay()
+        set_accessible(
+            display, f"Video {title} preview",
+            f"A/B video {title} preview with frame and presentation-time identity.",
+        )
         display.setMinimumSize(320, 180)
         layout.addWidget(heading)
         layout.addWidget(display, 1)
@@ -3419,6 +3545,7 @@ class FrameItemWidget(QWidget):
         self.frame_idx = frame_idx
         self.fps       = fps
         self.setFixedHeight(90)
+        set_accessible(self, f"Marked frame {frame_idx:,}")
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 6, 0)
@@ -3436,6 +3563,7 @@ class FrameItemWidget(QWidget):
 
         # Thumbnail
         thumb_lbl = QLabel()
+        set_accessible(thumb_lbl, f"Thumbnail for marked frame {frame_idx:,}")
         thumb_lbl.setFixedSize(96, 54)
         thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         thumb_lbl.setStyleSheet(
@@ -3451,15 +3579,20 @@ class FrameItemWidget(QWidget):
         ms = (display_time_ms_value if display_time_ms_value is not None
               else frame_to_ms(frame_idx, fps))
         self._ts_lbl    = QLabel(ms_to_ts(ms))
+        set_accessible(self._ts_lbl, "Mark presentation time")
         self._ts_lbl.setStyleSheet(f"color: {TEXT}; font-weight: bold; font-size: 13px;")
         self._frame_lbl = QLabel(f"Frame {frame_idx:,}")
+        set_accessible(self._frame_lbl, "Mark frame number")
         self._frame_lbl.setStyleSheet(f"color: {SUBTEXT0}; font-size: 11px;")
         self._label_lbl = QLabel(label)
+        set_accessible(self._label_lbl, "Mark label")
         self._label_lbl.setStyleSheet(f"color: {PEACH}; font-size: 11px; font-style: italic;")
         self._label_lbl.setVisible(bool(label))
         self._tags_lbl = QLabel()
+        set_accessible(self._tags_lbl, "Mark tags")
         self._tags_lbl.setStyleSheet(f"color: {TEAL}; font-size: 10px;")
         self._comment_lbl = QLabel()
+        set_accessible(self._comment_lbl, "Mark comment")
         self._comment_lbl.setStyleSheet(f"color: {SUBTEXT0}; font-size: 10px;")
         self._comment_lbl.setToolTip(comment)
         info.addWidget(self._ts_lbl)
@@ -3471,6 +3604,10 @@ class FrameItemWidget(QWidget):
         inner.addStretch()
 
         jump_btn = QPushButton("Go")
+        set_accessible(
+            jump_btn, f"Jump to marked frame {frame_idx:,}",
+            "Move the video preview to this mark.",
+        )
         jump_btn.setFixedSize(36, 28)
         jump_btn.setStyleSheet(f"""
             QPushButton {{
@@ -3482,6 +3619,10 @@ class FrameItemWidget(QWidget):
         jump_btn.clicked.connect(lambda: self.jump_requested.emit(self.frame_idx))
 
         del_btn = QPushButton("x")
+        set_accessible(
+            del_btn, f"Remove marked frame {frame_idx:,}",
+            "Remove this mark from the session.",
+        )
         del_btn.setFixedSize(28, 28)
         del_btn.setStyleSheet(f"""
             QPushButton {{
@@ -3499,6 +3640,18 @@ class FrameItemWidget(QWidget):
         self.set_color(color)
         self.update_tags(tags)
         self.update_comment(comment)
+        self._update_accessibility()
+
+    def _update_accessibility(self):
+        ms = self._ts_lbl.text()
+        details = [f"Frame {self.frame_idx:,} at {ms}"]
+        if self._label_lbl.isVisible() and self._label_lbl.text():
+            details.append(f"Label: {self._label_lbl.text()}")
+        if self._tags_lbl.isVisible() and self._tags_lbl.text():
+            details.append(f"Tags: {self._tags_lbl.text()}")
+        if self._comment_lbl.isVisible() and self._comment_lbl.text():
+            details.append(f"Comment: {self._comment_lbl.text()}")
+        self.setAccessibleDescription(". ".join(details) + ".")
 
     def set_color(self, color_hex: str):
         self._color_bar.setStyleSheet(
@@ -3508,15 +3661,18 @@ class FrameItemWidget(QWidget):
     def update_label(self, label: str):
         self._label_lbl.setText(label)
         self._label_lbl.setVisible(bool(label))
+        self._update_accessibility()
 
     def update_tags(self, tags: str):
         self._tags_lbl.setText("  ".join(f"#{tag}" for tag in parse_tags(tags)))
         self._tags_lbl.setVisible(bool(tags.strip()))
+        self._update_accessibility()
 
     def update_comment(self, comment: str):
         self._comment_lbl.setText(comment.strip())
         self._comment_lbl.setToolTip(comment.strip())
         self._comment_lbl.setVisible(bool(comment.strip()))
+        self._update_accessibility()
 
 
 # ── Main Window ───────────────────────────────────────────────────────────────
@@ -3596,6 +3752,7 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self._build_ui()
+        self._configure_accessibility()
         self._build_timer()
         self._build_hover_popup()
         self._apply_config()
@@ -3609,15 +3766,25 @@ class MainWindow(QMainWindow):
 
         file_menu = mb.addMenu("File")
         self._recent_menu = QMenu("Recent Files", self)
-        file_menu.addAction(self._make_act("Open Video...", self.open_video))
         file_menu.addAction(self._make_act(
-            "Open Side-by-Side A/B Viewer...", self.open_ab_viewer
+            "Open Video...", self.open_video, shortcut="Ctrl+O",
+            description="Open a video file.",
+        ))
+        file_menu.addAction(self._make_act(
+            "Open Side-by-Side A/B Viewer...", self.open_ab_viewer,
+            shortcut="Ctrl+Shift+B", description="Compare two videos side by side.",
         ))
         file_menu.addSeparator()
         file_menu.addMenu(self._recent_menu)
         file_menu.addSeparator()
-        file_menu.addAction(self._make_act("Save Session...", self.save_session))
-        file_menu.addAction(self._make_act("Load Session...", self.load_session))
+        file_menu.addAction(self._make_act(
+            "Save Session...", self.save_session, shortcut="Ctrl+S",
+            description="Save the current video marks and settings.",
+        ))
+        file_menu.addAction(self._make_act(
+            "Load Session...", self.load_session, shortcut="Ctrl+Shift+O",
+            description="Load a saved FrameSnap session.",
+        ))
         file_menu.addAction(self._make_act("Merge Sessions...", self.merge_sessions))
         file_menu.addAction(self._make_act("Compare Sessions...", self.diff_sessions))
         file_menu.addSeparator()
@@ -3628,10 +3795,13 @@ class MainWindow(QMainWindow):
             "Apply Session Template...", self.apply_session_template
         ))
         file_menu.addSeparator()
-        file_menu.addAction(self._make_act("Exit", self.close))
+        file_menu.addAction(self._make_act("Exit", self.close, shortcut="Ctrl+Q"))
 
         edit_menu = mb.addMenu("Edit")
-        edit_menu.addAction(self._make_act("Mark Current Frame", self.mark_frame))
+        edit_menu.addAction(self._make_act(
+            "Mark Current Frame", self.mark_frame, shortcut="Ctrl+M",
+            description="Add the current frame to the mark list.",
+        ))
         edit_menu.addAction(self._make_act("Auto-mark Scene Cuts", self.auto_mark_scenes))
         edit_menu.addAction(self._make_act("Auto-mark Chapters", self.auto_mark_chapters))
         edit_menu.addAction(self._make_act("Find Similar Frames...", self.find_similar_frames))
@@ -3641,10 +3811,14 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self._make_act(
             "Set Mouse-Wheel Step...", self.set_mouse_wheel_step
         ))
-        edit_menu.addAction(self._make_act("Clear All Marks",    self.clear_marks))
+        edit_menu.addAction(self._make_act(
+            "Clear All Marks", self.clear_marks, shortcut="Ctrl+Shift+Delete",
+        ))
         edit_menu.addSeparator()
-        edit_menu.addAction(self._make_act("Copy Current Frame to Clipboard",
-                                            self.copy_frame_clipboard))
+        edit_menu.addAction(self._make_act(
+            "Copy Current Frame to Clipboard", self.copy_frame_clipboard,
+            shortcut="Ctrl+Shift+C",
+        ))
 
         view_menu = mb.addMenu("View")
         self._act_overlay = self._make_act("Frame Overlay", self._toggle_overlay,
@@ -3661,10 +3835,48 @@ class MainWindow(QMainWindow):
             self._theme_actions[theme] = action
             theme_menu.addAction(action)
 
+        self._play_action = self._make_act(
+            "Play or Pause", self.toggle_play, shortcut="Ctrl+Space",
+            description="Start or stop video playback.",
+        )
+        self._step_previous_action = self._make_act(
+            "Step Back One Frame", lambda: self.step(-1), shortcut="Ctrl+Left",
+        )
+        self._step_next_action = self._make_act(
+            "Step Forward One Frame", lambda: self.step(1), shortcut="Ctrl+Right",
+        )
+        self._previous_mark_action = self._make_act(
+            "Previous Mark", self.jump_prev_mark, shortcut="Ctrl+Alt+Left",
+        )
+        self._next_mark_action = self._make_act(
+            "Next Mark", self.jump_next_mark, shortcut="Ctrl+Alt+Right",
+        )
+        self._delete_selected_action = self._make_act(
+            "Delete Selected Marks", self._delete_selected,
+            shortcut="Ctrl+Delete",
+        )
+        self._mark_menu_action = self._make_act(
+            "Open Selected Mark Actions", self._show_selected_mark_menu,
+            shortcut="Shift+F10",
+            description="Open actions for the selected mark without a mouse.",
+        )
+        for action in (
+            self._play_action, self._step_previous_action, self._step_next_action,
+            self._previous_mark_action, self._next_mark_action,
+            self._delete_selected_action, self._mark_menu_action,
+        ):
+            self.addAction(action)
+
         self._refresh_recent_menu()
 
-    def _make_act(self, label: str, slot, checkable=False, checked=False) -> QAction:
+    def _make_act(self, label: str, slot, checkable=False, checked=False,
+                  shortcut: str | None = None, description: str = "") -> QAction:
         act = QAction(label, self)
+        if shortcut:
+            act.setShortcut(QKeySequence(shortcut))
+        if description:
+            act.setStatusTip(description)
+            act.setToolTip(description)
         if checkable:
             act.setCheckable(True)
             act.setChecked(checked)
@@ -3734,12 +3946,12 @@ class MainWindow(QMainWindow):
         left.setSpacing(8)
 
         top_bar = QHBoxLayout()
-        open_btn = QPushButton("Open Video...")
-        open_btn.setFixedHeight(34)
-        open_btn.clicked.connect(self.open_video)
+        self._open_btn = QPushButton("Open Video...")
+        self._open_btn.setFixedHeight(34)
+        self._open_btn.clicked.connect(self.open_video)
         self._file_lbl = QLabel("No file loaded")
         self._file_lbl.setStyleSheet(f"color: {SUBTEXT0}; font-size: 12px;")
-        top_bar.addWidget(open_btn)
+        top_bar.addWidget(self._open_btn)
         top_bar.addWidget(self._file_lbl, 1)
         self._queue_lbl = QLabel("Queue: 0/0")
         self._queue_lbl.setStyleSheet(f"color: {OVERLAY0}; font-size: 11px;")
@@ -3927,14 +4139,17 @@ class MainWindow(QMainWindow):
         self._marks_list.itemDoubleClicked.connect(
             lambda item: self._jump_to(item.data(Qt.ItemDataRole.UserRole))
         )
+        self._marks_list.itemActivated.connect(
+            lambda item: self._jump_to(item.data(Qt.ItemDataRole.UserRole))
+        )
         ml.addWidget(self._marks_list, 1)
 
         nav_row = QHBoxLayout()
         self._count_lbl = QLabel("0 frames marked")
         self._count_lbl.setStyleSheet(f"color: {SUBTEXT0}; font-size: 11px;")
-        sel_all = QPushButton("All")
-        sel_all.setFixedHeight(28)
-        sel_all.clicked.connect(self._marks_list.selectAll)
+        self._select_all_btn = QPushButton("All")
+        self._select_all_btn.setFixedHeight(28)
+        self._select_all_btn.clicked.connect(self._marks_list.selectAll)
         self._del_sel_btn = QPushButton("Del Sel")
         self._del_sel_btn.setObjectName("dangerBtn")
         self._del_sel_btn.setFixedHeight(28)
@@ -3947,7 +4162,7 @@ class MainWindow(QMainWindow):
         self._clear_btn.clicked.connect(self.clear_marks)
         nav_row.addWidget(self._count_lbl)
         nav_row.addStretch()
-        nav_row.addWidget(sel_all)
+        nav_row.addWidget(self._select_all_btn)
         nav_row.addWidget(self._del_sel_btn)
         nav_row.addWidget(self._clear_btn)
         ml.addLayout(nav_row)
@@ -4095,11 +4310,11 @@ class MainWindow(QMainWindow):
         oi.setSpacing(6)
         dir_row = QHBoxLayout()
         self._dir_edit = QLineEdit(self._cfg.get("last_output_dir", ""))
-        browse_btn = QPushButton("Browse...")
-        browse_btn.setFixedHeight(30)
-        browse_btn.clicked.connect(self.browse_dir)
+        self._browse_btn = QPushButton("Browse...")
+        self._browse_btn.setFixedHeight(30)
+        self._browse_btn.clicked.connect(self.browse_dir)
         dir_row.addWidget(self._dir_edit, 1)
-        dir_row.addWidget(browse_btn)
+        dir_row.addWidget(self._browse_btn)
         oi.addLayout(dir_row)
 
         collision_row = QHBoxLayout()
@@ -4145,7 +4360,11 @@ class MainWindow(QMainWindow):
         self._status_lbl.setWordWrap(True)
         el.addWidget(self._status_lbl)
         el.addStretch()
-        self._tabs.addTab(export_tab, "Export")
+        export_scroll = QScrollArea()
+        export_scroll.setWidgetResizable(True)
+        export_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        export_scroll.setWidget(export_tab)
+        self._tabs.addTab(export_scroll, "Export")
 
         splitter.addWidget(left_w)
         splitter.addWidget(right_w)
@@ -4153,6 +4372,98 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         root.addWidget(splitter)
         self._update_queue_ui()
+
+    def _configure_accessibility(self):
+        """Set stable names and a predictable keyboard traversal order."""
+        set_accessible(
+            self, "FrameSnap video frame browser",
+            "Browse video, mark frames, and export screenshots locally.",
+        )
+        named_controls = [
+            (self._open_btn, "Open video", "Open a video file or start a queue."),
+            (self._file_lbl, "Loaded video", "Currently loaded video file."),
+            (self._queue_lbl, "Video queue status", "Current position in the video queue."),
+            (self._queue_prev_btn, "Previous video in queue", "Open the previous queued video."),
+            (self._queue_next_btn, "Next video in queue", "Open the next queued video."),
+            (self._backend_combo, "Decoder backend", "Choose the video decoder backend."),
+            (self._hardware_check, "Hardware decoding", "Request hardware decoding when available."),
+            (self._seek_combo, "Seek mode", "Choose exact, approximate, or timestamp seeking."),
+            (self._proxy_check, "Playback proxy", "Use a cached proxy for large-video playback."),
+            (self._info_bar, "Video information", "Loaded video dimensions, timing, and decoder details."),
+            (self.display, "Video preview", "Current video frame preview and frame/time identity."),
+            (self._pos_lbl, "Current video time", "Presentation time of the current frame."),
+            (self.slider, "Video timeline", "Use arrow keys to move frame by frame."),
+            (self._dur_lbl, "Video duration", "Duration of the loaded video."),
+            (self._waveform, "Audio waveform", "Read-only waveform aligned with the video timeline."),
+            (self._thumbnail_strip, "Video thumbnail strip", "Use arrow keys and Enter to navigate thumbnails."),
+            (self._btn_p10, "Step back ten frames", "Move ten frames backward."),
+            (self._btn_p1, "Step back one frame", "Move one frame backward."),
+            (self._btn_play, "Play or pause video", "Start or stop playback."),
+            (self._btn_n1, "Step forward one frame", "Move one frame forward."),
+            (self._btn_n10, "Step forward ten frames", "Move ten frames forward."),
+            (self._speed_combo, "Playback speed", "Choose playback speed."),
+            (self._loop_btn, "Loop playback", "Repeat playback when it reaches the end."),
+            (self._btn_prev_mark, "Previous mark", "Jump to the previous marked frame."),
+            (self._btn_next_mark, "Next mark", "Jump to the next marked frame."),
+            (self._copy_btn, "Copy current frame", "Copy the current frame image to the clipboard."),
+            (self._mark_btn, "Mark current frame", "Add the current frame to the mark list."),
+            (self._tabs, "Main panels", "Switch between Marks and Export panels."),
+            (self._marks_list, "Marked frames", "Select marks with arrow keys. Press the Menu key for mark actions."),
+            (self._count_lbl, "Marked frame count", "Number of marked frames."),
+            (self._select_all_btn, "Select all marks", "Select every mark in the list."),
+            (self._del_sel_btn, "Delete selected marks", "Remove selected marks."),
+            (self._clear_btn, "Clear all marks", "Remove every mark from the session."),
+            (self._fmt_combo, "Export format", "Choose the still or animation export format."),
+            (self._qual_spin, "Export quality", "Quality percentage for lossy formats."),
+            (self._group_combo, "Export mark group", "Filter exports by mark tag."),
+            (self._burn_check, "Burn export overlay", "Include frame, timestamp, and label in exports."),
+            (self._crop_check, "Crop exports", "Apply the configured crop rectangle."),
+            (self._crop_x, "Crop left position", "Crop rectangle X coordinate in pixels."),
+            (self._crop_y, "Crop top position", "Crop rectangle Y coordinate in pixels."),
+            (self._crop_w, "Crop width", "Crop rectangle width in pixels."),
+            (self._crop_h, "Crop height", "Crop rectangle height in pixels."),
+            (self._sheet_title, "Contact sheet title", "Optional contact-sheet title."),
+            (self._sheet_watermark, "Contact sheet watermark", "Optional contact-sheet watermark."),
+            (self._sheet_columns, "Contact sheet columns", "Number of contact-sheet columns."),
+            (self._sheet_pdf, "Contact sheet PDF", "Also save a PDF contact sheet."),
+            (self._scale_combo, "Export scale", "Choose the export scale."),
+            (self._cust_spin, "Custom export width", "Custom export width in pixels."),
+            (self._name_edit, "Filename template", "Template used to name exported files."),
+            (self._dir_edit, "Output folder", "Folder where exports are written."),
+            (self._browse_btn, "Browse output folder", "Choose the export output folder."),
+            (self._collision_combo, "Export collision policy", "Choose how existing files are handled."),
+            (self._export_btn, "Export all frames", "Export every selected mark."),
+            (self._open_dir_btn, "Open output folder", "Open the output folder in the file manager."),
+            (self._sheet_btn, "Export contact sheet", "Create a contact sheet from marked frames."),
+            (self._ffmpeg_btn, "Show FFmpeg commands", "Show replayable extraction commands for marks."),
+            (self._status_lbl, "Application status", "Live status and result announcements."),
+        ]
+        for widget, name, description in named_controls:
+            set_accessible(widget, name, description)
+
+        export_panel = self._tabs.widget(1)
+        if export_panel is not None:
+            set_accessible(export_panel, "Export panel", "Export settings and actions. Scroll to reach all controls.")
+        self._marks_list.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        focus_chain = [
+            self._open_btn, self._queue_prev_btn, self._queue_next_btn,
+            self._backend_combo, self._hardware_check, self._seek_combo,
+            self._proxy_check, self.display, self.slider, self._thumbnail_strip,
+            self._btn_p10, self._btn_p1, self._btn_play, self._btn_n1,
+            self._btn_n10, self._speed_combo, self._loop_btn,
+            self._btn_prev_mark, self._btn_next_mark, self._copy_btn,
+            self._mark_btn, self._tabs, self._marks_list, self._select_all_btn,
+            self._del_sel_btn, self._clear_btn, self._fmt_combo, self._qual_spin,
+            self._group_combo, self._burn_check, self._crop_check, self._crop_x,
+            self._crop_y, self._crop_w, self._crop_h, self._sheet_title,
+            self._sheet_watermark, self._sheet_columns, self._sheet_pdf,
+            self._scale_combo, self._cust_spin, self._name_edit, self._dir_edit,
+            self._browse_btn, self._collision_combo, self._export_btn,
+            self._open_dir_btn, self._sheet_btn, self._ffmpeg_btn,
+        ]
+        for previous, current in zip(focus_chain, focus_chain[1:]):
+            self.setTabOrder(previous, current)
 
     def _build_timer(self):
         self._timer = QTimer()
@@ -4379,9 +4690,21 @@ class MainWindow(QMainWindow):
         count = len(self._video_queue)
         current = self._queue_index + 1 if self._queue_index >= 0 else 0
         self._queue_lbl.setText(f"Queue: {current}/{count}")
+        self._queue_lbl.setAccessibleDescription(
+            f"Video queue item {current} of {count}."
+            if count else "Video queue is empty."
+        )
         self._queue_prev_btn.setEnabled(self._queue_index > 0)
         self._queue_next_btn.setEnabled(
             self._queue_index >= 0 and self._queue_index < count - 1
+        )
+        self._queue_prev_btn.setAccessibleDescription(
+            "Previous video is available." if self._queue_prev_btn.isEnabled()
+            else "No previous video in the queue."
+        )
+        self._queue_next_btn.setAccessibleDescription(
+            "Next video is available." if self._queue_next_btn.isEnabled()
+            else "No next video in the queue."
         )
 
     def _open_path(self, path: str, start_frame: int = 0,
@@ -4480,6 +4803,7 @@ class MainWindow(QMainWindow):
             self._dur_lbl.setText("--:--:--.---")
 
         self._file_lbl.setText(Path(path).name)
+        self._file_lbl.setAccessibleDescription(f"Loaded video: {Path(path).name}.")
 
         vw  = source_width
         vh  = source_height
@@ -4502,6 +4826,7 @@ class MainWindow(QMainWindow):
             f"  {vw}x{vh}  |  {fps_text}  |  {duration_text}  |  "
             f"{tf} frames  |  {sizeof_fmt(sz)}  |  {decoder}  |  {audio}"
         )
+        self._info_bar.setAccessibleDescription(self._info_bar.text())
         self._info_bar.show()
 
         for b in (self._btn_p10, self._btn_p1, self._btn_play,
@@ -4576,8 +4901,15 @@ class MainWindow(QMainWindow):
         self.display.show_frame(frame)
         ms = display_time_ms(identity, shown_idx, self.fps)
         self._pos_lbl.setText(ms_to_ts(ms))
+        self._pos_lbl.setAccessibleDescription(
+            f"Current frame {shown_idx:,}, presentation time {ms_to_ts(ms)}."
+        )
         tf  = f" / {self.total_frames:,}" if self.total_frames else ""
         self.display.set_overlay(f"Frame {shown_idx:,}{tf}  |  {ms_to_ts(ms)}")
+        self.slider.setAccessibleDescription(
+            f"Video timeline at frame {shown_idx:,} of {self.total_frames or 'unknown'}. "
+            "Use Left and Right arrows to step."
+        )
         self._waveform.set_position(ms / 1000.0)
 
         if not self._slider_held and self.total_frames > 0:
@@ -4621,6 +4953,13 @@ class MainWindow(QMainWindow):
         self._pos_lbl.setText(ms_to_ts(ms))
         tf = f" / {self.total_frames:,}" if self.total_frames else ""
         self.display.set_overlay(f"Frame {shown_idx:,}{tf}  |  {ms_to_ts(ms)}")
+        self._pos_lbl.setAccessibleDescription(
+            f"Current frame {shown_idx:,}, presentation time {ms_to_ts(ms)}."
+        )
+        self.slider.setAccessibleDescription(
+            f"Video timeline at frame {shown_idx:,} of {self.total_frames or 'unknown'}. "
+            "Use Left and Right arrows to step."
+        )
         self._waveform.set_position(ms / 1000.0)
 
         if not self._slider_held and self.total_frames > 0:
@@ -4703,6 +5042,10 @@ class MainWindow(QMainWindow):
 
     def _loop_toggled(self, checked: bool):
         self._loop_mode = checked
+        self._loop_btn.setAccessibleDescription(
+            "Loop playback is on; playback repeats at the end."
+            if checked else "Loop playback is off; playback stops at the end."
+        )
         self._loop_btn.setProperty("active", "true" if checked else "false")
         self._loop_btn.style().unpolish(self._loop_btn)
         self._loop_btn.style().polish(self._loop_btn)
@@ -5012,13 +5355,24 @@ class MainWindow(QMainWindow):
     def _update_marks_ui(self):
         n   = len(self.marked)
         self._count_lbl.setText(f"{n} frame{'s' if n != 1 else ''} marked")
+        self._count_lbl.setAccessibleDescription(f"{n} marked frame{'s' if n != 1 else ''}.")
         self._tabs.setTabText(0, f"Marks ({n})")
+        self._marks_list.setAccessibleDescription(
+            f"{n} marked frame{'s' if n != 1 else ''}. Select a mark and press the Menu key "
+            "for edit, color, copy, jump, or delete actions."
+        )
         has = n > 0
         self._export_btn.setEnabled(has)
         self._sheet_btn.setEnabled(has)
         self._ffmpeg_btn.setEnabled(has)
         self._clear_btn.setEnabled(has)
         self._del_sel_btn.setEnabled(has)
+        self._del_sel_btn.setAccessibleDescription(
+            "Delete selected marks." if has else "No marks are available to delete."
+        )
+        self._clear_btn.setAccessibleDescription(
+            "Clear all marks." if has else "No marks are available to clear."
+        )
         self._btn_prev_mark.setEnabled(has)
         self._btn_next_mark.setEnabled(has)
         self._refresh_group_filter()
@@ -5085,6 +5439,12 @@ class MainWindow(QMainWindow):
         elif chosen in color_acts:
             _, hex_val = color_acts[chosen]
             self._set_mark_color(idx, hex_val)
+
+    def _show_selected_mark_menu(self):
+        item = self._marks_list.currentItem()
+        if item is None:
+            return
+        self._marks_context_menu(self._marks_list.visualItemRect(item).center())
 
     def _set_mark_color(self, idx: int, color_hex: str):
         if idx not in self.marked:
@@ -5809,17 +6169,26 @@ class MainWindow(QMainWindow):
         lossy = fmt in ("JPEG", "WebP", "WebP Animation", "AVIF")
         self._qual_lbl_l.setEnabled(lossy)
         self._qual_spin.setEnabled(lossy)
+        self._qual_spin.setAccessibleDescription(
+            f"Quality for {fmt}; enabled for lossy formats." if lossy
+            else f"Quality is not used for {fmt}."
+        )
 
     def _scale_changed(self, scale: str):
         custom = scale == "Custom"
         self._cust_lbl.setVisible(custom)
         self._cust_spin.setVisible(custom)
+        self._cust_spin.setAccessibleDescription(
+            "Custom export width in pixels." if custom
+            else "Custom width is hidden until Custom scale is selected."
+        )
 
     # ── Status ────────────────────────────────────────────────────────────────
 
     def _set_status(self, msg: str, color: str = GREEN):
         self._status_lbl.setStyleSheet(f"color: {color}; font-size: 12px;")
         self._status_lbl.setText(msg)
+        self._status_lbl.setAccessibleDescription(msg or "No status message.")
         QTimer.singleShot(6000, lambda: self._status_lbl.setText(""))
 
     # ── Window drag-drop ──────────────────────────────────────────────────────

@@ -417,6 +417,41 @@ def test_alternative_theme_stylesheets_are_available():
         assert stylesheet.startswith("\nQMainWindow")
 
 
+def test_main_window_accessibility_and_keyboard_contract(tmp_path, monkeypatch):
+    app = framesnap_module.QApplication.instance()
+    if app is None:
+        app = framesnap_module.QApplication([])
+    monkeypatch.setattr(
+        framesnap_module, "CONFIG_PATH", tmp_path / "framesnap-config.json"
+    )
+    window = framesnap_module.MainWindow()
+    try:
+        for widget in (
+            window._open_btn, window.display, window.slider,
+            window._thumbnail_strip, window._marks_list, window._mark_btn,
+            window._export_btn, window._status_lbl,
+        ):
+            assert widget.accessibleName()
+            assert widget.accessibleDescription()
+
+        assert window._thumbnail_strip.focusPolicy().name == "StrongFocus"
+        assert window._tabs.widget(1).__class__.__name__ == "QScrollArea"
+        assert "#ffff00" in stylesheet_for_theme("High Contrast")
+        assert "#00ffff" in stylesheet_for_theme("High Contrast")
+        assert window._play_action.shortcut().toString() == "Ctrl+Space"
+        assert window._step_previous_action.shortcut().toString() == "Ctrl+Left"
+        assert window._step_next_action.shortcut().toString() == "Ctrl+Right"
+        assert window._mark_menu_action.shortcut().toString() == "Shift+F10"
+
+        window._loop_toggled(True)
+        assert "on" in window._loop_btn.accessibleDescription()
+        window._set_status("Accessibility test status", framesnap_module.BLUE)
+        assert window._status_lbl.accessibleDescription() == "Accessibility test status"
+    finally:
+        window.close()
+        app.processEvents()
+
+
 def test_export_codecs_write_avif_tiff16_and_exr(tmp_path):
     frame = np.full((12, 16, 3), 128, dtype=np.uint8)
     avif = tmp_path / "frame.avif"

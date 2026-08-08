@@ -21,6 +21,8 @@ All notable changes to FrameSnap will be documented in this file.
   when available and explicit Exact, Approximate, and Nearest timestamp seek modes.
 - Added: A/B comparison by frame index or presentation time, signed offsets, per-source frame/time
   overlays, and deterministic mismatched-boundary handling.
+- Added: keyboard and screen-reader parity for core controls, keyboard thumbnail navigation, a
+  high-contrast theme, and a scrollable export panel for scaled layouts.
 
 ## [v2.2.0] - 2026-08-03
 
