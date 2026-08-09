@@ -25,6 +25,8 @@ All notable changes to FrameSnap will be documented in this file.
   high-contrast theme, and a scrollable export panel for scaled layouts.
 - Added: user-invoked redacted support bundles with runtime capabilities, decoder attempts, timing,
   classified failures, and visible hardware-fallback reasons; no telemetry or media data is collected.
+- Added: indexed, quota-bounded proxy caching with source/settings identity, safe stale/partial
+  cleanup, low-disk refusal, and cancellable progress reporting.
 
 ## [v2.2.0] - 2026-08-03
 

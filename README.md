@@ -80,6 +80,8 @@
 - **Redacted support bundles** — File → Export Support Bundle saves local versions, decoder
   capabilities, backend attempts, timings, and classified failures without media, clipboard data,
   full paths, or telemetry
+- **Bounded proxy cache** — set its disk budget from Edit → Set Proxy Cache Budget; stale and
+  partial artifacts are cleaned safely, and proxy generation reports progress/cancellation
 - Preferences auto-saved (output folder, format, quality, scale, template, overlay state, speed)
 - **Themes:** Catppuccin Mocha, Catppuccin Latte, GitHub Dark, AMOLED Black, and High Contrast
 - **Keyboard/accessibility parity:** named controls, predictable Tab order, keyboard playback/mark navigation, and Shift+F10 mark actions

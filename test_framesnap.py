@@ -4,6 +4,7 @@ import json
 import sys
 import importlib
 import re
+import time
 from pathlib import Path
 import numpy as np
 import pytest
@@ -29,6 +30,7 @@ from framesnap import (
     burn_in_overlay,
     build_video_proxy,
     crop_frame,
+    cleanup_proxy_cache,
     classify_diagnostic_error,
     clamp_frame_position,
     detect_scene_cuts,
@@ -46,6 +48,7 @@ from framesnap import (
     diff_session_data,
     default_export_manifest_path,
     diagnostic_bundle,
+    ensure_cache_free_space,
     ensure_output_path,
     merge_session_data,
     ms_to_ts,
@@ -59,14 +62,18 @@ from framesnap import (
     normalize_session_data,
     normalize_seek_mode,
     normalize_template_data,
+    normalize_proxy_cache_budget_mb,
     save_config,
     safe_filename,
     SEEK_OPTIONS,
     set_wheel_step_for_video,
     wheel_step_for_video,
     proxy_cache_path,
+    proxy_cache_index_path,
+    proxy_cache_is_valid,
     redact_diagnostic_path,
     resolve_collision_path,
+    register_proxy_cache_entry,
     sha256_file,
     export_sequence,
     ordered_mark_indices,
@@ -460,6 +467,9 @@ def test_main_window_accessibility_and_keyboard_contract(tmp_path, monkeypatch):
     monkeypatch.setattr(
         framesnap_module, "CONFIG_PATH", tmp_path / "framesnap-config.json"
     )
+    monkeypatch.setattr(
+        framesnap_module, "PROXY_CACHE_DIR", tmp_path / "proxy-cache"
+    )
     window = framesnap_module.MainWindow()
     try:
         for widget in (
@@ -667,7 +677,11 @@ def test_proxy_generation_is_cached_and_downscaled(tmp_path):
     source = tmp_path / "source.mp4"
     output = tmp_path / "cache" / "proxy.mp4"
     _write_test_video(source)
-    width, height = build_video_proxy(source, output, max_width=16)
+    progress = []
+    width, height = build_video_proxy(
+        source, output, max_width=16,
+        progress=lambda done, total: progress.append((done, total)),
+    )
     assert (width, height) == (16, 12)
     assert output.is_file() and output.stat().st_size > 0
     reader = cv2.VideoCapture(str(output))
@@ -675,6 +689,61 @@ def test_proxy_generation_is_cached_and_downscaled(tmp_path):
     assert int(reader.get(cv2.CAP_PROP_FRAME_HEIGHT)) == 12
     reader.release()
     assert proxy_cache_path(source) == proxy_cache_path(source)
+    assert progress and progress[0][0] >= 1
+
+
+def test_proxy_cache_identity_index_quota_and_partial_cleanup(tmp_path, monkeypatch):
+    cache_root = tmp_path / "proxy-cache"
+    monkeypatch.setattr(framesnap_module, "PROXY_CACHE_DIR", cache_root)
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source-v1")
+    output = proxy_cache_path(str(source))
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"x" * 80)
+    assert proxy_cache_is_valid(str(source), output)
+    register_proxy_cache_entry(str(source), output)
+    assert proxy_cache_index_path().is_file()
+
+    source.write_bytes(b"source-v2")
+    assert not proxy_cache_is_valid(str(source), output)
+    output.unlink()
+
+    newest = cache_root / "newest.mp4"
+    oldest = cache_root / "oldest.mp4"
+    partial = cache_root / ".orphan.partial.mp4"
+    newest.write_bytes(b"n" * 80)
+    oldest.write_bytes(b"o" * 80)
+    partial.write_bytes(b"p" * 10)
+    atomic_write_json(
+        proxy_cache_index_path(),
+        {
+            "version": 1,
+            "entries": {
+                newest.name: {"last_used": time.time(), "size": 80},
+                oldest.name: {"last_used": time.time() - 2, "size": 80},
+            },
+        },
+    )
+    result = cleanup_proxy_cache(budget_bytes=100)
+    assert result["partial_removed"] == 1
+    assert result["removed"] >= 2
+    assert result["remaining_bytes"] <= 100
+    assert newest.is_file()
+    assert not oldest.exists()
+    assert not partial.exists()
+
+    assert normalize_proxy_cache_budget_mb(1) == framesnap_module.MIN_PROXY_CACHE_BUDGET_MB
+    assert normalize_proxy_cache_budget_mb("bad") == framesnap_module.DEFAULT_PROXY_CACHE_BUDGET_MB
+
+
+def test_proxy_cache_fails_closed_when_volume_is_low(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        framesnap_module.shutil, "disk_usage",
+        lambda _path: type("Usage", (), {"free": 0})(),
+    )
+    with pytest.raises(OSError) as error:
+        ensure_cache_free_space(tmp_path / "cache" / "proxy.mp4")
+    assert error.value.errno == 28
 
 
 def test_analysis_jobs_abort_without_leaving_partial_proxy(tmp_path):

@@ -10,6 +10,7 @@ import json
 import argparse
 import csv
 import datetime
+import errno
 import multiprocessing
 import platform
 import re
@@ -431,6 +432,15 @@ DEFAULT_TEMPLATE = "{stem}_{frame}_{ts}"
 PROXY_CACHE_DIR  = Path.home() / ".framesnap_proxy_cache"
 PROXY_MAX_WIDTH  = 1280
 PROXY_MIN_BYTES  = 1_000_000_000
+PROXY_CACHE_INDEX_VERSION = 1
+DEFAULT_PROXY_CACHE_BUDGET_MB = 4096
+MIN_PROXY_CACHE_BUDGET_MB = 64
+MAX_PROXY_CACHE_BUDGET_MB = 1_048_576
+MIN_CACHE_FREE_BYTES = 128 * 1024 * 1024
+PROXY_CACHE_STALE_SECONDS = 7 * 24 * 60 * 60
+THUMBNAIL_CACHE_LIMIT = 18
+ANALYSIS_FRAME_CACHE_LIMIT = 40
+_CACHE_LOCK = threading.RLock()
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -2223,20 +2233,239 @@ def extract_audio_waveform(path: str, bucket_count: int = 1200,
 
 
 def proxy_cache_path(path: str, max_width: int = PROXY_MAX_WIDTH) -> Path:
-    """Return a content-aware cache location for a generated playback proxy."""
+    """Return a source/settings-identity cache location for a playback proxy."""
     source = Path(path).resolve()
     try:
         stat = source.stat()
-        stamp = f"{source}|{stat.st_size}|{stat.st_mtime_ns}|{max_width}"
+        stamp = (
+            f"{source}|{stat.st_dev}|{stat.st_ino}|{stat.st_size}|"
+            f"{stat.st_mtime_ns}|{max_width}"
+        )
     except OSError:
         stamp = f"{source}|{max_width}"
     digest = hashlib.sha256(stamp.encode("utf-8")).hexdigest()[:24]
     return PROXY_CACHE_DIR / f"{digest}.mp4"
 
 
+def _proxy_cache_root(root: str | Path | None = None) -> Path:
+    return Path(root or PROXY_CACHE_DIR).expanduser().resolve()
+
+
+def _safe_proxy_cache_child(root: Path, path: str | Path) -> Path:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    candidate = Path(os.path.abspath(str(candidate)))
+    if os.path.normcase(str(candidate.parent)) != os.path.normcase(str(root)):
+        raise ValueError("Proxy cache path escapes the cache directory")
+    if _is_reparse_point(candidate):
+        raise ValueError("Proxy cache path is a reparse point")
+    return candidate
+
+
+def proxy_cache_index_path(root: str | Path | None = None) -> Path:
+    return _proxy_cache_root(root) / "index.json"
+
+
+def _read_proxy_cache_index(root: Path) -> dict:
+    index_path = proxy_cache_index_path(root)
+    if not index_path.is_file() or _is_reparse_point(index_path):
+        return {"version": PROXY_CACHE_INDEX_VERSION, "entries": {}}
+    try:
+        payload = _read_json_file(index_path, "proxy cache index")
+    except PersistenceError as exc:
+        DIAGNOSTICS.record_exception(
+            "proxy_cache_index_read_failed", exc, context="disk",
+            output_path=index_path,
+        )
+        return {"version": PROXY_CACHE_INDEX_VERSION, "entries": {}}
+    entries = payload.get("entries", {})
+    if not isinstance(entries, dict):
+        entries = {}
+    return {
+        "version": PROXY_CACHE_INDEX_VERSION,
+        "entries": {
+            str(name): entry for name, entry in entries.items()
+            if isinstance(entry, dict)
+        },
+    }
+
+
+def _write_proxy_cache_index(root: Path, index: dict) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    if _is_reparse_point(root):
+        raise PersistenceError("Proxy cache directory is a reparse point")
+    atomic_write_json(proxy_cache_index_path(root), index)
+
+
+def proxy_cache_is_valid(source_path: str, output_path: str | Path,
+                         max_width: int = PROXY_MAX_WIDTH) -> bool:
+    """Validate that a cached proxy belongs to the current source identity."""
+    root = _proxy_cache_root()
+    try:
+        target = _safe_proxy_cache_child(root, output_path)
+        expected = _safe_proxy_cache_child(root, proxy_cache_path(source_path, max_width))
+    except (OSError, ValueError):
+        return False
+    if target != expected or not target.is_file():
+        return False
+    try:
+        return target.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def register_proxy_cache_entry(source_path: str, output_path: str | Path,
+                               max_width: int = PROXY_MAX_WIDTH) -> None:
+    """Record a successful proxy and its source/settings identity."""
+    root = _proxy_cache_root()
+    target = _safe_proxy_cache_child(root, output_path)
+    expected = _safe_proxy_cache_child(root, proxy_cache_path(source_path, max_width))
+    if target != expected or not target.is_file() or _is_reparse_point(target):
+        raise ValueError("Proxy cache entry does not match its source identity")
+    stat = target.stat()
+    with _CACHE_LOCK:
+        index = _read_proxy_cache_index(root)
+        index["entries"][target.name] = {
+            "identity": target.stem,
+            "size": int(stat.st_size),
+            "last_used": round(time.time(), 3),
+            "max_width": int(max_width),
+        }
+        _write_proxy_cache_index(root, index)
+
+
+def touch_proxy_cache_entry(source_path: str, output_path: str | Path,
+                            max_width: int = PROXY_MAX_WIDTH) -> None:
+    """Refresh LRU metadata for a validated proxy without exposing the source path."""
+    if not proxy_cache_is_valid(source_path, output_path, max_width):
+        return
+    register_proxy_cache_entry(source_path, output_path, max_width)
+
+
+def ensure_cache_free_space(path: str | Path,
+                            minimum_bytes: int = MIN_CACHE_FREE_BYTES) -> None:
+    """Fail before writing a cache artifact when the volume is critically full."""
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    usage = shutil.disk_usage(target.parent)
+    if usage.free < max(0, int(minimum_bytes)):
+        raise OSError(
+            errno.ENOSPC,
+            f"Only {usage.free} bytes remain on the cache volume",
+        )
+
+
+def cleanup_proxy_cache(budget_bytes: int | None = None,
+                        root: str | Path | None = None) -> dict:
+    """Remove partial, stale, and least-recently-used proxy files safely."""
+    cache_root = _proxy_cache_root(root)
+    budget = max(
+        0,
+        int(
+            DEFAULT_PROXY_CACHE_BUDGET_MB * 1024 * 1024
+            if budget_bytes is None else budget_bytes
+        ),
+    )
+    result = {
+        "removed": 0, "removed_bytes": 0, "partial_removed": 0,
+        "remaining_bytes": 0, "skipped_reparse": 0,
+    }
+    if not cache_root.exists():
+        return result
+    if _is_reparse_point(cache_root):
+        raise PersistenceError("Proxy cache directory is a reparse point")
+
+    with _CACHE_LOCK:
+        index = _read_proxy_cache_index(cache_root)
+        entries = index["entries"]
+        files: list[tuple[Path, int, float]] = []
+        now = time.time()
+        for child in cache_root.iterdir():
+            if child.name == "index.json" or child.name.endswith(".bak"):
+                continue
+            if _is_reparse_point(child):
+                result["skipped_reparse"] += 1
+                continue
+            try:
+                stat = child.stat()
+            except OSError:
+                continue
+            if not child.is_file():
+                continue
+            is_partial = ".partial" in child.name or child.name.startswith(".")
+            if is_partial:
+                try:
+                    child.unlink()
+                    result["removed"] += 1
+                    result["removed_bytes"] += int(stat.st_size)
+                    result["partial_removed"] += 1
+                except OSError as exc:
+                    DIAGNOSTICS.record_exception(
+                        "proxy_partial_cleanup_failed", exc, context="disk",
+                        output_path=child,
+                    )
+                continue
+            if child.suffix.lower() != ".mp4":
+                continue
+            last_used = float(entries.get(child.name, {}).get("last_used", stat.st_atime))
+            stale = (
+                now - last_used > PROXY_CACHE_STALE_SECONDS
+                if child.name in entries
+                else now - stat.st_mtime > PROXY_CACHE_STALE_SECONDS
+            )
+            if stale:
+                try:
+                    child.unlink()
+                    result["removed"] += 1
+                    result["removed_bytes"] += int(stat.st_size)
+                except OSError as exc:
+                    DIAGNOSTICS.record_exception(
+                        "proxy_stale_cleanup_failed", exc, context="disk",
+                        output_path=child,
+                    )
+                continue
+            files.append((child, int(stat.st_size), last_used))
+
+        total = sum(size for _, size, _ in files)
+        for target, size, _last_used in sorted(files, key=lambda item: item[2]):
+            if total <= budget:
+                break
+            try:
+                target.unlink()
+            except OSError as exc:
+                DIAGNOSTICS.record_exception(
+                    "proxy_quota_cleanup_failed", exc, context="disk",
+                    output_path=target,
+                )
+                continue
+            total -= size
+            result["removed"] += 1
+            result["removed_bytes"] += size
+
+        existing = {
+            target.name for target, _size, _last_used in files
+            if target.exists() and not _is_reparse_point(target)
+        }
+        index["entries"] = {
+            name: entry for name, entry in entries.items() if name in existing
+        }
+        for target, size, last_used in files:
+            if target.name in existing:
+                index["entries"].setdefault(target.name, {
+                    "identity": target.stem,
+                    "size": size,
+                    "last_used": last_used,
+                    "max_width": PROXY_MAX_WIDTH,
+                })["size"] = size
+        _write_proxy_cache_index(cache_root, index)
+        result["remaining_bytes"] = total
+    return result
+
+
 def build_video_proxy(source_path: str, output_path: str | Path,
                       max_width: int = PROXY_MAX_WIDTH,
-                      cancelled=None) -> tuple[int, int]:
+                      cancelled=None, progress=None) -> tuple[int, int]:
     """Create a silent, low-resolution MP4 proxy and return its dimensions."""
     if max_width <= 0:
         raise ValueError("max_width must be positive")
@@ -2259,6 +2488,7 @@ def build_video_proxy(source_path: str, output_path: str | Path,
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
+    ensure_cache_free_space(output)
     temporary = output.with_name(f".{output.stem}.partial.mp4")
     writer = cv2.VideoWriter(
         str(temporary), cv2.VideoWriter_fourcc(*"mp4v"), fps,
@@ -2284,6 +2514,8 @@ def build_video_proxy(source_path: str, output_path: str | Path,
                                    interpolation=cv2.INTER_AREA)
             writer.write(frame)
             frames += 1
+            if progress is not None and (frames == 1 or frames % 10 == 0):
+                progress(frames, int(source.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
     except JobCancelled:
         cancelled_job = True
     finally:
@@ -2586,6 +2818,15 @@ def set_wheel_step_for_video(cfg: dict, path: str, step: int) -> int:
     return value
 
 
+def normalize_proxy_cache_budget_mb(value) -> int:
+    """Clamp the user-configured persistent proxy-cache budget."""
+    try:
+        budget = int(value)
+    except (TypeError, ValueError):
+        budget = DEFAULT_PROXY_CACHE_BUDGET_MB
+    return max(MIN_PROXY_CACHE_BUDGET_MB, min(MAX_PROXY_CACHE_BUDGET_MB, budget))
+
+
 def _config_defaults() -> dict:
     return {
         "config_version": CONFIG_VERSION,
@@ -2614,6 +2855,7 @@ def _config_defaults() -> dict:
         "hardware_accel": False,
         "seek_mode": "Exact frame",
         "proxy_enabled": False,
+        "proxy_cache_budget_mb": DEFAULT_PROXY_CACHE_BUDGET_MB,
         "similarity_threshold": 8,
         "similarity_step": 5,
         "wheel_steps": {},
@@ -2634,6 +2876,9 @@ def normalize_config(data: dict) -> dict:
     defaults = _config_defaults()
     defaults.update(data)
     defaults["config_version"] = CONFIG_VERSION
+    defaults["proxy_cache_budget_mb"] = normalize_proxy_cache_budget_mb(
+        defaults.get("proxy_cache_budget_mb")
+    )
     return defaults
 
 
@@ -2650,7 +2895,7 @@ def save_config(cfg: dict) -> None:
 # ── Frame Cache ───────────────────────────────────────────────────────────────
 
 class FrameCache:
-    def __init__(self, maxsize: int = 40):
+    def __init__(self, maxsize: int = ANALYSIS_FRAME_CACHE_LIMIT):
         self._cache: dict[int, np.ndarray] = {}
         self._order: list[int] = []
         self._maxsize = maxsize
@@ -2852,6 +3097,7 @@ class WaveformThread(CancellableWorker):
 class ProxyThread(CancellableWorker):
     """Generate one playback proxy at a time outside the GUI thread."""
     proxy_ready = pyqtSignal(int, str, str, int, int)
+    proxy_progress = pyqtSignal(int, str, int, int)
     proxy_failed = pyqtSignal(int, str, str)
 
     def __init__(self, parent=None):
@@ -2891,9 +3137,13 @@ class ProxyThread(CancellableWorker):
             if self._cancelled(token):
                 continue
             try:
+                def progress(done: int, total: int):
+                    if not self._cancelled(token):
+                        self.proxy_progress.emit(generation, source_path, done, total)
+
                 width, height = build_video_proxy(
                     source_path, output_path, max_width,
-                    cancelled=token.is_cancelled,
+                    cancelled=token.is_cancelled, progress=progress,
                 )
                 if not self._cancelled(token):
                     self.proxy_ready.emit(
@@ -2956,7 +3206,9 @@ class ThumbnailStripThread(CancellableWorker):
             frames = []
             if reader is not None and reader.isOpened():
                 try:
-                    for idx in thumbnail_frame_indices(reader.frame_count):
+                    for idx in thumbnail_frame_indices(
+                        reader.frame_count, THUMBNAIL_CACHE_LIMIT
+                    ):
                         if self._cancelled(token):
                             break
                         reader.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -3929,6 +4181,9 @@ class MainWindow(QMainWindow):
         self._hardware_accel = bool(self._cfg.get("hardware_accel", False))
         self._seek_mode = normalize_seek_mode(self._cfg.get("seek_mode"))
         self._proxy_enabled = bool(self._cfg.get("proxy_enabled", False))
+        self._proxy_cache_budget_mb = normalize_proxy_cache_budget_mb(
+            self._cfg.get("proxy_cache_budget_mb")
+        )
         self._diagnostics = DIAGNOSTICS
 
         # Video state
@@ -3964,6 +4219,7 @@ class MainWindow(QMainWindow):
         self._waveform_thread.start()
         self._proxy_thread = ProxyThread(self)
         self._proxy_thread.proxy_ready.connect(self._on_proxy_ready)
+        self._proxy_thread.proxy_progress.connect(self._on_proxy_progress)
         self._proxy_thread.proxy_failed.connect(self._on_proxy_failed)
         self._proxy_thread.start()
         self._thumbnail_thread = ThumbnailStripThread(self)
@@ -3985,6 +4241,7 @@ class MainWindow(QMainWindow):
         self._build_timer()
         self._build_hover_popup()
         self._apply_config()
+        self._maintain_proxy_cache(notify=False)
         if self._config_load_error:
             QTimer.singleShot(0, self._show_config_load_error)
 
@@ -4044,6 +4301,10 @@ class MainWindow(QMainWindow):
         ))
         edit_menu.addAction(self._make_act(
             "Set Mouse-Wheel Step...", self.set_mouse_wheel_step
+        ))
+        edit_menu.addAction(self._make_act(
+            "Set Proxy Cache Budget...", self.set_proxy_cache_budget,
+            description="Set the maximum disk space used by playback proxies.",
         ))
         edit_menu.addAction(self._make_act(
             "Clear All Marks", self.clear_marks, shortcut="Ctrl+Shift+Delete",
@@ -4876,6 +5137,44 @@ class MainWindow(QMainWindow):
                             preserve_marks=True,
                             record_recent=False)
 
+    def _proxy_cache_budget_bytes(self) -> int:
+        return self._proxy_cache_budget_mb * 1024 * 1024
+
+    def _maintain_proxy_cache(self, notify: bool = True):
+        try:
+            result = cleanup_proxy_cache(self._proxy_cache_budget_bytes())
+        except (OSError, PersistenceError, ValueError) as exc:
+            self._diagnostics.record_exception(
+                "proxy_cache_cleanup_failed", exc, context="disk",
+            )
+            if notify:
+                self._set_status(f"Proxy cache cleanup unavailable: {exc}", YELLOW)
+            return
+        if notify and result["removed"]:
+            self._set_status(
+                f"Proxy cache cleanup removed {result['removed']} stale/over-budget item"
+                f"{'s' if result['removed'] != 1 else ''}.", BLUE,
+            )
+
+    def set_proxy_cache_budget(self):
+        budget, accepted = QInputDialog.getInt(
+            self, "Proxy Cache Budget",
+            "Maximum proxy cache size in MB:",
+            self._proxy_cache_budget_mb,
+            MIN_PROXY_CACHE_BUDGET_MB,
+            MAX_PROXY_CACHE_BUDGET_MB,
+            64,
+        )
+        if not accepted:
+            return
+        self._proxy_cache_budget_mb = normalize_proxy_cache_budget_mb(budget)
+        self._cfg["proxy_cache_budget_mb"] = self._proxy_cache_budget_mb
+        self._save_config()
+        self._maintain_proxy_cache()
+        self._set_status(
+            f"Proxy cache budget: {self._proxy_cache_budget_mb:,} MB.", GREEN
+        )
+
     # ── Video loading ─────────────────────────────────────────────────────────
 
     def open_video(self):
@@ -5012,8 +5311,16 @@ class MainWindow(QMainWindow):
         if (self._proxy_enabled
                 and os.path.getsize(path) >= PROXY_MIN_BYTES
                 and source_width > PROXY_MAX_WIDTH):
+            self._maintain_proxy_cache(notify=False)
             proxy_candidate = proxy_cache_path(path)
-            if proxy_candidate.is_file() and proxy_candidate.stat().st_size > 0:
+            if proxy_cache_is_valid(path, proxy_candidate):
+                try:
+                    touch_proxy_cache_entry(path, proxy_candidate)
+                except (OSError, PersistenceError, ValueError) as exc:
+                    self._diagnostics.record_exception(
+                        "proxy_cache_touch_failed", exc, context="disk",
+                        source_path=path, output_path=proxy_candidate,
+                    )
                 proxy_cap = open_cap(
                     str(proxy_candidate), self._backend,
                     self._hardware_accel,
@@ -5363,6 +5670,14 @@ class MainWindow(QMainWindow):
                 or source_path != self._video_path
                 or not os.path.isfile(output_path)):
             return
+        try:
+            register_proxy_cache_entry(source_path, output_path)
+            self._maintain_proxy_cache(notify=False)
+        except (OSError, PersistenceError, ValueError) as exc:
+            self._diagnostics.record_exception(
+                "proxy_cache_register_failed", exc, context="disk",
+                source_path=source_path, output_path=output_path,
+            )
         position = self.current_frame
         if self._open_path(source_path,
                            start_frame=position,
@@ -5372,6 +5687,17 @@ class MainWindow(QMainWindow):
                 f"Playback proxy ready: {width}x{height}; exports remain full resolution.",
                 BLUE,
             )
+
+    def _on_proxy_progress(self, generation: int, source_path: str,
+                           done: int, total: int):
+        if (generation != self._job_generation
+                or source_path != self._video_path
+                or not self._proxy_enabled):
+            return
+        total_text = f"/{total:,}" if total > 0 else ""
+        self._set_status(
+            f"Building playback proxy: {done:,}{total_text} frames...", BLUE
+        )
 
     def _on_proxy_failed(self, generation: int, source_path: str, error: str):
         if (generation == self._job_generation
