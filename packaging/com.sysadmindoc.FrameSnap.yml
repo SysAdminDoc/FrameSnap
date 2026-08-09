@@ -18,6 +18,7 @@ modules:
       - install -Dm644 framesnap.py /app/share/framesnap/framesnap.py
       - install -Dm644 framesnap_version.py /app/share/framesnap/framesnap_version.py
       - install -Dm644 framesnap_plugins.py /app/share/framesnap/framesnap_plugins.py
+      - install -Dm644 framesnap_release.py /app/share/framesnap/framesnap_release.py
       - install -Dm644 framesnap_es.qm /app/share/framesnap/translations/framesnap_es.qm
       - install -Dm644 com.sysadmindoc.FrameSnap.512.png /app/share/icons/hicolor/512x512/apps/com.sysadmindoc.FrameSnap.png
       - install -Dm644 com.sysadmindoc.FrameSnap.desktop /app/share/applications/com.sysadmindoc.FrameSnap.desktop
@@ -30,6 +31,8 @@ modules:
         path: ../framesnap_version.py
       - type: file
         path: ../framesnap_plugins.py
+      - type: file
+        path: ../framesnap_release.py
       - type: file
         path: ../translations/framesnap_es.qm
       - type: file

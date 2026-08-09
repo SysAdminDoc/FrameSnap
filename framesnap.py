@@ -28,6 +28,13 @@ from pathlib import Path
 
 from framesnap_version import __version__
 from framesnap_plugins import PLUGIN_API_VERSION, PluginError, PluginRegistry
+from framesnap_release import (
+    DEFAULT_UPDATE_MANIFEST_URL,
+    ReleaseError,
+    UpdateCheck,
+    UpdateCheckCancelled,
+    check_for_update,
+)
 
 
 PLUGIN_REGISTRY = PluginRegistry(PLUGIN_API_VERSION)
@@ -3143,6 +3150,7 @@ def _config_defaults() -> dict:
         "locale": "system",
         "plugin_dir": "",
         "enabled_plugins": [],
+        "update_manifest_url": DEFAULT_UPDATE_MANIFEST_URL,
         "theme": "Catppuccin Mocha",
         "last_output_dir": str(Path.home() / "Desktop"),
         "export_format": "PNG",
@@ -3280,6 +3288,39 @@ class CancellableWorker(QThread):
             self._running = False
             self._job_token.cancel()
         self._cond.wakeAll()
+
+
+class UpdateCheckThread(QThread):
+    """Run one explicitly requested release-manifest check off the UI thread."""
+
+    result_ready = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, url: str, parent=None):
+        super().__init__(parent)
+        self.url = url
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    def run(self) -> None:
+        try:
+            result = check_for_update(
+                self.url,
+                __version__,
+                cancel_event=self._cancel_event,
+            )
+        except UpdateCheckCancelled:
+            self.cancelled.emit()
+        except (OSError, ReleaseError) as exc:
+            self.failed.emit(str(exc))
+        else:
+            if self._cancel_event.is_set():
+                self.cancelled.emit()
+            else:
+                self.result_ready.emit(result)
 
 
 class PreviewThread(CancellableWorker):
@@ -4540,6 +4581,7 @@ class MainWindow(QMainWindow):
         self._slider_held = False
         self._last_bgr: np.ndarray | None = None
         self._cache = FrameCache(40)
+        self._update_thread: UpdateCheckThread | None = None
 
         # Marks: frame_idx -> {item, widget, label, color}
         self.marked: dict[int, dict] = {}
@@ -4685,6 +4727,13 @@ class MainWindow(QMainWindow):
             self._language_actions[code] = action
             language_menu.addAction(action)
 
+        help_menu = mb.addMenu(_tr("Help"))
+        self._update_action = self._make_act(
+            "Check for Updates...", self._toggle_update_check,
+            description="Check for a newer release without sending media paths.",
+        )
+        help_menu.addAction(self._update_action)
+
         self._play_action = self._make_act(
             "Play or Pause", self.toggle_play, shortcut="Ctrl+Space",
             description="Start or stop video playback.",
@@ -4766,6 +4815,88 @@ class MainWindow(QMainWindow):
                 "config_write_failed", exc, context="disk",
             )
             self._set_status(f"Preferences not saved: {exc}", RED)
+
+    def _update_manifest_endpoint(self) -> str:
+        environment_url = os.environ.get("FRAMESNAP_UPDATE_MANIFEST_URL")
+        if environment_url is not None:
+            return environment_url.strip()
+        return str(self._cfg.get("update_manifest_url", DEFAULT_UPDATE_MANIFEST_URL)).strip()
+
+    def _toggle_update_check(self):
+        if self._update_thread is not None and self._update_thread.isRunning():
+            self._update_thread.cancel()
+            self._update_action.setEnabled(False)
+            self._set_status(_tr("Cancelling update check..."), YELLOW)
+            return
+        endpoint = self._update_manifest_endpoint()
+        if not endpoint:
+            QMessageBox.information(
+                self,
+                _tr("Update Check"),
+                _tr("Update discovery is disabled. Set update_manifest_url to enable it."),
+            )
+            return
+        thread = UpdateCheckThread(endpoint, self)
+        self._update_thread = thread
+        thread.result_ready.connect(self._on_update_check_result)
+        thread.failed.connect(self._on_update_check_failed)
+        thread.cancelled.connect(self._on_update_check_cancelled)
+        thread.finished.connect(lambda: self._on_update_check_finished(thread))
+        self._update_action.setText(_tr("Cancel Update Check"))
+        self._update_action.setStatusTip(_tr("Cancel the in-progress update check."))
+        self._set_status(_tr("Checking for updates..."), BLUE)
+        thread.start()
+
+    def _on_update_check_result(self, result: UpdateCheck):
+        if result.available:
+            version = str(result.manifest["version"])
+            artifact_names = ", ".join(
+                str(item["name"]) for item in result.manifest["artifacts"]
+            )
+            message = _tr("FrameSnap %1 is available.").replace("%1", version)
+            message += "\n\n" + _tr("Artifacts: %1").replace("%1", artifact_names)
+            release_url = str(result.manifest.get("release_url", "")).strip()
+            if release_url:
+                message += "\n\n" + _tr("Release information: %1").replace("%1", release_url)
+            message += "\n\n" + _tr(
+                "Verify downloaded files with the offline release-manifest command in README.md."
+            )
+            QMessageBox.information(self, _tr("Update Check"), message)
+            self._set_status(_tr("A newer FrameSnap release is available."), GREEN)
+        else:
+            QMessageBox.information(
+                self,
+                _tr("Update Check"),
+                _tr("You are running the latest available FrameSnap release."),
+            )
+            self._set_status(_tr("FrameSnap is up to date."), GREEN)
+
+    def _on_update_check_failed(self, message: str):
+        self._diagnostics.record(
+            "update_check_failed", "network",
+            "The user-invoked release-manifest check failed.",
+            error=message,
+        )
+        QMessageBox.warning(
+            self,
+            _tr("Update Check"),
+            _tr("Update check failed: %1").replace("%1", message),
+        )
+        self._set_status(_tr("Update check failed."), RED)
+
+    def _on_update_check_cancelled(self):
+        self._set_status(_tr("Update check cancelled."), YELLOW)
+
+    def _on_update_check_finished(self, thread: UpdateCheckThread):
+        if self._update_thread is not thread:
+            return
+        self._update_thread = None
+        self._update_action.setEnabled(True)
+        self._update_action.setText(_tr("Check for Updates..."))
+        self._update_action.setStatusTip(
+            _tr("Check for a newer release without sending media paths.")
+        )
+        thread.deleteLater()
 
     def _show_config_load_error(self):
         if not self._config_load_error:
@@ -7311,13 +7442,25 @@ class MainWindow(QMainWindow):
         if self._ab_dialog is not None:
             self._ab_dialog.close()
             self._ab_dialog = None
+        deadline = time.monotonic() + 5.0
+        if self._update_thread is not None and self._update_thread.isRunning():
+            self._update_thread.cancel()
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if not self._update_thread.wait(remaining_ms):
+                QMessageBox.warning(
+                    self,
+                    "Update Check Still Running",
+                    "FrameSnap is still stopping the update check. "
+                    "Retry close in a moment.",
+                )
+                event.ignore()
+                return
         workers = (
             self._preview_thread, self._waveform_thread, self._proxy_thread,
             self._thumbnail_thread, self._scene_thread, self._similarity_thread,
         )
         for worker in workers:
             worker.stop()
-        deadline = time.monotonic() + 5.0
         for worker in workers:
             remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
             if not worker.wait(remaining_ms):

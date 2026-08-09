@@ -34,7 +34,7 @@ jobs:
       - name: Install project and test tools
         run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
       - name: Lint
-        run: ruff check framesnap.py test_framesnap.py tools/validate_translations.py
+        run: ruff check framesnap.py framesnap_plugins.py framesnap_release.py test_framesnap.py tools/validate_translations.py tools/release_manifest.py
       - name: Validate translations
         run: python tools/validate_translations.py
       - name: Test
@@ -69,6 +69,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "FrameSnap.exe --version failed with code $LASTEXITCODE"
           }
+      - name: Create and verify release manifest
+        shell: pwsh
+        run: |
+          python tools/release_manifest.py create `
+            --output dist/FrameSnap-release.json `
+            --artifact dist/FrameSnap.exe `
+            --base-url https://github.com/SysAdminDoc/FrameSnap/releases/latest/download
+          python tools/release_manifest.py verify `
+            --manifest dist/FrameSnap-release.json `
+            --source-root . `
+            --check-source
 
   dependency-audit:
     name: Dependency audit

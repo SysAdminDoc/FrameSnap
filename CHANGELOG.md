@@ -35,6 +35,9 @@ All notable changes to FrameSnap will be documented in this file.
   discovery is non-executable, capabilities are declared and inspectable, and session loading
   never executes plugin code. Added headless manifest inspection/loading and explicit config-based
   enablement without plugin-specific MainWindow changes.
+- Added: deterministic SHA-256 release manifests with offline verification, reproducible source
+  inputs, synchronized version metadata, and an explicitly invoked, cancellable update check that
+  sends no media paths or telemetry and introduces no signing requirement.
 
 ## [v2.2.0] - 2026-08-03
 

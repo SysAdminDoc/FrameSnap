@@ -197,6 +197,40 @@ Release builds include an unsigned `FrameSnap.AppImage` for portable Linux use a
 `FrameSnap.flatpak` bundle for Flatpak-based desktops. Run the AppImage directly, or install the
 Flatpak bundle with `flatpak install --user ./FrameSnap.flatpak`.
 
+## Release verification and updates
+
+Release artifacts are accompanied by a deterministic JSON manifest. Put every artifact and the
+manifest in one release directory, then create the manifest from a clean checkout:
+
+```bash
+python tools/release_manifest.py create \
+  --output release/FrameSnap-release.json \
+  --artifact release/FrameSnap.exe \
+  --artifact release/FrameSnap.AppImage \
+  --artifact release/FrameSnap.flatpak \
+  --base-url https://github.com/SysAdminDoc/FrameSnap/releases/latest/download
+```
+
+The manifest records each artifact's version, byte size, SHA-256, platform, reproducible source
+inputs, Git revision, and synchronized version-metadata hashes. It contains no timestamp and adds
+no signing requirement. Verify downloaded files entirely offline from the release directory:
+
+```bash
+python tools/release_manifest.py verify --manifest FrameSnap-release.json
+```
+
+Maintainers can also verify the recorded source inputs from a checkout with
+`--check-source --source-root .`. The verifier reads only local files and fails on any missing,
+changed, or mismatched artifact. Keep the generated manifest beside the release artifacts when
+publishing them.
+
+Update discovery is opt-in: FrameSnap makes no network request at startup. Use Help → Check for
+Updates... to fetch the configured HTTPS release manifest; the same action cancels an in-flight
+check. Only release version and artifact metadata are requested, with no video paths, media bytes,
+clipboard data, or telemetry. The default endpoint is the project's latest release asset; set
+`FRAMESNAP_UPDATE_MANIFEST_URL` for another endpoint, or set `update_manifest_url` to an empty
+string in the local configuration to disable discovery.
+
 ---
 
 ## Workflow

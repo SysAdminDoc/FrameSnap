@@ -4,6 +4,7 @@ import json
 import sys
 import importlib
 import re
+import threading
 import time
 from pathlib import Path
 import numpy as np
@@ -93,6 +94,15 @@ from framesnap import (
     write_diagnostic_bundle,
 )
 from framesnap_plugins import PLUGIN_API_VERSION, PluginError, PluginRegistry
+from framesnap_release import (
+    ReleaseVerificationError,
+    UpdateCheckCancelled,
+    build_release_manifest,
+    check_for_update,
+    fetch_release_manifest,
+    write_release_manifest,
+    verify_release_manifest,
+)
 
 
 def test_missing_dependency_check_is_actionable(monkeypatch):
@@ -600,6 +610,123 @@ def test_plugins_are_inspectable_and_explicitly_loaded(tmp_path, capsys):
 
     with pytest.raises(PluginError):
         PluginRegistry(api_version=PLUGIN_API_VERSION + 1)
+
+
+def test_release_manifest_is_deterministic_and_verifiable(tmp_path):
+    source_root = tmp_path / "source"
+    release_root = tmp_path / "release"
+    (source_root / "packaging").mkdir(parents=True)
+    release_root.mkdir()
+    version = "2.3.4"
+    (source_root / "framesnap_version.py").write_text(
+        f'__version__ = "{version}"\n', encoding="utf-8"
+    )
+    (source_root / "README.md").write_text(f"version-{version}-badge\n", encoding="utf-8")
+    (source_root / "CHANGELOG.md").write_text(f"## [v{version}]\n", encoding="utf-8")
+    (source_root / "packaging" / "com.sysadmindoc.FrameSnap.metainfo.xml").write_text(
+        f'<release version="{version}"/>\n', encoding="utf-8"
+    )
+    input_paths = [
+        "framesnap_version.py",
+        "README.md",
+        "CHANGELOG.md",
+        "packaging/com.sysadmindoc.FrameSnap.metainfo.xml",
+    ]
+    artifact = release_root / "FrameSnap.exe"
+    artifact.write_bytes(b"release artifact")
+    manifest_path = release_root / "FrameSnap-release.json"
+    first = build_release_manifest(
+        manifest_path,
+        [artifact],
+        source_root=source_root,
+        input_paths=input_paths,
+        base_url="https://updates.example.test/download",
+        release_url="https://updates.example.test/release",
+        source_revision="abc123",
+    )
+    write_release_manifest(manifest_path, first)
+    second = build_release_manifest(
+        manifest_path,
+        [artifact],
+        source_root=source_root,
+        input_paths=input_paths,
+        base_url="https://updates.example.test/download",
+        release_url="https://updates.example.test/release",
+        source_revision="abc123",
+    )
+    assert first == second
+    assert verify_release_manifest(
+        manifest_path, source_root=source_root, check_source=True
+    )["artifacts"] == 1
+    artifact.write_bytes(b"tampered content")
+    with pytest.raises(ReleaseVerificationError, match="SHA-256 mismatch"):
+        verify_release_manifest(manifest_path)
+
+
+def test_update_discovery_sends_only_release_metadata_and_can_cancel():
+    payload = {
+        "manifest_version": 1,
+        "application": "FrameSnap",
+        "version": "2.3.0",
+        "verification": {"algorithm": "SHA-256", "offline": True, "signing": "none"},
+        "artifacts": [{
+            "name": "FrameSnap.exe",
+            "path": "FrameSnap.exe",
+            "platform": "windows-x64",
+            "format": "exe",
+            "version": "2.3.0",
+            "size": 1,
+            "sha256": "0" * 64,
+        }],
+    }
+    requests = []
+
+    class Response:
+        def __init__(self, body):
+            self.body = body
+            self.closed = False
+
+        def read(self, _size):
+            body, self.body = self.body, b""
+            return body
+
+        def close(self):
+            self.closed = True
+
+    response = Response(json.dumps(payload).encode("utf-8"))
+
+    def opener(request, timeout):
+        requests.append((request, timeout))
+        return response
+
+    result = check_for_update(
+        "https://updates.example.test/FrameSnap-release.json",
+        "2.2.0",
+        opener=opener,
+    )
+    assert result.available
+    request, timeout = requests[0]
+    assert request.data is None
+    assert request.full_url.endswith("/FrameSnap-release.json")
+    assert "media" not in str(request.headers).casefold()
+    assert timeout == 5.0
+    assert response.closed
+
+    cancel_event = threading.Event()
+
+    class CancellingResponse(Response):
+        def read(self, _size):
+            cancel_event.set()
+            return b"{"
+
+    cancelled_response = CancellingResponse(b"ignored")
+    with pytest.raises(UpdateCheckCancelled):
+        fetch_release_manifest(
+            "https://updates.example.test/FrameSnap-release.json",
+            cancel_event=cancel_event,
+            opener=lambda _request, timeout: cancelled_response,
+        )
+    assert cancelled_response.closed
 
 
 def test_main_window_accessibility_and_keyboard_contract(tmp_path, monkeypatch):

@@ -116,5 +116,24 @@
     <message><source>View</source><translation>Ver</translation></message>
     <message><source>Watermark:</source><translation>Marca de agua:</translation></message>
     <message><source>Width px:</source><translation>Anchura px:</translation></message>
+    <message><source>A newer FrameSnap release is available.</source><translation>Hay una versión más reciente de FrameSnap disponible.</translation></message>
+    <message><source>Artifacts: %1</source><translation>Artefactos: %1</translation></message>
+    <message><source>Cancel Update Check</source><translation>Cancelar comprobación de actualizaciones</translation></message>
+    <message><source>Cancel the in-progress update check.</source><translation>Cancelar la comprobación de actualizaciones en curso.</translation></message>
+    <message><source>Cancelling update check...</source><translation>Cancelando la comprobación de actualizaciones...</translation></message>
+    <message><source>Check for Updates...</source><translation>Buscar actualizaciones...</translation></message>
+    <message><source>Check for a newer release without sending media paths.</source><translation>Buscar una versión más reciente sin enviar rutas de medios.</translation></message>
+    <message><source>Checking for updates...</source><translation>Comprobando actualizaciones...</translation></message>
+    <message><source>FrameSnap %1 is available.</source><translation>FrameSnap %1 está disponible.</translation></message>
+    <message><source>FrameSnap is up to date.</source><translation>FrameSnap está actualizado.</translation></message>
+    <message><source>Help</source><translation>Ayuda</translation></message>
+    <message><source>Release information: %1</source><translation>Información de la versión: %1</translation></message>
+    <message><source>Update Check</source><translation>Comprobación de actualizaciones</translation></message>
+    <message><source>Update check cancelled.</source><translation>Comprobación de actualizaciones cancelada.</translation></message>
+    <message><source>Update check failed.</source><translation>Falló la comprobación de actualizaciones.</translation></message>
+    <message><source>Update check failed: %1</source><translation>Falló la comprobación de actualizaciones: %1</translation></message>
+    <message><source>Update discovery is disabled. Set update_manifest_url to enable it.</source><translation>La detección de actualizaciones está desactivada. Define update_manifest_url para activarla.</translation></message>
+    <message><source>Verify downloaded files with the offline release-manifest command in README.md.</source><translation>Verifica los archivos descargados con el comando de manifiesto de versión sin conexión en README.md.</translation></message>
+    <message><source>You are running the latest available FrameSnap release.</source><translation>Estás usando la versión más reciente de FrameSnap.</translation></message>
   </context>
 </TS>
