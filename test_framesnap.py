@@ -75,6 +75,9 @@ from framesnap import (
     resolve_collision_path,
     register_proxy_cache_entry,
     sha256_file,
+    metadata_records_from_marks,
+    mark_matches_query,
+    write_metadata_export,
     export_sequence,
     ordered_mark_indices,
     thumbnail_frame_indices,
@@ -396,6 +399,50 @@ def test_batch_marker_export_supports_csv_json_and_cli(tmp_path):
     assert len(list(json_output.glob("*.jpg"))) == 1
 
 
+def test_mark_metadata_round_trips_identity_and_searches_fields(tmp_path):
+    video = tmp_path / "scene.mp4"
+    marked = {
+        4: {
+            "label": "hero",
+            "tags": "wide, action",
+            "comment": "opening note",
+            "chapter": "Intro",
+            "color": "#cba6f7",
+            "pts": 40,
+            "time_base": "1/10",
+            "presentation_time_ms": 400.0,
+            "display_time_ms": 400.0,
+            "timestamp_source": "pts",
+        }
+    }
+    records = metadata_records_from_marks(str(video), marked, 10.0)
+    assert records[0]["source_name"] == "scene.mp4"
+    assert records[0]["time_ms"] == 400.0
+    assert records[0]["timecode"] == "00:00:00.400"
+    assert records[0]["chapter"] == "Intro"
+
+    json_path = tmp_path / "marks.json"
+    csv_path = tmp_path / "marks.csv"
+    write_metadata_export(json_path, str(video), marked, 10.0)
+    write_metadata_export(csv_path, str(video), marked, 10.0)
+    for path in (json_path, csv_path):
+        loaded = load_marker_list(path)
+        assert loaded[0]["video_path"] == str(video.resolve())
+        assert loaded[0]["frame"] == 4
+        assert loaded[0]["time_ms"] == 400.0
+        assert loaded[0]["label"] == "hero"
+        assert loaded[0]["chapter"] == "Intro"
+        assert loaded[0]["pts"] == 40
+        assert loaded[0]["time_base"] == "1/10"
+        assert loaded[0]["presentation_time_ms"] == 400.0
+        assert loaded[0]["timestamp_source"] == "pts"
+
+    assert mark_matches_query(
+        str(video), marked[4], 4, 10.0, "scene hero wide 00:00:00.400 intro"
+    )
+    assert not mark_matches_query(str(video), marked[4], 4, 10.0, "missing")
+
+
 def test_collision_policy_and_transactional_export(tmp_path, monkeypatch):
     target = tmp_path / "frame.png"
     target.write_bytes(b"original")
@@ -474,7 +521,8 @@ def test_main_window_accessibility_and_keyboard_contract(tmp_path, monkeypatch):
     try:
         for widget in (
             window._open_btn, window.display, window.slider,
-            window._thumbnail_strip, window._marks_list, window._mark_btn,
+            window._thumbnail_strip, window._mark_search, window._marks_list,
+            window._mark_btn, window._metadata_btn,
             window._export_btn, window._status_lbl,
         ):
             assert widget.accessibleName()
@@ -494,6 +542,30 @@ def test_main_window_accessibility_and_keyboard_contract(tmp_path, monkeypatch):
         ]
         assert len(support_actions) == 1
         assert support_actions[0].shortcut().toString() == "Ctrl+Shift+D"
+        metadata_actions = [
+            action for action in window.findChildren(framesnap_module.QAction)
+            if action.text() == "Export Mark Metadata..."
+        ]
+        assert len(metadata_actions) == 1
+        assert metadata_actions[0].shortcut().toString() == "Ctrl+Shift+M"
+
+        item = framesnap_module.QListWidgetItem()
+        item.setData(framesnap_module.Qt.ItemDataRole.UserRole, 4)
+        window._marks_list.addItem(item)
+        window._video_path = str(tmp_path / "scene.mp4")
+        window.marked = {
+            4: {
+                "label": "hero", "tags": "wide", "comment": "opening",
+                "chapter": "Intro", "display_time_ms": 400.0,
+            }
+        }
+        window._mark_search.setText("intro")
+        assert not item.isHidden()
+        window._mark_search.setText("missing")
+        assert item.isHidden()
+        window._mark_search.clear()
+        window._select_visible_marks()
+        assert item.isSelected()
 
         window._loop_toggled(True)
         assert "on" in window._loop_btn.accessibleDescription()

@@ -27,6 +27,8 @@ All notable changes to FrameSnap will be documented in this file.
   classified failures, and visible hardware-fallback reasons; no telemetry or media data is collected.
 - Added: indexed, quota-bounded proxy caching with source/settings identity, safe stale/partial
   cleanup, low-disk refusal, and cancellable progress reporting.
+- Added: searchable mark metadata plus stable, atomic JSON/CSV export and import preserving
+  source, frame, presentation-time, PTS, labels, tags, comments, chapters, and colors.
 
 ## [v2.2.0] - 2026-08-03
 

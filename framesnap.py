@@ -632,8 +632,42 @@ def export_sequence(marked: dict, group: str = "All") -> dict[int, int]:
     }
 
 
+def mark_search_text(video_path: str, mark: dict, frame_idx: int,
+                     fps: float) -> str:
+    """Build the searchable text projection for one mark."""
+    time_ms = display_time_ms(mark, frame_idx, fps)
+    source_path = str(video_path or "")
+    source_name = Path(source_path).name if source_path else ""
+    values = (
+        source_path, source_name, str(frame_idx), f"frame {frame_idx}",
+        str(round(time_ms, 3)), f"time {round(time_ms, 3)}",
+        ms_to_ts(time_ms), str(mark.get("label", "")),
+        str(mark.get("tags", "")), str(mark.get("comment", "")),
+        str(mark.get("chapter", "")), str(mark.get("pts", "")),
+        str(mark.get("time_base", "")),
+    )
+    return " ".join(values).casefold()
+
+
+def mark_matches_query(video_path: str, mark: dict, frame_idx: int,
+                       fps: float, query: str) -> bool:
+    """Return whether every whitespace-delimited search term matches a mark."""
+    terms = str(query or "").casefold().split()
+    if not terms:
+        return True
+    searchable = mark_search_text(video_path, mark, frame_idx, fps)
+    return all(term in searchable for term in terms)
+
+
 SESSION_VERSION = "2.2"
 TEMPLATE_VERSION = "1"
+MARK_METADATA_SCHEMA_VERSION = 1
+MARK_METADATA_FIELDS = (
+    "schema_version", "source_path", "source_name", "frame", "pts",
+    "time_base", "presentation_time_ms", "display_time_ms",
+    "timestamp_source", "time_ms", "timecode", "label", "tags",
+    "comment", "chapter", "color",
+)
 CONFIG_VERSION = 1
 
 
@@ -917,6 +951,7 @@ def _clean_session_mark(entry: dict, frame: int) -> dict:
         "color": str(entry.get("color", MAUVE)),
         "tags": ", ".join(parse_tags(str(entry.get("tags", "")))),
         "comment": str(entry.get("comment", "")).strip(),
+        "chapter": str(entry.get("chapter", "")).strip(),
     }
 
 
@@ -965,6 +1000,7 @@ def session_data_from_marks(video_path: str, position: int,
              "color": mark.get("color", MAUVE),
              "tags": mark.get("tags", ""),
              "comment": mark.get("comment", ""),
+             "chapter": mark.get("chapter", ""),
              "pts": mark.get("pts"),
              "time_base": mark.get("time_base"),
              "presentation_time_ms": mark.get("presentation_time_ms"),
@@ -973,6 +1009,115 @@ def session_data_from_marks(video_path: str, position: int,
             for idx, mark in sorted(marked.items())
         ],
     })
+
+
+def metadata_records_from_marks(video_path: str, marked: dict,
+                                fps: float) -> list[dict]:
+    """Return deterministic, review-friendly records for marked frames."""
+    source_path = str(video_path or "")
+    source_name = Path(source_path).name if source_path else ""
+    records = []
+    for idx, mark in sorted(marked.items()):
+        frame = int(idx)
+        identity = frame_time_identity(
+            frame, fps,
+            pts=mark.get("pts"),
+            time_base=mark.get("time_base"),
+            presentation_time_ms=mark.get("presentation_time_ms"),
+            display_time_ms=mark.get("display_time_ms"),
+            timestamp_source=mark.get("timestamp_source"),
+        )
+        time_ms = round(display_time_ms(identity, frame, fps), 3)
+        record = {
+            "schema_version": MARK_METADATA_SCHEMA_VERSION,
+            "source_path": source_path,
+            "source_name": source_name,
+            "frame": frame,
+            "pts": identity["pts"],
+            "time_base": identity["time_base"],
+            "presentation_time_ms": identity["presentation_time_ms"],
+            "display_time_ms": identity["display_time_ms"],
+            "timestamp_source": identity["timestamp_source"],
+            "time_ms": time_ms,
+            "timecode": ms_to_ts(time_ms),
+            "label": str(mark.get("label", "")).strip(),
+            "tags": ", ".join(parse_tags(str(mark.get("tags", "")))),
+            "comment": str(mark.get("comment", "")).strip(),
+            "chapter": str(mark.get("chapter", "")).strip(),
+            "color": str(mark.get("color", MAUVE)),
+        }
+        records.append(record)
+    return records
+
+
+def metadata_payload_from_marks(video_path: str, marked: dict,
+                                fps: float) -> dict:
+    """Build the versioned JSON envelope used by metadata exports."""
+    return {
+        "schema_version": MARK_METADATA_SCHEMA_VERSION,
+        "application": "FrameSnap",
+        "video_path": str(video_path or ""),
+        "source_name": Path(video_path).name if video_path else "",
+        "fields": list(MARK_METADATA_FIELDS),
+        "records": metadata_records_from_marks(video_path, marked, fps),
+    }
+
+
+def _atomic_write_metadata_csv(path: str | Path, records: list[dict]) -> None:
+    target = Path(path).expanduser()
+    temp_path: Path | None = None
+    backup_temp: Path | None = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temp_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+        )
+        temp_path = Path(temp_name)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(
+                stream, fieldnames=MARK_METADATA_FIELDS,
+                extrasaction="ignore", lineterminator="\n",
+            )
+            writer.writeheader()
+            writer.writerows(records)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        backup = target.with_name(f"{target.name}.bak")
+        if target.exists():
+            backup_descriptor, backup_name = tempfile.mkstemp(
+                prefix=f".{backup.name}.", suffix=".tmp", dir=str(target.parent)
+            )
+            os.close(backup_descriptor)
+            backup_temp = Path(backup_name)
+            shutil.copy2(target, backup_temp)
+            os.replace(backup_temp, backup)
+            backup_temp = None
+        os.replace(temp_path, target)
+        temp_path = None
+    except (OSError, TypeError, ValueError) as exc:
+        raise PersistenceError(f"Could not write {target.name}: {exc}") from exc
+    finally:
+        for leftover in (temp_path, backup_temp):
+            if leftover is not None:
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
+
+
+def write_metadata_export(path: str | Path, video_path: str, marked: dict,
+                          fps: float) -> None:
+    """Write stable mark metadata as an atomic JSON or CSV document."""
+    target = Path(path).expanduser()
+    suffix = target.suffix.casefold()
+    if suffix not in (".csv", ".json"):
+        raise ValueError("Metadata export must be a .csv or .json file")
+    payload = metadata_payload_from_marks(video_path, marked, fps)
+    if suffix == ".json":
+        atomic_write_json(target, payload)
+    else:
+        _atomic_write_metadata_csv(target, payload["records"])
 
 
 def session_video_key(path: str) -> str:
@@ -1001,6 +1146,7 @@ def merge_session_data(left: dict, right: dict) -> dict:
         current["tags"] = ", ".join(parse_tags(
             f"{current['tags']}, {incoming['tags']}"
         ))
+        current["chapter"] = current["chapter"] or incoming["chapter"]
         if incoming["comment"] and incoming["comment"] != current["comment"]:
             if current["comment"]:
                 current["comment"] += f"\n{incoming['comment']}"
@@ -1043,7 +1189,9 @@ def session_template_from_data(data: dict, fps: float) -> dict:
     return {
         "version": TEMPLATE_VERSION,
         "marks": [
-            {key: mark[key] for key in ("time_ms", "label", "color", "tags", "comment")}
+            {key: mark[key] for key in (
+                "time_ms", "label", "color", "tags", "comment", "chapter"
+            )}
             for mark in [
                 {"time_ms": round(frame_to_ms(item["frame"], fps), 3), **item}
                 for item in normalized["marks"]
@@ -1095,6 +1243,7 @@ def template_to_marks(template: dict, fps: float,
             "color": entry["color"],
             "tags": entry["tags"],
             "comment": entry["comment"],
+            "chapter": entry.get("chapter", ""),
         }
     return [marks[idx] for idx in sorted(marks)]
 
@@ -1277,8 +1426,19 @@ def load_marker_list(path: str | Path, video_path: str = "") -> list[dict]:
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ValueError(f"Could not parse marker JSON: {exc}") from exc
         if isinstance(raw, dict):
-            default_video = str(raw.get("video_path", raw.get("video", video_path)))
-            payload = raw.get("marks", raw.get("markers", []))
+            if raw.get("application") == "FrameSnap" and "schema_version" in raw:
+                _check_schema_version(
+                    raw.get("schema_version"),
+                    str(MARK_METADATA_SCHEMA_VERSION),
+                    str(MARK_METADATA_SCHEMA_VERSION),
+                    "Mark metadata",
+                )
+            default_video = str(raw.get(
+                "video_path", raw.get("video", raw.get("source_path", video_path))
+            ))
+            payload = raw.get(
+                "records", raw.get("marks", raw.get("markers", []))
+            )
         else:
             default_video = video_path
             payload = raw
@@ -1322,6 +1482,14 @@ def load_marker_list(path: str | Path, video_path: str = "") -> list[dict]:
             if (not math.isfinite(time_ms) or time_ms < 0
                     or time_ms > MAX_MARKER_TIME_MS):
                 raise ValueError(f"Marker {number} has an invalid time_ms")
+        elif _value_present(raw_entry.get("time_ms")):
+            try:
+                time_ms = float(raw_entry["time_ms"])
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(f"Marker {number} has an invalid time_ms") from None
+            if (not math.isfinite(time_ms) or time_ms < 0
+                    or time_ms > MAX_MARKER_TIME_MS):
+                raise ValueError(f"Marker {number} has an invalid time_ms")
         label = _bounded_marker_text(
             raw_entry.get("label", ""), MAX_MARKER_LABEL_LENGTH, "label", number
         )
@@ -1331,17 +1499,38 @@ def load_marker_list(path: str | Path, video_path: str = "") -> list[dict]:
         comment = _bounded_marker_text(
             raw_entry.get("comment", ""), MAX_MARKER_TEXT_LENGTH, "comment", number
         )
-        entries.append({
-            "video_path": _resolve_marker_video(
-                raw_entry.get("video_path", raw_entry.get("video",
-                                     raw_entry.get("path", ""))),
+        chapter = _bounded_marker_text(
+            raw_entry.get("chapter", ""), MAX_MARKER_TEXT_LENGTH, "chapter", number
+        )
+        resolved_video = _resolve_marker_video(
+                raw_entry.get("video_path", raw_entry.get(
+                    "source_path", raw_entry.get("video", raw_entry.get("path", ""))
+                )),
                 default_video, base_dir,
-            ),
+        )
+        identity = frame_time_identity(
+            frame if frame is not None else 0,
+            0.0,
+            pts=raw_entry.get("pts"),
+            time_base=raw_entry.get("time_base"),
+            presentation_time_ms=raw_entry.get("presentation_time_ms"),
+            display_time_ms=raw_entry.get("display_time_ms"),
+            timestamp_source=raw_entry.get("timestamp_source"),
+        )
+        entries.append({
+            "video_path": resolved_video,
             "frame": frame,
             "time_ms": time_ms,
             "label": label,
             "tags": ", ".join(parse_tags(tags)),
             "comment": comment,
+            "chapter": chapter,
+            "pts": identity["pts"],
+            "time_base": identity["time_base"],
+            "presentation_time_ms": identity["presentation_time_ms"],
+            "display_time_ms": identity["display_time_ms"],
+            "timestamp_source": identity["timestamp_source"],
+            "color": str(raw_entry.get("color", MAUVE)),
         })
     if not entries:
         raise ValueError("Marker list is empty")
@@ -4278,6 +4467,11 @@ class MainWindow(QMainWindow):
             shortcut="Ctrl+Shift+D",
             description="Save a redacted local diagnostics bundle for support.",
         ))
+        file_menu.addAction(self._make_act(
+            "Export Mark Metadata...", self.export_mark_metadata,
+            shortcut="Ctrl+Shift+M",
+            description="Export searchable mark metadata as stable JSON or CSV.",
+        ))
         file_menu.addSeparator()
         file_menu.addAction(self._make_act(
             "Save Session Template...", self.save_session_template
@@ -4457,6 +4651,32 @@ class MainWindow(QMainWindow):
         self._set_status(
             f"Support bundle saved: {Path(path).name}", GREEN
         )
+
+    def export_mark_metadata(self):
+        """Export the current marks as stable, searchable JSON or CSV metadata."""
+        if not self._video_path or not self.marked:
+            self._set_status("Mark frames before exporting metadata.", YELLOW)
+            return
+        default_name = f"{Path(self._video_path).stem}-marks.json"
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export Mark Metadata",
+            default_name,
+            "JSON (*.json);;CSV (*.csv)",
+        )
+        if not path:
+            return
+        if Path(path).suffix.casefold() not in (".json", ".csv"):
+            path += ".csv" if "CSV" in selected_filter.upper() else ".json"
+        try:
+            write_metadata_export(path, self._video_path, self.marked, self.fps)
+        except (PersistenceError, OSError, ValueError) as exc:
+            self._diagnostics.record_exception(
+                "metadata_export_failed", exc, context="disk", output_path=path,
+            )
+            QMessageBox.critical(self, "Metadata Export Failed", str(exc))
+            return
+        self._set_status(f"Metadata saved: {Path(path).name}", GREEN)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -4662,6 +4882,14 @@ class MainWindow(QMainWindow):
         ml.setContentsMargins(8, 8, 8, 8)
         ml.setSpacing(6)
 
+        self._mark_search = QLineEdit()
+        self._mark_search.setPlaceholderText(
+            "Filter source, label, tag, comment, frame, time, or chapter"
+        )
+        self._mark_search.setClearButtonEnabled(True)
+        self._mark_search.textChanged.connect(self._refresh_mark_visibility)
+        ml.addWidget(self._mark_search)
+
         self._marks_list = QListWidget()
         self._marks_list.setSpacing(2)
         self._marks_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -4680,7 +4908,11 @@ class MainWindow(QMainWindow):
         self._count_lbl.setStyleSheet(f"color: {SUBTEXT0}; font-size: 11px;")
         self._select_all_btn = QPushButton("All")
         self._select_all_btn.setFixedHeight(28)
-        self._select_all_btn.clicked.connect(self._marks_list.selectAll)
+        self._select_all_btn.clicked.connect(self._select_visible_marks)
+        self._metadata_btn = QPushButton("Export Metadata...")
+        self._metadata_btn.setFixedHeight(28)
+        self._metadata_btn.setEnabled(False)
+        self._metadata_btn.clicked.connect(self.export_mark_metadata)
         self._del_sel_btn = QPushButton("Del Sel")
         self._del_sel_btn.setObjectName("dangerBtn")
         self._del_sel_btn.setFixedHeight(28)
@@ -4693,6 +4925,7 @@ class MainWindow(QMainWindow):
         self._clear_btn.clicked.connect(self.clear_marks)
         nav_row.addWidget(self._count_lbl)
         nav_row.addStretch()
+        nav_row.addWidget(self._metadata_btn)
         nav_row.addWidget(self._select_all_btn)
         nav_row.addWidget(self._del_sel_btn)
         nav_row.addWidget(self._clear_btn)
@@ -4939,8 +5172,10 @@ class MainWindow(QMainWindow):
             (self._copy_btn, "Copy current frame", "Copy the current frame image to the clipboard."),
             (self._mark_btn, "Mark current frame", "Add the current frame to the mark list."),
             (self._tabs, "Main panels", "Switch between Marks and Export panels."),
+            (self._mark_search, "Filter marked frames", "Search source, labels, tags, comments, frames, times, or chapters."),
             (self._marks_list, "Marked frames", "Select marks with arrow keys. Press the Menu key for mark actions."),
             (self._count_lbl, "Marked frame count", "Number of marked frames."),
+            (self._metadata_btn, "Export mark metadata", "Save stable mark metadata as JSON or CSV."),
             (self._select_all_btn, "Select all marks", "Select every mark in the list."),
             (self._del_sel_btn, "Delete selected marks", "Remove selected marks."),
             (self._clear_btn, "Clear all marks", "Remove every mark from the session."),
@@ -4984,8 +5219,9 @@ class MainWindow(QMainWindow):
             self._btn_p10, self._btn_p1, self._btn_play, self._btn_n1,
             self._btn_n10, self._speed_combo, self._loop_btn,
             self._btn_prev_mark, self._btn_next_mark, self._copy_btn,
-            self._mark_btn, self._tabs, self._marks_list, self._select_all_btn,
-            self._del_sel_btn, self._clear_btn, self._fmt_combo, self._qual_spin,
+            self._mark_btn, self._tabs, self._mark_search, self._marks_list,
+            self._metadata_btn, self._select_all_btn, self._del_sel_btn,
+            self._clear_btn, self._fmt_combo, self._qual_spin,
             self._group_combo, self._burn_check, self._crop_check, self._crop_x,
             self._crop_y, self._crop_w, self._crop_h, self._sheet_title,
             self._sheet_watermark, self._sheet_columns, self._sheet_pdf,
@@ -5869,6 +6105,7 @@ class MainWindow(QMainWindow):
             self.mark_frame()
             if len(self.marked) > before and frame_idx in self.marked:
                 self.marked[frame_idx]["label"] = title
+                self.marked[frame_idx]["chapter"] = title
                 self.marked[frame_idx]["widget"].update_label(title)
                 added += 1
         self._show(original_position)
@@ -5922,7 +6159,8 @@ class MainWindow(QMainWindow):
         self._marks_list.setItemWidget(list_item, widget)
         self.marked[idx] = {
             "item": list_item, "widget": widget, "label": "",
-            "color": color, "tags": "", "comment": "", **identity,
+            "color": color, "tags": "", "comment": "", "chapter": "",
+            **identity,
         }
 
         self.slider.set_marks({k: v["color"] for k, v in self.marked.items()})
@@ -5963,6 +6201,42 @@ class MainWindow(QMainWindow):
         self.slider.set_marks({})
         self._update_marks_ui()
 
+    def _select_visible_marks(self):
+        self._marks_list.clearSelection()
+        for row in range(self._marks_list.count()):
+            item = self._marks_list.item(row)
+            if not item.isHidden():
+                item.setSelected(True)
+
+    def _refresh_mark_visibility(self):
+        if not hasattr(self, "_marks_list") or not hasattr(self, "_mark_search"):
+            return
+        query = self._mark_search.text().strip()
+        total = len(self.marked)
+        visible = 0
+        for row in range(self._marks_list.count()):
+            item = self._marks_list.item(row)
+            idx = item.data(Qt.ItemDataRole.UserRole)
+            mark = self.marked.get(idx, {})
+            matches = mark_matches_query(
+                self._video_path, mark, int(idx), self.fps, query
+            )
+            item.setHidden(not matches)
+            if matches:
+                visible += 1
+        if query:
+            count_text = f"{visible}/{total} frames shown"
+            count_description = f"{visible} of {total} marked frames match the filter."
+        else:
+            count_text = f"{total} frame{'s' if total != 1 else ''} marked"
+            count_description = f"{total} marked frame{'s' if total != 1 else ''}."
+        self._count_lbl.setText(count_text)
+        self._count_lbl.setAccessibleDescription(count_description)
+        self._marks_list.setAccessibleDescription(
+            f"{count_description} Select a mark and press the Menu key "
+            "for edit, color, copy, jump, or delete actions."
+        )
+
     def _update_marks_ui(self):
         n   = len(self.marked)
         self._count_lbl.setText(f"{n} frame{'s' if n != 1 else ''} marked")
@@ -5987,6 +6261,7 @@ class MainWindow(QMainWindow):
         self._btn_prev_mark.setEnabled(has)
         self._btn_next_mark.setEnabled(has)
         self._refresh_group_filter()
+        self._refresh_mark_visibility()
 
     def _refresh_group_filter(self):
         if not hasattr(self, "_group_combo"):
@@ -6595,6 +6870,7 @@ class MainWindow(QMainWindow):
             self.marked[fidx]["widget"].update_tags(entry["tags"])
             self.marked[fidx]["comment"] = entry["comment"]
             self.marked[fidx]["widget"].update_comment(entry["comment"])
+            self.marked[fidx]["chapter"] = entry.get("chapter", "")
             self.marked[fidx].update(frame_time_identity(
                 fidx, self.fps,
                 pts=entry.get("pts"),
@@ -6776,6 +7052,7 @@ class MainWindow(QMainWindow):
             mark["widget"].update_tags(entry["tags"])
             mark["comment"] = entry["comment"]
             mark["widget"].update_comment(entry["comment"])
+            mark["chapter"] = entry.get("chapter", "")
             self._set_mark_color(fidx, entry["color"])
         self._refresh_group_filter()
         self._show(original_position)

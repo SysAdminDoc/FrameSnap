@@ -43,6 +43,8 @@
 - **Prev / Next mark** navigation buttons for quick cycling
 - **Multi-select** marks with Ctrl/Shift+Click, then bulk delete selected
 - Marks are kept sorted by time and persist in sessions with their available frame/time identity
+- **Searchable mark metadata** — filter by source, label, tag, comment, frame, time, or chapter;
+  export/import stable JSON or CSV metadata with frame and presentation-time identity
 - **Find Similar Frames** — perceptual-hash scan with configurable sampling to identify near-duplicates
 - **QR/barcode detection** — decode codes from the current frame through Edit → Detect QR/Barcodes
 
@@ -133,7 +135,7 @@ To build the unsigned Windows executable from source, run `pwsh packaging/build-
 ### Noninteractive batch export
 
 Use a CSV or JSON marker list without opening the GUI. Rows may contain `frame` or `time_ms` (or
-`time` as seconds / `HH:MM:SS.mmm`), plus an optional `label`, `tags`, and `comment`. Include
+`time` as seconds / `HH:MM:SS.mmm`), plus an optional `label`, `tags`, `comment`, and `chapter`. Include
 `video_path` per row or provide `--video`:
 
 ```bash
