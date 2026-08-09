@@ -29,6 +29,8 @@ All notable changes to FrameSnap will be documented in this file.
   cleanup, low-disk refusal, and cancellable progress reporting.
 - Added: searchable mark metadata plus stable, atomic JSON/CSV export and import preserving
   source, frame, presentation-time, PTS, labels, tags, comments, chapters, and colors.
+- Added: Qt Linguist runtime catalogs with Spanish UI support, locale-aware visible numbers and
+  timecodes, restart-safe language preferences, and CI checks for missing or stale translations.
 
 ## [v2.2.0] - 2026-08-03
 

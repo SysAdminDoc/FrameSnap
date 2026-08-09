@@ -38,6 +38,9 @@ framesnap = "framesnap:main"
 [tool.setuptools]
 py-modules = ["framesnap", "framesnap_version"]
 
+[tool.setuptools.data-files]
+"share/framesnap/translations" = ["translations/framesnap_es.qm"]
+
 [tool.setuptools.dynamic]
 version = { attr = "framesnap_version.__version__" }
 

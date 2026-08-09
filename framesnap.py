@@ -108,7 +108,8 @@ from PyQt6.QtWidgets import (  # noqa: E402
     QStyle, QStyleOptionSlider, QTabWidget, QAbstractItemView, QCheckBox,
 )
 from PyQt6.QtCore import (  # noqa: E402
-    Qt, QTimer, QThread, QMutex, QWaitCondition, pyqtSignal,
+    Qt, QCoreApplication, QLocale, QTranslator, QTimer, QThread, QMutex,
+    QWaitCondition, pyqtSignal,
     QPoint, QSize, QRect,
 )
 from PyQt6.QtGui import (  # noqa: E402
@@ -425,6 +426,121 @@ def set_accessible(widget, name: str, description: str = "") -> None:
     widget.setAccessibleName(name)
     if description:
         widget.setAccessibleDescription(description)
+
+
+TRANSLATION_CONTEXT = "FrameSnap"
+TRANSLATION_DIR_NAME = "translations"
+_ACTIVE_TRANSLATOR: QTranslator | None = None
+_ACTIVE_LOCALE = ""
+
+
+def _tr(source: str, n: int = -1) -> str:
+    """Translate a UI string while keeping English as the complete fallback."""
+    translated = QCoreApplication.translate(TRANSLATION_CONTEXT, source, "", n)
+    if n >= 0 and "%n" in translated:
+        translated = translated.replace("%n", format_localized_number(n))
+    return translated
+
+
+def _trn(source: str, count: int) -> str:
+    count = max(0, int(count))
+    translated = _tr(source, count)
+    if source == "%n frame(s) marked" and "frame(s)" in translated:
+        return f"{format_localized_number(count)} frame" + (
+            " marked" if count == 1 else "s marked"
+        )
+    if source == "%n marked frame(s)." and "frame(s)" in translated:
+        return f"{format_localized_number(count)} marked frame" + (
+            "." if count == 1 else "s."
+        )
+    return translated
+
+
+def format_localized_number(value, decimals: int | None = None) -> str:
+    """Format visible numbers with the active Qt locale; exports stay stable."""
+    locale = QLocale()
+    if decimals is None:
+        try:
+            return locale.toString(int(value))
+        except (TypeError, ValueError, OverflowError):
+            return str(value)
+    try:
+        return locale.toString(float(value), "f", max(0, int(decimals)))
+    except (TypeError, ValueError, OverflowError):
+        return str(value)
+
+
+def localized_timecode(ms: float) -> str:
+    """Format a display timecode with the locale decimal separator.
+
+    ``ms_to_ts`` remains the stable ASCII representation for filenames and
+    interchange; this helper is only for visible UI text.
+    """
+    return ms_to_ts(ms).replace(".", QLocale().decimalPoint())
+
+
+def normalize_locale(value) -> str:
+    text = str(value or "system").strip().replace("-", "_")
+    if not text or text.casefold() in {"auto", "default", "system"}:
+        return "system"
+    if text.casefold() in {"en", "en_us", "en_gb"}:
+        return "en"
+    if text.casefold().startswith("es"):
+        return "es"
+    return "system"
+
+
+def _translation_locale(requested: str | None = None) -> str:
+    configured = requested or os.environ.get("FRAMESNAP_LOCALE", "system")
+    normalized = normalize_locale(configured)
+    if normalized == "system":
+        return QLocale.system().name().split("_")[0].casefold()
+    return normalized
+
+
+def translation_paths(catalog_name: str) -> list[Path]:
+    """Return source, frozen, installed, and Flatpak catalog locations."""
+    paths = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        paths.append(Path(meipass) / TRANSLATION_DIR_NAME / catalog_name)
+    module_dir = Path(__file__).resolve().parent
+    paths.append(module_dir / TRANSLATION_DIR_NAME / catalog_name)
+    paths.append(Path(sys.prefix) / "share" / "framesnap" / TRANSLATION_DIR_NAME / catalog_name)
+    paths.append(Path("/app/share/framesnap") / TRANSLATION_DIR_NAME / catalog_name)
+    return paths
+
+
+def install_translator(app: QApplication, requested: str | None = None) -> str:
+    """Install the optional Qt catalog and select a matching number locale."""
+    global _ACTIVE_TRANSLATOR, _ACTIVE_LOCALE
+    if _ACTIVE_TRANSLATOR is not None:
+        app.removeTranslator(_ACTIVE_TRANSLATOR)
+        _ACTIVE_TRANSLATOR = None
+    locale_name = _translation_locale(requested)
+    QLocale.setDefault(QLocale(locale_name))
+    _ACTIVE_LOCALE = locale_name
+    if locale_name == "en":
+        return locale_name
+    catalog = f"framesnap_{locale_name}.qm"
+    for candidate in translation_paths(catalog):
+        translator = QTranslator(app)
+        if translator.load(str(candidate)):
+            app.installTranslator(translator)
+            _ACTIVE_TRANSLATOR = translator
+            break
+    return locale_name
+
+
+def startup_locale() -> str:
+    environment_locale = os.environ.get("FRAMESNAP_LOCALE", "").strip()
+    if environment_locale:
+        return normalize_locale(environment_locale)
+    try:
+        return normalize_locale(load_config().get("locale", "system"))
+    except (OSError, PersistenceError, ValueError, json.JSONDecodeError):
+        return normalize_locale(os.environ.get("FRAMESNAP_LOCALE", "system"))
+
 
 CONFIG_PATH     = Path.home() / ".framesnap_config.json"
 MAX_RECENT      = 10
@@ -3020,6 +3136,7 @@ def _config_defaults() -> dict:
     return {
         "config_version": CONFIG_VERSION,
         "recent": [],
+        "locale": "system",
         "theme": "Catppuccin Mocha",
         "last_output_dir": str(Path.home() / "Desktop"),
         "export_format": "PNG",
@@ -3905,7 +4022,7 @@ class ABViewerDialog(QDialog):
                  start_frame: int = 0, seek_mode: str = "Exact frame"):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        self.setWindowTitle("FrameSnap · Side-by-Side A/B Viewer")
+        self.setWindowTitle(_tr("FrameSnap · Side-by-Side A/B Viewer"))
         self.setMinimumSize(1060, 700)
         self.resize(1280, 800)
 
@@ -3974,7 +4091,7 @@ class ABViewerDialog(QDialog):
         next_button.clicked.connect(lambda: self._show_position(
             self._position + self._step_size()
         ))
-        self._position_label = QLabel("Frame 0")
+        self._position_label = QLabel(_tr("Frame 0"))
         set_accessible(self._position_label, "A/B aligned position")
         self._position_label.setMinimumWidth(120)
         self._position_label.setStyleSheet(
@@ -3993,7 +4110,7 @@ class ABViewerDialog(QDialog):
         root.addLayout(control_row)
 
         alignment_row = QHBoxLayout()
-        alignment_row.addWidget(QLabel("Alignment:"))
+        alignment_row.addWidget(QLabel(_tr("Alignment:")))
         self._alignment_combo = QComboBox()
         set_accessible(
             self._alignment_combo, "A/B alignment mode",
@@ -4002,7 +4119,7 @@ class ABViewerDialog(QDialog):
         self._alignment_combo.addItems(["Frame index", "Presentation time"])
         self._alignment_combo.currentTextChanged.connect(self._alignment_changed)
         alignment_row.addWidget(self._alignment_combo)
-        self._offset_label = QLabel("Offset B (frames):")
+        self._offset_label = QLabel(_tr("Offset B (frames):"))
         set_accessible(self._offset_label, "A/B offset units")
         alignment_row.addWidget(self._offset_label)
         self._offset_spin = QSpinBox()
@@ -4028,7 +4145,7 @@ class ABViewerDialog(QDialog):
         self._status_label.setStyleSheet(f"color: {SUBTEXT0}; font-size: 11px;")
         root.addWidget(self._status_label)
 
-        close_button = QPushButton("Close")
+        close_button = QPushButton(_tr("Close"))
         set_accessible(close_button, "Close A/B viewer")
         close_button.clicked.connect(self.close)
         root.addWidget(close_button, 0, Qt.AlignmentFlag.AlignRight)
@@ -4079,13 +4196,13 @@ class ABViewerDialog(QDialog):
             maximum = ab_frame_limit(self._left_count, self._right_count)
             self._slider.setRange(0, maximum)
             self._position = max(0, min(maximum, int(start_value)))
-            self._offset_label.setText("Offset B (frames):")
+            self._offset_label.setText(_tr("Offset B (frames):"))
         else:
             maximum = max(self._left_duration_ms, self._right_duration_ms)
             maximum = max(0, maximum)
             self._slider.setRange(0, maximum)
             self._position = max(0, min(maximum, int(start_value)))
-            self._offset_label.setText("Offset B (ms):")
+            self._offset_label.setText(_tr("Offset B (ms):"))
         self._slider.setEnabled(self._slider.maximum() > 0)
         self._slider.setValue(self._position)
         self._slider.blockSignals(False)
@@ -4129,7 +4246,7 @@ class ABViewerDialog(QDialog):
         if identity is None:
             return "--:--:--.---"
         timestamp = display_time_ms(identity, fallback_frame, fps)
-        text = ms_to_ts(timestamp)
+        text = localized_timecode(timestamp)
         if identity.get("pts") is not None and identity.get("time_base"):
             text += f"  PTS {identity['pts']}@{identity['time_base']}"
         return text
@@ -4161,7 +4278,9 @@ class ABViewerDialog(QDialog):
             right_frame, right_info = self._read_at(
                 self._right_reader, self._right_count, position + offset
             )
-            self._position_label.setText(f"Frame {position:,}")
+            self._position_label.setText(
+                _tr("Frame %1").replace("%1", format_localized_number(position))
+            )
             offset_text = f"offset B {offset:+d} frames"
         else:
             maximum = max(self._left_duration_ms, self._right_duration_ms)
@@ -4174,7 +4293,9 @@ class ABViewerDialog(QDialog):
                 self._right_reader, self._right_count, position + offset,
                 self._right_fps,
             )
-            self._position_label.setText(f"Time {ms_to_ts(position)}")
+            self._position_label.setText(
+                _tr("Time %1").replace("%1", localized_timecode(position))
+            )
             offset_text = f"offset B {offset:+d} ms"
         self._position = position
         self._slider.blockSignals(True)
@@ -4247,10 +4368,12 @@ class FrameItemWidget(QWidget):
         info.setSpacing(1)
         ms = (display_time_ms_value if display_time_ms_value is not None
               else frame_to_ms(frame_idx, fps))
-        self._ts_lbl    = QLabel(ms_to_ts(ms))
+        self._ts_lbl    = QLabel(localized_timecode(ms))
         set_accessible(self._ts_lbl, "Mark presentation time")
         self._ts_lbl.setStyleSheet(f"color: {TEXT}; font-weight: bold; font-size: 13px;")
-        self._frame_lbl = QLabel(f"Frame {frame_idx:,}")
+        self._frame_lbl = QLabel(
+            _tr("Frame %1").replace("%1", format_localized_number(frame_idx))
+        )
         set_accessible(self._frame_lbl, "Mark frame number")
         self._frame_lbl.setStyleSheet(f"color: {SUBTEXT0}; font-size: 11px;")
         self._label_lbl = QLabel(label)
@@ -4272,7 +4395,7 @@ class FrameItemWidget(QWidget):
         inner.addLayout(info)
         inner.addStretch()
 
-        jump_btn = QPushButton("Go")
+        jump_btn = QPushButton(_tr("Go"))
         set_accessible(
             jump_btn, f"Jump to marked frame {frame_idx:,}",
             "Move the video preview to this mark.",
@@ -4313,7 +4436,10 @@ class FrameItemWidget(QWidget):
 
     def _update_accessibility(self):
         ms = self._ts_lbl.text()
-        details = [f"Frame {self.frame_idx:,} at {ms}"]
+        details = [
+            _tr("Frame %1 at %2").replace("%1", format_localized_number(self.frame_idx))
+            .replace("%2", ms)
+        ]
         if self._label_lbl.isVisible() and self._label_lbl.text():
             details.append(f"Label: {self._label_lbl.text()}")
         if self._tags_lbl.isVisible() and self._tags_lbl.text():
@@ -4349,7 +4475,9 @@ class FrameItemWidget(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"FrameSnap v{__version__}")
+        self.setWindowTitle(
+            _tr("FrameSnap v%1").replace("%1", __version__)
+        )
         self.setMinimumSize(1100, 680)
         self.resize(1380, 860)
         self.setAcceptDrops(True)
@@ -4439,8 +4567,8 @@ class MainWindow(QMainWindow):
     def _build_menu(self):
         mb = self.menuBar()
 
-        file_menu = mb.addMenu("File")
-        self._recent_menu = QMenu("Recent Files", self)
+        file_menu = mb.addMenu(_tr("File"))
+        self._recent_menu = QMenu(_tr("Recent Files"), self)
         file_menu.addAction(self._make_act(
             "Open Video...", self.open_video, shortcut="Ctrl+O",
             description="Open a video file.",
@@ -4482,7 +4610,7 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(self._make_act("Exit", self.close, shortcut="Ctrl+Q"))
 
-        edit_menu = mb.addMenu("Edit")
+        edit_menu = mb.addMenu(_tr("Edit"))
         edit_menu.addAction(self._make_act(
             "Mark Current Frame", self.mark_frame, shortcut="Ctrl+M",
             description="Add the current frame to the mark list.",
@@ -4509,12 +4637,12 @@ class MainWindow(QMainWindow):
             shortcut="Ctrl+Shift+C",
         ))
 
-        view_menu = mb.addMenu("View")
+        view_menu = mb.addMenu(_tr("View"))
         self._act_overlay = self._make_act("Frame Overlay", self._toggle_overlay,
                                             checkable=True,
                                             checked=self._cfg.get("show_overlay", True))
         view_menu.addAction(self._act_overlay)
-        theme_menu = view_menu.addMenu("Theme")
+        theme_menu = view_menu.addMenu(_tr("Theme"))
         self._theme_actions = {}
         for theme in THEME_NAMES:
             action = self._make_act(
@@ -4523,6 +4651,23 @@ class MainWindow(QMainWindow):
             )
             self._theme_actions[theme] = action
             theme_menu.addAction(action)
+        language_menu = view_menu.addMenu(_tr("Language"))
+        configured_locale = normalize_locale(self._cfg.get("locale", "system"))
+        self._language_actions = {}
+        for code, label in (
+            ("system", _tr("System")),
+            ("en", _tr("English")),
+            ("es", _tr("Español")),
+        ):
+            action = self._make_act(
+                label,
+                lambda _checked, choice=code: self._set_locale_preference(choice),
+                checkable=True,
+                checked=code == configured_locale,
+                description=_tr("Choose the UI language; restart to apply the change."),
+            )
+            self._language_actions[code] = action
+            language_menu.addAction(action)
 
         self._play_action = self._make_act(
             "Play or Pause", self.toggle_play, shortcut="Ctrl+Space",
@@ -4560,12 +4705,12 @@ class MainWindow(QMainWindow):
 
     def _make_act(self, label: str, slot, checkable=False, checked=False,
                   shortcut: str | None = None, description: str = "") -> QAction:
-        act = QAction(label, self)
+        act = QAction(_tr(label), self)
         if shortcut:
             act.setShortcut(QKeySequence(shortcut))
         if description:
-            act.setStatusTip(description)
-            act.setToolTip(description)
+            act.setStatusTip(_tr(description))
+            act.setToolTip(_tr(description))
         if checkable:
             act.setCheckable(True)
             act.setChecked(checked)
@@ -4578,7 +4723,7 @@ class MainWindow(QMainWindow):
         self._recent_menu.clear()
         recents = self._cfg.get("recent", [])
         if not recents:
-            no_act = QAction("(none)", self)
+            no_act = QAction(_tr("(none)"), self)
             no_act.setEnabled(False)
             self._recent_menu.addAction(no_act)
             return
@@ -4697,10 +4842,10 @@ class MainWindow(QMainWindow):
         left.setSpacing(8)
 
         top_bar = QHBoxLayout()
-        self._open_btn = QPushButton("Open Video...")
+        self._open_btn = QPushButton(_tr("Open Video..."))
         self._open_btn.setFixedHeight(34)
         self._open_btn.clicked.connect(self.open_video)
-        self._file_lbl = QLabel("No file loaded")
+        self._file_lbl = QLabel(_tr("No file loaded"))
         self._file_lbl.setStyleSheet(f"color: {SUBTEXT0}; font-size: 12px;")
         top_bar.addWidget(self._open_btn)
         top_bar.addWidget(self._file_lbl, 1)
@@ -4708,46 +4853,46 @@ class MainWindow(QMainWindow):
         self._queue_lbl.setStyleSheet(f"color: {OVERLAY0}; font-size: 11px;")
         self._queue_prev_btn = QPushButton("◀")
         self._queue_prev_btn.setFixedSize(28, 28)
-        self._queue_prev_btn.setToolTip("Previous video in queue")
+        self._queue_prev_btn.setToolTip(_tr("Previous video in queue"))
         self._queue_prev_btn.clicked.connect(self.previous_queue_video)
         self._queue_next_btn = QPushButton("▶")
         self._queue_next_btn.setFixedSize(28, 28)
-        self._queue_next_btn.setToolTip("Next video in queue")
+        self._queue_next_btn.setToolTip(_tr("Next video in queue"))
         self._queue_next_btn.clicked.connect(self.next_queue_video)
         top_bar.addWidget(self._queue_lbl)
         top_bar.addWidget(self._queue_prev_btn)
         top_bar.addWidget(self._queue_next_btn)
-        top_bar.addWidget(QLabel("Decoder:"))
+        top_bar.addWidget(QLabel(_tr("Decoder:")))
         self._backend_combo = QComboBox()
         self._backend_combo.addItems(BACKEND_OPTIONS)
         self._backend_combo.setFixedHeight(30)
         self._backend_combo.setToolTip(
-            "Auto prefers PyAV when installed; OpenCV uses its FFmpeg wrapper."
+            _tr("Auto prefers PyAV when installed; OpenCV uses its FFmpeg wrapper.")
         )
         self._backend_combo.currentTextChanged.connect(self._backend_changed)
         top_bar.addWidget(self._backend_combo)
-        self._hardware_check = QCheckBox("HW")
+        self._hardware_check = QCheckBox(_tr("HW"))
         self._hardware_check.setFixedHeight(30)
         self._hardware_check.setToolTip(
-            "Request platform hardware decode through PyAV when available."
+            _tr("Request platform hardware decode through PyAV when available.")
         )
         self._hardware_check.setEnabled(av is not None)
         self._hardware_check.toggled.connect(self._hardware_toggled)
         top_bar.addWidget(self._hardware_check)
-        top_bar.addWidget(QLabel("Seek:"))
+        top_bar.addWidget(QLabel(_tr("Seek:")))
         self._seek_combo = QComboBox()
         self._seek_combo.addItems(SEEK_OPTIONS)
         self._seek_combo.setFixedHeight(30)
         self._seek_combo.setToolTip(
-            "Exact frame decodes to the requested index; approximate keyframe favors speed; "
-            "nearest timestamp targets presentation time."
+            _tr("Exact frame decodes to the requested index; approximate keyframe favors speed; "
+                "nearest timestamp targets presentation time.")
         )
         self._seek_combo.currentTextChanged.connect(self._seek_changed)
         top_bar.addWidget(self._seek_combo)
-        self._proxy_check = QCheckBox("Proxy")
+        self._proxy_check = QCheckBox(_tr("Proxy"))
         self._proxy_check.setFixedHeight(30)
         self._proxy_check.setToolTip(
-            "Generate a cached 1280px playback proxy for videos over 1 GB."
+            _tr("Generate a cached 1280px playback proxy for videos over 1 GB.")
         )
         self._proxy_check.toggled.connect(self._proxy_toggled)
         top_bar.addWidget(self._proxy_check)
@@ -4771,7 +4916,7 @@ class MainWindow(QMainWindow):
 
         # Scrubber
         scrub = QHBoxLayout()
-        self._pos_lbl = QLabel("00:00:00.000")
+        self._pos_lbl = QLabel(localized_timecode(0))
         self._pos_lbl.setStyleSheet(
             f"color: {MAUVE}; font-family: Consolas, monospace; "
             f"font-size: 13px; min-width: 105px;"
@@ -4783,7 +4928,7 @@ class MainWindow(QMainWindow):
         self.slider.valueChanged.connect(self._slider_changed)
         self.slider.hovered_frame.connect(self._slider_hovered)
         self.slider.hover_left.connect(self._slider_hover_left)
-        self._dur_lbl = QLabel("00:00:00.000")
+        self._dur_lbl = QLabel(localized_timecode(0))
         self._dur_lbl.setStyleSheet(
             f"color: {SUBTEXT0}; font-family: Consolas, monospace; "
             f"font-size: 13px; min-width: 105px;"
@@ -4805,7 +4950,7 @@ class MainWindow(QMainWindow):
 
         self._btn_p10  = QPushButton("-10")
         self._btn_p1   = QPushButton("-1")
-        self._btn_play = QPushButton("Play")
+        self._btn_play = QPushButton(_tr("Play"))
         self._btn_n1   = QPushButton("+1")
         self._btn_n10  = QPushButton("+10")
         for b in (self._btn_p10, self._btn_p1, self._btn_play, self._btn_n1, self._btn_n10):
@@ -4827,7 +4972,7 @@ class MainWindow(QMainWindow):
         ctrl.addWidget(self._speed_combo)
 
         # Loop button
-        self._loop_btn = QPushButton("Loop")
+        self._loop_btn = QPushButton(_tr("Loop"))
         self._loop_btn.setObjectName("loopBtn")
         self._loop_btn.setFixedHeight(32)
         self._loop_btn.setCheckable(True)
@@ -4836,23 +4981,23 @@ class MainWindow(QMainWindow):
 
         ctrl.addStretch()
 
-        self._btn_prev_mark = QPushButton("< Prev")
+        self._btn_prev_mark = QPushButton(_tr("< Prev"))
         self._btn_prev_mark.setEnabled(False)
         self._btn_prev_mark.setFixedHeight(32)
         self._btn_prev_mark.clicked.connect(self.jump_prev_mark)
 
-        self._btn_next_mark = QPushButton("Next >")
+        self._btn_next_mark = QPushButton(_tr("Next >"))
         self._btn_next_mark.setEnabled(False)
         self._btn_next_mark.setFixedHeight(32)
         self._btn_next_mark.clicked.connect(self.jump_next_mark)
 
-        self._copy_btn = QPushButton("Copy Frame")
+        self._copy_btn = QPushButton(_tr("Copy Frame"))
         self._copy_btn.setObjectName("copyBtn")
         self._copy_btn.setEnabled(False)
         self._copy_btn.setFixedHeight(38)
         self._copy_btn.clicked.connect(self.copy_frame_clipboard)
 
-        self._mark_btn = QPushButton("Mark Frame")
+        self._mark_btn = QPushButton(_tr("Mark Frame"))
         self._mark_btn.setObjectName("markBtn")
         self._mark_btn.setEnabled(False)
         self._mark_btn.setFixedHeight(38)
@@ -4884,7 +5029,7 @@ class MainWindow(QMainWindow):
 
         self._mark_search = QLineEdit()
         self._mark_search.setPlaceholderText(
-            "Filter source, label, tag, comment, frame, time, or chapter"
+            _tr("Filter source, label, tag, comment, frame, time, or chapter")
         )
         self._mark_search.setClearButtonEnabled(True)
         self._mark_search.textChanged.connect(self._refresh_mark_visibility)
@@ -4904,21 +5049,21 @@ class MainWindow(QMainWindow):
         ml.addWidget(self._marks_list, 1)
 
         nav_row = QHBoxLayout()
-        self._count_lbl = QLabel("0 frames marked")
+        self._count_lbl = QLabel(_trn("%n frame(s) marked", 0))
         self._count_lbl.setStyleSheet(f"color: {SUBTEXT0}; font-size: 11px;")
-        self._select_all_btn = QPushButton("All")
+        self._select_all_btn = QPushButton(_tr("All"))
         self._select_all_btn.setFixedHeight(28)
         self._select_all_btn.clicked.connect(self._select_visible_marks)
-        self._metadata_btn = QPushButton("Export Metadata...")
+        self._metadata_btn = QPushButton(_tr("Export Metadata..."))
         self._metadata_btn.setFixedHeight(28)
         self._metadata_btn.setEnabled(False)
         self._metadata_btn.clicked.connect(self.export_mark_metadata)
-        self._del_sel_btn = QPushButton("Del Sel")
+        self._del_sel_btn = QPushButton(_tr("Del Sel"))
         self._del_sel_btn.setObjectName("dangerBtn")
         self._del_sel_btn.setFixedHeight(28)
         self._del_sel_btn.setEnabled(False)
         self._del_sel_btn.clicked.connect(self._delete_selected)
-        self._clear_btn = QPushButton("Clear All")
+        self._clear_btn = QPushButton(_tr("Clear All"))
         self._clear_btn.setObjectName("dangerBtn")
         self._clear_btn.setFixedHeight(28)
         self._clear_btn.setEnabled(False)
@@ -4930,7 +5075,7 @@ class MainWindow(QMainWindow):
         nav_row.addWidget(self._del_sel_btn)
         nav_row.addWidget(self._clear_btn)
         ml.addLayout(nav_row)
-        self._tabs.addTab(marks_tab, "Marks (0)")
+        self._tabs.addTab(marks_tab, f"{_tr('Marks')} ({format_localized_number(0)})")
 
         # Tab 2: Export
         export_tab = QWidget()
@@ -4939,11 +5084,11 @@ class MainWindow(QMainWindow):
         el.setSpacing(10)
 
         # Format
-        fmt_g = QGroupBox("Format")
+        fmt_g = QGroupBox(_tr("Format"))
         fi = QVBoxLayout(fmt_g)
         fi.setSpacing(6)
         fmt_row = QHBoxLayout()
-        fmt_row.addWidget(QLabel("Format:"))
+        fmt_row.addWidget(QLabel(_tr("Format:")))
         self._fmt_combo = QComboBox()
         self._fmt_combo.addItems([
             "PNG", "JPEG", "WebP", "TIFF", "TIFF 16-bit", "BMP",
@@ -4954,7 +5099,7 @@ class MainWindow(QMainWindow):
         fmt_row.addStretch()
         fi.addLayout(fmt_row)
         qual_row = QHBoxLayout()
-        self._qual_lbl_l = QLabel("Quality:")
+        self._qual_lbl_l = QLabel(_tr("Quality:"))
         self._qual_spin  = QSpinBox()
         self._qual_spin.setRange(1, 100)
         self._qual_spin.setValue(90)
@@ -4968,22 +5113,22 @@ class MainWindow(QMainWindow):
         fi.addLayout(qual_row)
         el.addWidget(fmt_g)
 
-        group_g = QGroupBox("Export Group")
+        group_g = QGroupBox(_tr("Export Group"))
         gi = QHBoxLayout(group_g)
-        gi.addWidget(QLabel("Group:"))
+        gi.addWidget(QLabel(_tr("Group:")))
         self._group_combo = QComboBox()
         self._group_combo.addItem("All")
-        self._group_combo.setToolTip("Export only marks carrying the selected tag.")
+        self._group_combo.setToolTip(_tr("Export only marks carrying the selected tag."))
         self._group_combo.currentTextChanged.connect(self._group_changed)
         gi.addWidget(self._group_combo, 1)
         el.addWidget(group_g)
 
-        transform_g = QGroupBox("Export Transforms")
+        transform_g = QGroupBox(_tr("Export Transforms"))
         ti = QVBoxLayout(transform_g)
-        self._burn_check = QCheckBox("Burn timestamp, frame, and label")
+        self._burn_check = QCheckBox(_tr("Burn timestamp, frame, and label"))
         ti.addWidget(self._burn_check)
         crop_row = QHBoxLayout()
-        self._crop_check = QCheckBox("Crop")
+        self._crop_check = QCheckBox(_tr("Crop"))
         crop_row.addWidget(self._crop_check)
         crop_row.addWidget(QLabel("X"))
         self._crop_x = QSpinBox()
@@ -5004,38 +5149,38 @@ class MainWindow(QMainWindow):
         ti.addLayout(crop_row)
         el.addWidget(transform_g)
 
-        sheet_g = QGroupBox("Contact Sheet")
+        sheet_g = QGroupBox(_tr("Contact Sheet"))
         si2 = QVBoxLayout(sheet_g)
         title_row = QHBoxLayout()
-        title_row.addWidget(QLabel("Title:"))
+        title_row.addWidget(QLabel(_tr("Title:")))
         self._sheet_title = QLineEdit()
-        self._sheet_title.setPlaceholderText("Optional sheet title")
+        self._sheet_title.setPlaceholderText(_tr("Optional sheet title"))
         title_row.addWidget(self._sheet_title, 1)
         si2.addLayout(title_row)
         watermark_row = QHBoxLayout()
-        watermark_row.addWidget(QLabel("Watermark:"))
+        watermark_row.addWidget(QLabel(_tr("Watermark:")))
         self._sheet_watermark = QLineEdit()
-        self._sheet_watermark.setPlaceholderText("Optional watermark")
+        self._sheet_watermark.setPlaceholderText(_tr("Optional watermark"))
         watermark_row.addWidget(self._sheet_watermark, 1)
         si2.addLayout(watermark_row)
         sheet_options = QHBoxLayout()
-        sheet_options.addWidget(QLabel("Columns:"))
+        sheet_options.addWidget(QLabel(_tr("Columns:")))
         self._sheet_columns = QSpinBox()
         self._sheet_columns.setRange(0, 6)
-        self._sheet_columns.setSpecialValueText("Auto")
+        self._sheet_columns.setSpecialValueText(_tr("Auto"))
         sheet_options.addWidget(self._sheet_columns)
-        self._sheet_pdf = QCheckBox("Also save PDF")
+        self._sheet_pdf = QCheckBox(_tr("Also save PDF"))
         sheet_options.addWidget(self._sheet_pdf)
         sheet_options.addStretch()
         si2.addLayout(sheet_options)
         el.addWidget(sheet_g)
 
         # Scale
-        scale_g = QGroupBox("Scale")
+        scale_g = QGroupBox(_tr("Scale"))
         si = QVBoxLayout(scale_g)
         si.setSpacing(6)
         scale_row = QHBoxLayout()
-        scale_row.addWidget(QLabel("Scale:"))
+        scale_row.addWidget(QLabel(_tr("Scale:")))
         self._scale_combo = QComboBox()
         self._scale_combo.addItems(["100%", "75%", "50%", "25%", "Custom"])
         self._scale_combo.currentTextChanged.connect(self._scale_changed)
@@ -5043,7 +5188,7 @@ class MainWindow(QMainWindow):
         scale_row.addStretch()
         si.addLayout(scale_row)
         cust_row = QHBoxLayout()
-        self._cust_lbl  = QLabel("Width px:")
+        self._cust_lbl  = QLabel(_tr("Width px:"))
         self._cust_spin = QSpinBox()
         self._cust_spin.setRange(1, 7680)
         self._cust_spin.setValue(1280)
@@ -5057,24 +5202,24 @@ class MainWindow(QMainWindow):
         el.addWidget(scale_g)
 
         # Naming
-        name_g = QGroupBox("Filename Template")
+        name_g = QGroupBox(_tr("Filename Template"))
         ni = QVBoxLayout(name_g)
         ni.setSpacing(4)
         self._name_edit = QLineEdit(DEFAULT_TEMPLATE)
         self._name_edit.setPlaceholderText("{stem}_{frame}_{ts}")
         ni.addWidget(self._name_edit)
-        hint = QLabel("Variables: {stem}  {frame}  {ts}  {label}  {n}")
+        hint = QLabel(_tr("Variables: {stem}  {frame}  {ts}  {label}  {n}"))
         hint.setStyleSheet(f"color: {OVERLAY0}; font-size: 10px;")
         ni.addWidget(hint)
         el.addWidget(name_g)
 
         # Output
-        out_g = QGroupBox("Output Folder")
+        out_g = QGroupBox(_tr("Output Folder"))
         oi = QVBoxLayout(out_g)
         oi.setSpacing(6)
         dir_row = QHBoxLayout()
         self._dir_edit = QLineEdit(self._cfg.get("last_output_dir", ""))
-        self._browse_btn = QPushButton("Browse...")
+        self._browse_btn = QPushButton(_tr("Browse..."))
         self._browse_btn.setFixedHeight(30)
         self._browse_btn.clicked.connect(self.browse_dir)
         dir_row.addWidget(self._dir_edit, 1)
@@ -5082,37 +5227,37 @@ class MainWindow(QMainWindow):
         oi.addLayout(dir_row)
 
         collision_row = QHBoxLayout()
-        collision_row.addWidget(QLabel("If a file exists:"))
+        collision_row.addWidget(QLabel(_tr("If a file exists:")))
         self._collision_combo = QComboBox()
-        self._collision_combo.addItem("Create numbered copy", "suffix")
-        self._collision_combo.addItem("Skip existing file", "skip")
-        self._collision_combo.addItem("Overwrite existing file", "overwrite")
+        self._collision_combo.addItem(_tr("Create numbered copy"), "suffix")
+        self._collision_combo.addItem(_tr("Skip existing file"), "skip")
+        self._collision_combo.addItem(_tr("Overwrite existing file"), "overwrite")
         self._collision_combo.setToolTip(
-            "Choose how exports handle a filename that already exists."
+            _tr("Choose how exports handle a filename that already exists.")
         )
         collision_row.addWidget(self._collision_combo, 1)
         oi.addLayout(collision_row)
 
         export_row = QHBoxLayout()
-        self._export_btn = QPushButton("Export All Frames")
+        self._export_btn = QPushButton(_tr("Export All Frames"))
         self._export_btn.setObjectName("exportBtn")
         self._export_btn.setEnabled(False)
         self._export_btn.setFixedHeight(38)
         self._export_btn.clicked.connect(self.export_frames)
-        self._open_dir_btn = QPushButton("Open Folder")
+        self._open_dir_btn = QPushButton(_tr("Open Folder"))
         self._open_dir_btn.setFixedHeight(38)
         self._open_dir_btn.clicked.connect(self.open_export_dir)
         export_row.addWidget(self._export_btn, 1)
         export_row.addWidget(self._open_dir_btn)
         oi.addLayout(export_row)
 
-        self._sheet_btn = QPushButton("Contact Sheet...")
+        self._sheet_btn = QPushButton(_tr("Contact Sheet..."))
         self._sheet_btn.setObjectName("sheetBtn")
         self._sheet_btn.setEnabled(False)
         self._sheet_btn.setFixedHeight(34)
         self._sheet_btn.clicked.connect(self.export_contact_sheet)
         oi.addWidget(self._sheet_btn)
-        self._ffmpeg_btn = QPushButton("FFmpeg Commands...")
+        self._ffmpeg_btn = QPushButton(_tr("FFmpeg Commands..."))
         self._ffmpeg_btn.setFixedHeight(30)
         self._ffmpeg_btn.clicked.connect(self.show_ffmpeg_commands)
         oi.addWidget(self._ffmpeg_btn)
@@ -5128,7 +5273,7 @@ class MainWindow(QMainWindow):
         export_scroll.setWidgetResizable(True)
         export_scroll.setFrameShape(QFrame.Shape.NoFrame)
         export_scroll.setWidget(export_tab)
-        self._tabs.addTab(export_scroll, "Export")
+        self._tabs.addTab(export_scroll, _tr("Export"))
 
         splitter.addWidget(left_w)
         splitter.addWidget(right_w)
@@ -5728,12 +5873,16 @@ class MainWindow(QMainWindow):
         self._last_bgr     = frame
         self.display.show_frame(frame)
         ms = display_time_ms(identity, shown_idx, self.fps)
-        self._pos_lbl.setText(ms_to_ts(ms))
+        self._pos_lbl.setText(localized_timecode(ms))
         self._pos_lbl.setAccessibleDescription(
-            f"Current frame {shown_idx:,}, presentation time {ms_to_ts(ms)}."
+            f"Current frame {format_localized_number(shown_idx)}, "
+            f"presentation time {localized_timecode(ms)}."
         )
         tf  = f" / {self.total_frames:,}" if self.total_frames else ""
-        self.display.set_overlay(f"Frame {shown_idx:,}{tf}  |  {ms_to_ts(ms)}")
+        self.display.set_overlay(
+            f"{_tr('Frame %1').replace('%1', format_localized_number(shown_idx))}"
+            f"{tf}  |  {localized_timecode(ms)}"
+        )
         self.slider.setAccessibleDescription(
             f"Video timeline at frame {shown_idx:,} of {self.total_frames or 'unknown'}. "
             "Use Left and Right arrows to step."
@@ -5778,9 +5927,12 @@ class MainWindow(QMainWindow):
         self._last_bgr     = frame
         self.display.show_frame(frame)
         ms = display_time_ms(identity, shown_idx, self.fps)
-        self._pos_lbl.setText(ms_to_ts(ms))
+        self._pos_lbl.setText(localized_timecode(ms))
         tf = f" / {self.total_frames:,}" if self.total_frames else ""
-        self.display.set_overlay(f"Frame {shown_idx:,}{tf}  |  {ms_to_ts(ms)}")
+        self.display.set_overlay(
+            f"{_tr('Frame %1').replace('%1', format_localized_number(shown_idx))}"
+            f"{tf}  |  {localized_timecode(ms)}"
+        )
         self._pos_lbl.setAccessibleDescription(
             f"Current frame {shown_idx:,}, presentation time {ms_to_ts(ms)}."
         )
@@ -5800,11 +5952,11 @@ class MainWindow(QMainWindow):
             return
         self.is_playing = not self.is_playing
         if self.is_playing:
-            self._btn_play.setText("Pause")
+            self._btn_play.setText(_tr("Pause"))
             interval = max(1, int(1000.0 / (self.fps * self._speed)))
             self._timer.start(interval)
         else:
-            self._btn_play.setText("Play")
+            self._btn_play.setText(_tr("Play"))
             self._timer.stop()
 
     def step(self, delta: int):
@@ -6225,11 +6377,17 @@ class MainWindow(QMainWindow):
             if matches:
                 visible += 1
         if query:
-            count_text = f"{visible}/{total} frames shown"
-            count_description = f"{visible} of {total} marked frames match the filter."
+            count_text = _tr("%1/%2 frames shown").replace(
+                "%1", format_localized_number(visible)
+            ).replace("%2", format_localized_number(total))
+            count_description = _tr(
+                "%1 of %2 marked frames match the filter."
+            ).replace("%1", format_localized_number(visible)).replace(
+                "%2", format_localized_number(total)
+            )
         else:
-            count_text = f"{total} frame{'s' if total != 1 else ''} marked"
-            count_description = f"{total} marked frame{'s' if total != 1 else ''}."
+            count_text = _trn("%n frame(s) marked", total)
+            count_description = _trn("%n marked frame(s).", total)
         self._count_lbl.setText(count_text)
         self._count_lbl.setAccessibleDescription(count_description)
         self._marks_list.setAccessibleDescription(
@@ -6239,12 +6397,10 @@ class MainWindow(QMainWindow):
 
     def _update_marks_ui(self):
         n   = len(self.marked)
-        self._count_lbl.setText(f"{n} frame{'s' if n != 1 else ''} marked")
-        self._count_lbl.setAccessibleDescription(f"{n} marked frame{'s' if n != 1 else ''}.")
-        self._tabs.setTabText(0, f"Marks ({n})")
-        self._marks_list.setAccessibleDescription(
-            f"{n} marked frame{'s' if n != 1 else ''}. Select a mark and press the Menu key "
-            "for edit, color, copy, jump, or delete actions."
+        self._count_lbl.setText(_trn("%n frame(s) marked", n))
+        self._count_lbl.setAccessibleDescription(_trn("%n marked frame(s).", n))
+        self._tabs.setTabText(
+            0, f"{_tr('Marks')} ({format_localized_number(n)})"
         )
         has = n > 0
         self._export_btn.setEnabled(has)
@@ -6252,6 +6408,7 @@ class MainWindow(QMainWindow):
         self._ffmpeg_btn.setEnabled(has)
         self._clear_btn.setEnabled(has)
         self._del_sel_btn.setEnabled(has)
+        self._metadata_btn.setEnabled(has)
         self._del_sel_btn.setAccessibleDescription(
             "Delete selected marks." if has else "No marks are available to delete."
         )
@@ -7077,6 +7234,16 @@ class MainWindow(QMainWindow):
             self._cfg["theme"] = theme
             self._save_config()
 
+    def _set_locale_preference(self, locale: str):
+        locale = normalize_locale(locale)
+        self._cfg["locale"] = locale
+        self._save_config()
+        for code, action in getattr(self, "_language_actions", {}).items():
+            action.blockSignals(True)
+            action.setChecked(code == locale)
+            action.blockSignals(False)
+        self._set_status(_tr("Language preference saved. Restart FrameSnap to apply."), BLUE)
+
     def _toggle_overlay(self, checked: bool):
         self.display.set_show_overlay(checked)
         self._cfg["show_overlay"] = checked
@@ -7256,6 +7423,7 @@ def main(argv: list[str] | None = None):
 
     configure_high_dpi()
     app = QApplication(sys.argv)
+    install_translator(app, startup_locale())
     branding_icon = QIcon(str(_branding_icon_path()))
     app.setWindowIcon(branding_icon)
     app.setApplicationName("FrameSnap")

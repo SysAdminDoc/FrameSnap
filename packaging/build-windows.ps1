@@ -17,6 +17,7 @@ try {
     }
     & $python.Source -m PyInstaller --noconfirm --onefile --windowed --name FrameSnap `
         --icon icon.ico `
+        --add-data "translations;translations" `
         --hidden-import=numpy._core._exceptions `
         framesnap.py
     if ($LASTEXITCODE -ne 0) {

@@ -87,6 +87,9 @@
 - Preferences auto-saved (output folder, format, quality, scale, template, overlay state, speed)
 - **Themes:** Catppuccin Mocha, Catppuccin Latte, GitHub Dark, AMOLED Black, and High Contrast
 - **Keyboard/accessibility parity:** named controls, predictable Tab order, keyboard playback/mark navigation, and Shift+F10 mark actions
+- **Internationalization:** Qt Linguist catalogs for English fallback and Spanish UI text;
+  choose System, English, or Español from View → Language and restart to apply it. Visible
+  numbers and timecodes follow the active locale while filenames and metadata remain stable.
 - Windows per-monitor-v2 DPI awareness is enabled before Qt creates the application window
 
 ---
@@ -129,6 +132,10 @@ For a clean Windows CPython 3.12 x64 runtime, install the pinned, hash-verified 
 
 If a dependency is missing, the application exits with the exact installation command rather than
 silently changing the interpreter.
+
+The UI follows the operating-system locale by default. The View → Language menu stores a choice
+for the next launch; `FRAMESNAP_LOCALE=es` or `FRAMESNAP_LOCALE=en` can override it for a single
+run. Translation catalogs are validated in CI and the English strings remain the fallback.
 
 To build the unsigned Windows executable from source, run `pwsh packaging/build-windows.ps1`.
 

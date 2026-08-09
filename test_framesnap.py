@@ -78,6 +78,13 @@ from framesnap import (
     metadata_records_from_marks,
     mark_matches_query,
     write_metadata_export,
+    _tr,
+    _trn,
+    format_localized_number,
+    install_translator,
+    localized_timecode,
+    normalize_locale,
+    translation_paths,
     export_sequence,
     ordered_mark_indices,
     thumbnail_frame_indices,
@@ -505,6 +512,25 @@ def test_alternative_theme_stylesheets_are_available():
         stylesheet = stylesheet_for_theme(theme)
         assert "QMainWindow" in stylesheet
         assert stylesheet.startswith("\nQMainWindow")
+
+
+def test_qt_translation_catalog_and_locale_formatting():
+    app = framesnap_module.QApplication.instance()
+    if app is None:
+        app = framesnap_module.QApplication([])
+    assert normalize_locale("es-MX") == "es"
+    assert normalize_locale("en_GB") == "en"
+    assert normalize_locale("unknown") == "system"
+    assert any(path.is_file() for path in translation_paths("framesnap_es.qm"))
+    install_translator(app, "es")
+    try:
+        assert _tr("Open Video...") == "Abrir vídeo..."
+        assert _trn("%n frame(s) marked", 1) == "1 fotograma marcado"
+        assert _trn("%n frame(s) marked", 2) == "2 fotogramas marcados"
+        assert format_localized_number(1.5, 2) == "1,50"
+        assert localized_timecode(1234) == "00:00:01,234"
+    finally:
+        install_translator(app, "en")
 
 
 def test_main_window_accessibility_and_keyboard_contract(tmp_path, monkeypatch):
