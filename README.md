@@ -77,6 +77,9 @@
 
 - **Frame overlay** on video display — shows frame number, total frames, and timestamp (toggleable via View menu)
 - **Video info bar** — resolution, FPS, duration, frame count, file size shown on load
+- **Redacted support bundles** — File → Export Support Bundle saves local versions, decoder
+  capabilities, backend attempts, timings, and classified failures without media, clipboard data,
+  full paths, or telemetry
 - Preferences auto-saved (output folder, format, quality, scale, template, overlay state, speed)
 - **Themes:** Catppuccin Mocha, Catppuccin Latte, GitHub Dark, AMOLED Black, and High Contrast
 - **Keyboard/accessibility parity:** named controls, predictable Tab order, keyboard playback/mark navigation, and Shift+F10 mark actions
@@ -176,7 +179,7 @@ FrameSnap uses OpenCV's FFmpeg backend and accepts any container/codec FFmpeg su
 
 ---
 
-## Keyboard-Free Design
+## Keyboard and Accessibility
 
 FrameSnap is designed for direct local GUI operation. All actions are accessible through visible controls, keyboard shortcuts, Shift+F10 mark actions, context menus, and the menu bar.
 

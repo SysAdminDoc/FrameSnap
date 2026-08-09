@@ -9,7 +9,10 @@ import os
 import json
 import argparse
 import csv
+import datetime
 import multiprocessing
+import platform
+import re
 import subprocess
 import math
 import hashlib
@@ -18,6 +21,7 @@ import tempfile
 import time
 import threading
 import unicodedata
+from contextlib import contextmanager
 from fractions import Fraction
 from pathlib import Path
 
@@ -629,6 +633,185 @@ class PersistenceError(ValueError):
 
 class JobCancelled(RuntimeError):
     """Raised internally when a background job is superseded or stopped."""
+
+
+DIAGNOSTIC_SCHEMA_VERSION = 1
+DIAGNOSTIC_MAX_EVENTS = 400
+_DIAGNOSTIC_PATH_RE = re.compile(
+    r"(?i)(?:[a-z]:[\\/]|\\\\|/(?:users|home|tmp|var|private|mnt)/)[^\s\"']+"
+)
+
+
+def redact_diagnostic_path(value) -> str:
+    """Return a stable, non-reversible identity without exposing a source path."""
+    text = str(value or "")
+    if not text:
+        return "<path:empty>"
+    digest = hashlib.sha256(text.casefold().encode("utf-8", "replace")).hexdigest()[:12]
+    suffix = Path(text).suffix[:16]
+    return f"<path:{digest}>{suffix}"
+
+
+def redact_diagnostic_text(value) -> str:
+    """Remove path-shaped substrings from exception/status text."""
+    text = str(value or "")
+    return _DIAGNOSTIC_PATH_RE.sub("<path>", text)
+
+
+def classify_diagnostic_error(error, context: str = "") -> str:
+    """Map common local failures to a stable support-bundle category."""
+    if isinstance(error, JobCancelled):
+        return "cancelled"
+    message = redact_diagnostic_text(error).casefold()
+    context_text = str(context or "").casefold()
+    if isinstance(error, PermissionError) or any(
+        token in message for token in ("permission", "access is denied", "eacces")
+    ):
+        return "permission"
+    if isinstance(error, OSError) and getattr(error, "errno", None) in (28, 112):
+        return "disk"
+    if any(token in message for token in ("no space", "disk full", "enospc", "not enough space")):
+        return "disk"
+    if "backend" in context_text or any(
+        token in message for token in ("backend", "hardware decode", "accelerator")
+    ):
+        return "backend"
+    if any(token in message for token in ("codec", "decoder", "ffmpeg", "pyav", "opencv")):
+        return "codec"
+    if isinstance(error, (ValueError, PersistenceError, json.JSONDecodeError)):
+        return "input"
+    if isinstance(error, (FileNotFoundError, IsADirectoryError)):
+        return "permission"
+    return "internal"
+
+
+def _redact_diagnostic_value(key: str, value):
+    key_text = str(key).casefold()
+    if any(token in key_text for token in ("clipboard", "media_bytes", "payload_bytes", "secret", "token")):
+        return "<redacted>"
+    if "path" in key_text or key_text in {"source", "output", "directory"}:
+        return redact_diagnostic_path(value)
+    if isinstance(value, dict):
+        return {
+            str(child_key): _redact_diagnostic_value(str(child_key), child_value)
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_diagnostic_value(key, child) for child in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return redact_diagnostic_text(value) if isinstance(value, str) else value
+    return redact_diagnostic_text(value)
+
+
+class DiagnosticRecorder:
+    """Bounded, process-local diagnostic events; nothing is sent off the machine."""
+
+    def __init__(self, max_events: int = DIAGNOSTIC_MAX_EVENTS):
+        self._max_events = max(1, int(max_events))
+        self._started = time.monotonic()
+        self._sequence = 0
+        self._events: list[dict] = []
+        self._lock = threading.RLock()
+
+    def record(self, event: str, category: str = "info", message: str = "",
+               **details) -> dict:
+        with self._lock:
+            self._sequence += 1
+            entry = {
+                "sequence": self._sequence,
+                "elapsed_ms": round((time.monotonic() - self._started) * 1000.0, 3),
+                "event": str(event),
+                "category": str(category),
+                "message": redact_diagnostic_text(message),
+            }
+            entry.update({
+                str(key): _redact_diagnostic_value(str(key), value)
+                for key, value in details.items()
+            })
+            self._events.append(entry)
+            if len(self._events) > self._max_events:
+                del self._events[:len(self._events) - self._max_events]
+            return dict(entry)
+
+    def record_exception(self, event: str, error, context: str = "", **details) -> dict:
+        return self.record(
+            event, classify_diagnostic_error(error, context),
+            redact_diagnostic_text(error), context=context,
+            error_type=type(error).__name__, **details,
+        )
+
+    @contextmanager
+    def timed(self, event: str, category: str = "operation", **details):
+        started = time.monotonic()
+        try:
+            yield
+        except Exception as error:
+            self.record_exception(
+                event, error, context=category,
+                duration_ms=round((time.monotonic() - started) * 1000.0, 3),
+                **details,
+            )
+            raise
+        else:
+            self.record(
+                event, category, duration_ms=round(
+                    (time.monotonic() - started) * 1000.0, 3
+                ), **details,
+            )
+
+    def snapshot(self) -> list[dict]:
+        with self._lock:
+            return [dict(event) for event in self._events]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._events.clear()
+            self._sequence = 0
+            self._started = time.monotonic()
+
+
+DIAGNOSTICS = DiagnosticRecorder()
+
+
+def diagnostic_capabilities() -> dict:
+    """Return safe runtime capabilities suitable for a local support bundle."""
+    return {
+        "application": "FrameSnap",
+        "version": __version__,
+        "python": platform.python_version(),
+        "platform": sys.platform,
+        "os_release": platform.release(),
+        "architecture": platform.machine(),
+        "opencv": getattr(cv2, "__version__", "unknown"),
+        "pillow": getattr(PilImage, "__version__", "unknown"),
+        "pyav": getattr(av, "__version__", None) if av is not None else None,
+        "decoder_backends": list(BACKEND_OPTIONS),
+        "seek_modes": list(SEEK_OPTIONS),
+        "hardware_backend": _hardware_backend_name(),
+        "hardware_decode_request_available": av is not None,
+    }
+
+
+def diagnostic_bundle(recorder: DiagnosticRecorder | None = None) -> dict:
+    active = recorder or DIAGNOSTICS
+    return {
+        "schema_version": DIAGNOSTIC_SCHEMA_VERSION,
+        "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "redaction": {
+            "paths": "stable hash plus extension only",
+            "media_bytes": "never collected",
+            "clipboard": "never collected",
+            "telemetry": "not used",
+        },
+        "capabilities": diagnostic_capabilities(),
+        "events": active.snapshot(),
+    }
+
+
+def write_diagnostic_bundle(path: str | Path,
+                            recorder: DiagnosticRecorder | None = None) -> None:
+    """Write a redacted support bundle through the existing atomic JSON path."""
+    atomic_write_json(path, diagnostic_bundle(recorder))
 
 
 def _schema_version(value, default: str, kind: str) -> tuple[int, ...]:
@@ -1607,12 +1790,15 @@ class VideoReader:
     def __init__(self, path: str, backend: str = "Auto",
                  hardware_accel: bool = False,
                  exact_seek: bool = True,
-                 seek_mode: str | None = None):
+                 seek_mode: str | None = None,
+                 diagnostics: DiagnosticRecorder | None = None):
         self.path = path
+        self._diagnostics = diagnostics or DIAGNOSTICS
         self.backend_name = ""
         self.audio_tracks: int | None = None
         self.hardware_accel = False
         self.hardware_fallback = False
+        self.hardware_fallback_reason = ""
         self.seek_mode = normalize_seek_mode(seek_mode, exact_seek)
         self.exact_seek = self.seek_mode == "Exact frame"
         self._cv_cap: cv2.VideoCapture | None = None
@@ -1633,14 +1819,30 @@ class VideoReader:
 
         last_error: Exception | None = None
         for candidate in candidates:
+            attempt_started = time.monotonic()
             try:
                 if candidate == "PyAV":
                     self._open_pyav(path, hardware_accel)
                 else:
                     self._open_opencv(path)
+                self._diagnostics.record(
+                    "decoder_attempt", "backend", "Decoder opened.",
+                    source_path=path, requested_backend=requested,
+                    backend=candidate, hardware_requested=hardware_accel,
+                    hardware_active=self.hardware_accel,
+                    hardware_fallback=self.hardware_fallback,
+                    hardware_fallback_reason=self.hardware_fallback_reason,
+                    duration_ms=round((time.monotonic() - attempt_started) * 1000.0, 3),
+                )
                 return
             except Exception as exc:
                 last_error = exc
+                self._diagnostics.record_exception(
+                    "decoder_attempt", exc, context="backend",
+                    source_path=path, requested_backend=requested,
+                    backend=candidate, hardware_requested=hardware_accel,
+                    duration_ms=round((time.monotonic() - attempt_started) * 1000.0, 3),
+                )
                 self.release()
 
         detail = f" ({last_error})" if last_error else ""
@@ -1666,11 +1868,12 @@ class VideoReader:
             options["hwaccel"] = requested_accel
         try:
             self._container = av.open(path, options=options)
-        except Exception:
+        except Exception as exc:
             if not options:
                 raise
             self._container = av.open(path, options={})
             self.hardware_fallback = True
+            self.hardware_fallback_reason = redact_diagnostic_text(exc)
 
         self._stream = next(iter(self._container.streams.video), None)
         if self._stream is None:
@@ -1924,19 +2127,29 @@ def _probe_audio_tracks(path: str) -> int | None:
     try:
         with av.open(path) as container:
             return len(container.streams.audio)
-    except Exception:
+    except Exception as exc:
+        DIAGNOSTICS.record_exception(
+            "audio_track_probe_failed", exc, context="codec", source_path=path,
+        )
         return None
 
 
 def open_cap(path: str, backend: str = "Auto",
              hardware_accel: bool = False,
              exact_seek: bool = True,
-             seek_mode: str | None = None) -> VideoReader | None:
+             seek_mode: str | None = None,
+             diagnostics: DiagnosticRecorder | None = None) -> VideoReader | None:
     try:
         return VideoReader(
-            path, backend, hardware_accel, exact_seek, seek_mode=seek_mode
+            path, backend, hardware_accel, exact_seek, seek_mode=seek_mode,
+            diagnostics=diagnostics,
         )
-    except (OSError, RuntimeError, ValueError):
+    except (OSError, RuntimeError, ValueError) as exc:
+        (diagnostics or DIAGNOSTICS).record_exception(
+            "decoder_open_failed", exc, context="backend",
+            source_path=path, requested_backend=backend,
+            hardware_requested=hardware_accel,
+        )
         return None
 
 
@@ -2002,7 +2215,10 @@ def extract_audio_waveform(path: str, bucket_count: int = 1200,
             return levels.tolist(), duration
     except JobCancelled:
         raise
-    except Exception:
+    except Exception as exc:
+        DIAGNOSTICS.record_exception(
+            "waveform_failed", exc, context="codec", source_path=path,
+        )
         return [], 0.0
 
 
@@ -2686,6 +2902,10 @@ class ProxyThread(CancellableWorker):
             except JobCancelled:
                 continue
             except Exception as exc:
+                DIAGNOSTICS.record_exception(
+                    "proxy_failed", exc, context="disk", source_path=source_path,
+                    output_path=output_path, generation=generation,
+                )
                 Path(output_path).with_name(
                     f".{Path(output_path).stem}.partial.mp4"
                 ).unlink(missing_ok=True)
@@ -2811,6 +3031,10 @@ class SceneDetectThread(CancellableWorker):
             except JobCancelled:
                 continue
             except Exception as exc:
+                DIAGNOSTICS.record_exception(
+                    "scene_detection_failed", exc, context="codec",
+                    source_path=path, generation=generation,
+                )
                 if not self._cancelled(token):
                     self.scenes_failed.emit(generation, path, str(exc))
 
@@ -2869,6 +3093,10 @@ class SimilarityThread(CancellableWorker):
             except JobCancelled:
                 continue
             except Exception as exc:
+                DIAGNOSTICS.record_exception(
+                    "similarity_search_failed", exc, context="codec",
+                    source_path=path, generation=generation,
+                )
                 if not self._cancelled(token):
                     self.similar_failed.emit(generation, path, str(exc))
 
@@ -3701,6 +3929,7 @@ class MainWindow(QMainWindow):
         self._hardware_accel = bool(self._cfg.get("hardware_accel", False))
         self._seek_mode = normalize_seek_mode(self._cfg.get("seek_mode"))
         self._proxy_enabled = bool(self._cfg.get("proxy_enabled", False))
+        self._diagnostics = DIAGNOSTICS
 
         # Video state
         self.cap: VideoReader | None = None
@@ -3787,6 +4016,11 @@ class MainWindow(QMainWindow):
         ))
         file_menu.addAction(self._make_act("Merge Sessions...", self.merge_sessions))
         file_menu.addAction(self._make_act("Compare Sessions...", self.diff_sessions))
+        file_menu.addAction(self._make_act(
+            "Export Support Bundle...", self.export_support_bundle,
+            shortcut="Ctrl+Shift+D",
+            description="Save a redacted local diagnostics bundle for support.",
+        ))
         file_menu.addSeparator()
         file_menu.addAction(self._make_act(
             "Save Session Template...", self.save_session_template
@@ -3912,6 +4146,9 @@ class MainWindow(QMainWindow):
         try:
             save_config(self._cfg)
         except PersistenceError as exc:
+            self._diagnostics.record_exception(
+                "config_write_failed", exc, context="disk",
+            )
             self._set_status(f"Preferences not saved: {exc}", RED)
 
     def _show_config_load_error(self):
@@ -3926,6 +4163,39 @@ class MainWindow(QMainWindow):
             "a new file and backup.",
         )
         self._set_status("Preferences reset to defaults; review the warning.", PEACH)
+
+    def export_support_bundle(self):
+        """Let the user save a redacted, offline diagnostics report."""
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        default_name = f"framesnap-support-{stamp}.json"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Support Bundle", default_name, "JSON (*.json)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        self._diagnostics.record(
+            "support_bundle_requested", "operation",
+            "User requested a redacted support bundle.",
+            output_path=path,
+        )
+        try:
+            write_diagnostic_bundle(path, self._diagnostics)
+        except PersistenceError as exc:
+            self._diagnostics.record_exception(
+                "support_bundle_write_failed", exc, context="disk",
+                output_path=path,
+            )
+            QMessageBox.critical(self, "Support Bundle Failed", str(exc))
+            return
+        self._diagnostics.record(
+            "support_bundle_written", "operation",
+            "Redacted support bundle written.", output_path=path,
+        )
+        self._set_status(
+            f"Support bundle saved: {Path(path).name}", GREEN
+        )
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -4715,9 +4985,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Not Found", f"File not found:\n{path}")
             return False
 
+        open_started = time.monotonic()
         cap = open_cap(
             path, self._backend, self._hardware_accel,
             self._seek_mode == "Exact frame", seek_mode=self._seek_mode,
+            diagnostics=self._diagnostics,
         )
         if cap is None or not cap.isOpened():
             QMessageBox.critical(self, "Error",
@@ -4746,6 +5018,7 @@ class MainWindow(QMainWindow):
                     str(proxy_candidate), self._backend,
                     self._hardware_accel,
                     self._seek_mode == "Exact frame", seek_mode=self._seek_mode,
+                    diagnostics=self._diagnostics,
                 )
                 if proxy_cap is not None and proxy_cap.isOpened():
                     cap.release()
@@ -4814,7 +5087,8 @@ class MainWindow(QMainWindow):
                  if cap.audio_tracks is not None else "audio unknown")
         decoder = cap.backend_name
         if cap.hardware_fallback:
-            decoder += " (software fallback)"
+            reason = cap.hardware_fallback_reason or "requested accelerator unavailable"
+            decoder += f" (software fallback: {reason})"
         if playback_path != path:
             decoder += f" + proxy {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}"
         fps_text = f"{self.fps:.3f} fps" if self._fps_known else "fps unknown"
@@ -4828,6 +5102,17 @@ class MainWindow(QMainWindow):
         )
         self._info_bar.setAccessibleDescription(self._info_bar.text())
         self._info_bar.show()
+        self._diagnostics.record(
+            "video_opened", "backend", "Video opened for playback.",
+            source_path=path, playback_source_path=playback_path,
+            backend=cap.backend_name, hardware_requested=self._hardware_accel,
+            hardware_active=cap.hardware_accel,
+            hardware_fallback=cap.hardware_fallback,
+            hardware_fallback_reason=cap.hardware_fallback_reason,
+            frame_count=self.total_frames, fps=self.fps,
+            duration_ms=cap.duration_ms,
+            duration_ms_elapsed=round((time.monotonic() - open_started) * 1000.0, 3),
+        )
 
         for b in (self._btn_p10, self._btn_p1, self._btn_play,
                   self._btn_n1, self._btn_n10,
@@ -5550,8 +5835,14 @@ class MainWindow(QMainWindow):
         reader = open_cap(
             self._video_path, self._backend, self._hardware_accel,
             self._seek_mode == "Exact frame", seek_mode=self._seek_mode,
+            diagnostics=self._diagnostics,
         )
         if reader is None or not reader.isOpened():
+            self._diagnostics.record(
+                "export_source_unavailable", "codec",
+                "Could not open a decoder for export.", source_path=self._video_path,
+                backend=self._backend,
+            )
             return results
         try:
             for idx in ordered_mark_indices(self.marked, selected_group):
@@ -5619,6 +5910,10 @@ class MainWindow(QMainWindow):
             out_dir_path.mkdir(parents=True, exist_ok=True)
             out_dir_path = out_dir_path.resolve()
         except OSError as exc:
+            self._diagnostics.record_exception(
+                "export_directory_failed", exc, context="disk",
+                output_path=out_dir,
+            )
             self._set_status(f"Cannot create output folder: {exc}", YELLOW)
             return
 
@@ -5666,7 +5961,12 @@ class MainWindow(QMainWindow):
             try:
                 base_path = ensure_output_path(out_dir_path, out_dir_path / fname)
                 target = resolve_collision_path(base_path, collision)
-            except (OSError, ValueError):
+            except (OSError, ValueError) as exc:
+                self._diagnostics.record_exception(
+                    "export_path_failed", exc, context="disk",
+                    output_path=out_dir_path / fname,
+                    format=fmt,
+                )
                 errors += 1
                 continue
             if target is None:
@@ -5678,6 +5978,10 @@ class MainWindow(QMainWindow):
             if ok:
                 exported += 1
             else:
+                self._diagnostics.record(
+                    "export_write_failed", "disk",
+                    "Frame export writer returned failure.", format=fmt,
+                )
                 errors += 1
 
         self._update_export_config(
@@ -5790,6 +6094,10 @@ class MainWindow(QMainWindow):
             out_dir_path.mkdir(parents=True, exist_ok=True)
             out_dir_path = out_dir_path.resolve()
         except OSError as exc:
+            self._diagnostics.record_exception(
+                "contact_sheet_directory_failed", exc, context="disk",
+                output_path=out_dir,
+            )
             self._set_status(f"Cannot create output folder: {exc}", YELLOW)
             return
 
@@ -5994,6 +6302,9 @@ class MainWindow(QMainWindow):
         try:
             atomic_write_json(path, data)
         except PersistenceError as exc:
+            self._diagnostics.record_exception(
+                "session_write_failed", exc, context="disk", output_path=path,
+            )
             QMessageBox.critical(self, "Session Save Failed", str(exc))
             return
         self._set_status(f"Session saved: {Path(path).name}", GREEN)
@@ -6007,6 +6318,9 @@ class MainWindow(QMainWindow):
         try:
             data = read_session_file(path)
         except Exception as e:
+            self._diagnostics.record_exception(
+                "session_read_failed", e, context="input", source_path=path,
+            )
             QMessageBox.critical(self, "Error", f"Could not read session:\n{e}")
             return
         if self._apply_session_data(data):

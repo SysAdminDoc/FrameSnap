@@ -23,6 +23,8 @@ All notable changes to FrameSnap will be documented in this file.
   overlays, and deterministic mismatched-boundary handling.
 - Added: keyboard and screen-reader parity for core controls, keyboard thumbnail navigation, a
   high-contrast theme, and a scrollable export panel for scaled layouts.
+- Added: user-invoked redacted support bundles with runtime capabilities, decoder attempts, timing,
+  classified failures, and visible hardware-fallback reasons; no telemetry or media data is collected.
 
 ## [v2.2.0] - 2026-08-03
 

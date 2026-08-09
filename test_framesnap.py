@@ -18,6 +18,7 @@ from framesnap import av as pyav
 from framesnap import (
     _bootstrap,
     CancellationToken,
+    DiagnosticRecorder,
     JobCancelled,
     PersistenceError,
     apply_template,
@@ -28,6 +29,7 @@ from framesnap import (
     burn_in_overlay,
     build_video_proxy,
     crop_frame,
+    classify_diagnostic_error,
     clamp_frame_position,
     detect_scene_cuts,
     detect_codes,
@@ -43,6 +45,7 @@ from framesnap import (
     load_marker_list,
     diff_session_data,
     default_export_manifest_path,
+    diagnostic_bundle,
     ensure_output_path,
     merge_session_data,
     ms_to_ts,
@@ -62,12 +65,14 @@ from framesnap import (
     set_wheel_step_for_video,
     wheel_step_for_video,
     proxy_cache_path,
+    redact_diagnostic_path,
     resolve_collision_path,
     sha256_file,
     export_sequence,
     ordered_mark_indices,
     thumbnail_frame_indices,
     to_uint16_frame,
+    write_diagnostic_bundle,
 )
 
 
@@ -271,6 +276,37 @@ def test_json_persistence_is_atomic_and_keeps_one_backup(tmp_path):
     assert json.loads(target.read_text(encoding="utf-8"))["marks"][0]["frame"] == 8
 
 
+def test_diagnostics_are_classified_bounded_and_redacted(tmp_path):
+    recorder = DiagnosticRecorder(max_events=2)
+    source = r"C:\Users\--\Videos\private clip.mp4"
+    assert redact_diagnostic_path(source).startswith("<path:")
+    assert classify_diagnostic_error(PermissionError("access is denied")) == "permission"
+    assert classify_diagnostic_error(OSError(28, "No space left on device")) == "disk"
+    assert classify_diagnostic_error(JobCancelled("cancelled")) == "cancelled"
+
+    recorder.record(
+        "decoder_attempt", "backend", "Tried source.",
+        source_path=source, clipboard="private clipboard data", media_bytes=b"secret",
+    )
+    recorder.record_exception("decode_failed", RuntimeError("codec failed"), context="backend")
+    recorder.record("last_event", duration_ms=12.5)
+    assert len(recorder.snapshot()) == 2
+    payload = diagnostic_bundle(recorder)
+    encoded = json.dumps(payload)
+    assert source not in encoded
+    assert "private clipboard data" not in encoded
+    assert "secret" not in encoded
+    assert payload["schema_version"] == 1
+    assert payload["capabilities"]["application"] == "FrameSnap"
+    assert all("elapsed_ms" in event for event in payload["events"])
+
+    output = tmp_path / "support.json"
+    write_diagnostic_bundle(output, recorder)
+    written = json.loads(output.read_text(encoding="utf-8"))
+    assert written["redaction"]["telemetry"] == "not used"
+    assert written["events"] == payload["events"]
+
+
 def test_persistence_migrations_normalize_legacy_and_reject_future_versions():
     session = normalize_session_data({
         "version": "2.1",
@@ -442,6 +478,12 @@ def test_main_window_accessibility_and_keyboard_contract(tmp_path, monkeypatch):
         assert window._step_previous_action.shortcut().toString() == "Ctrl+Left"
         assert window._step_next_action.shortcut().toString() == "Ctrl+Right"
         assert window._mark_menu_action.shortcut().toString() == "Shift+F10"
+        support_actions = [
+            action for action in window.findChildren(framesnap_module.QAction)
+            if action.text() == "Export Support Bundle..."
+        ]
+        assert len(support_actions) == 1
+        assert support_actions[0].shortcut().toString() == "Ctrl+Shift+D"
 
         window._loop_toggled(True)
         assert "on" in window._loop_btn.accessibleDescription()
@@ -531,6 +573,25 @@ def test_reader_preserves_frame_time_identity_and_final_frame(tmp_path):
         assert identity["pts"] is not None
         assert identity["time_base"]
         assert identity["presentation_time_ms"] is not None
+
+
+def test_decoder_attempts_report_backend_and_timing_without_paths(tmp_path):
+    path = tmp_path / "diagnostic-video.mp4"
+    _write_test_video(path)
+    recorder = DiagnosticRecorder()
+    reader = framesnap_module.open_cap(
+        str(path), "OpenCV", diagnostics=recorder
+    )
+    assert reader is not None and reader.isOpened()
+    reader.release()
+    attempts = [
+        event for event in recorder.snapshot()
+        if event["event"] == "decoder_attempt"
+    ]
+    assert attempts
+    assert attempts[-1]["backend"] == "OpenCV"
+    assert attempts[-1]["duration_ms"] >= 0
+    assert str(path) not in json.dumps(attempts)
 
 
 def test_frame_time_contract_migrates_legacy_marks_and_seek_modes():
