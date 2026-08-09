@@ -75,6 +75,40 @@
 - **Compare Sessions** — show added, removed, and changed marks
 - **Session Templates** — save relative timestamps to `.fstpl` and apply them to another video
 
+### Local extensions
+
+FrameSnap exposes a versioned, local-only registry for optional detectors, metadata probes, and
+exporters. Plugin discovery reads `plugin.json` manifests without importing code; code runs only
+after an explicit `PluginRegistry.load(...)` or `load_opt_in(...)` call. Session and template
+loading never executes plugin entrypoints.
+
+```json
+{
+  "manifest_version": 1,
+  "api_version": 1,
+  "id": "my-review-tools",
+  "name": "My Review Tools",
+  "version": "1.0",
+  "entrypoint": "plugin.py:register",
+  "capabilities": ["detector", "probe", "exporter"],
+  "enabled": false
+}
+```
+
+The plugin's `register(registry)` function can call `register_detector`, `register_probe`, or
+`register_exporter`. Capabilities are declared in the manifest, interfaces are inspectable via
+`registry.describe()`, and plugins receive no implicit media or session access.
+
+For headless inspection or explicit loading, use:
+
+```bash
+python framesnap.py --plugins-dir ./plugins --list-plugins
+python framesnap.py --plugins-dir ./plugins --load-plugin my-review-tools
+```
+
+GUI startup also honors `plugin_dir` plus an `enabled_plugins` list in the local configuration;
+an empty list keeps discovery and execution disabled.
+
 ### UX
 
 - **Frame overlay** on video display — shows frame number, total frames, and timestamp (toggleable via View menu)

@@ -45,6 +45,7 @@ from framesnap import (
     main,
     load_config,
     load_marker_list,
+    read_session_file,
     diff_session_data,
     default_export_manifest_path,
     diagnostic_bundle,
@@ -91,6 +92,7 @@ from framesnap import (
     to_uint16_frame,
     write_diagnostic_bundle,
 )
+from framesnap_plugins import PLUGIN_API_VERSION, PluginError, PluginRegistry
 
 
 def test_missing_dependency_check_is_actionable(monkeypatch):
@@ -531,6 +533,73 @@ def test_qt_translation_catalog_and_locale_formatting():
         assert localized_timecode(1234) == "00:00:01,234"
     finally:
         install_translator(app, "en")
+
+
+def test_plugins_are_inspectable_and_explicitly_loaded(tmp_path, capsys):
+    plugin_root = tmp_path / "plugins"
+    plugin_dir = plugin_root / "demo"
+    plugin_dir.mkdir(parents=True)
+    sentinel = tmp_path / "plugin-executed.txt"
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps({
+            "manifest_version": 1,
+            "api_version": PLUGIN_API_VERSION,
+            "id": "demo",
+            "name": "Demo Plugin",
+            "version": "1.0",
+            "entrypoint": "plugin.py:register",
+            "capabilities": ["detector", "probe", "exporter"],
+            "enabled": False,
+        }),
+        encoding="utf-8",
+    )
+    (plugin_dir / "plugin.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(sentinel)!r}).write_text('loaded', encoding='utf-8')\n"
+        "def register(registry):\n"
+        "    registry.register_detector('solid', lambda frame: [], 'Demo detector')\n"
+        "    registry.register_probe('metadata', lambda path: {'source': path})\n"
+        "    registry.register_exporter('review', lambda request, output: output)\n",
+        encoding="utf-8",
+    )
+
+    registry = PluginRegistry()
+    manifests = registry.discover(plugin_root)
+    assert len(manifests) == 1
+    assert not sentinel.exists()
+    description = registry.describe(plugin_root)
+    assert description["api_version"] == PLUGIN_API_VERSION
+    assert Path(description["plugins"][0]["manifest"]) == Path("demo") / "plugin.json"
+    assert description["loaded"] == []
+
+    opt_in_registry = PluginRegistry()
+    assert opt_in_registry.load_opt_in(plugin_root, enabled_ids=[]) == []
+    assert not sentinel.exists()
+    assert main(["--plugins-dir", str(plugin_root), "--list-plugins"]) == 0
+    assert "\"demo\"" in capsys.readouterr().out
+    assert not sentinel.exists()
+
+    registry.load("demo")
+    assert sentinel.read_text(encoding="utf-8") == "loaded"
+    assert registry.get("detector", "solid")(None) == []
+    assert registry.get("probe", "metadata")("clip.mp4")["source"] == "clip.mp4"
+    assert registry.describe()["loaded"] == ["demo"]
+    assert [item["name"] for item in registry.describe()["extensions"]["exporter"]] == ["review"]
+
+    session_path = tmp_path / "session.fsnap"
+    session_path.write_text(
+        json.dumps({
+            "version": "2.2",
+            "marks": [],
+            "plugin": {"entrypoint": "plugin.py:register"},
+        }),
+        encoding="utf-8",
+    )
+    read_session_file(session_path)
+    assert sentinel.read_text(encoding="utf-8") == "loaded"
+
+    with pytest.raises(PluginError):
+        PluginRegistry(api_version=PLUGIN_API_VERSION + 1)
 
 
 def test_main_window_accessibility_and_keyboard_contract(tmp_path, monkeypatch):

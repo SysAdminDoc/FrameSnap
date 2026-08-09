@@ -36,7 +36,7 @@ dev = [
 framesnap = "framesnap:main"
 
 [tool.setuptools]
-py-modules = ["framesnap", "framesnap_version"]
+py-modules = ["framesnap", "framesnap_version", "framesnap_plugins"]
 
 [tool.setuptools.data-files]
 "share/framesnap/translations" = ["translations/framesnap_es.qm"]

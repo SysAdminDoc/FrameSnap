@@ -31,6 +31,10 @@ All notable changes to FrameSnap will be documented in this file.
   source, frame, presentation-time, PTS, labels, tags, comments, chapters, and colors.
 - Added: Qt Linguist runtime catalogs with Spanish UI support, locale-aware visible numbers and
   timecodes, restart-safe language preferences, and CI checks for missing or stale translations.
+- Added: versioned local plugin registry for opt-in detectors, probes, and exporters; manifest
+  discovery is non-executable, capabilities are declared and inspectable, and session loading
+  never executes plugin code. Added headless manifest inspection/loading and explicit config-based
+  enablement without plugin-specific MainWindow changes.
 
 ## [v2.2.0] - 2026-08-03
 

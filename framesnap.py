@@ -27,6 +27,10 @@ from fractions import Fraction
 from pathlib import Path
 
 from framesnap_version import __version__
+from framesnap_plugins import PLUGIN_API_VERSION, PluginError, PluginRegistry
+
+
+PLUGIN_REGISTRY = PluginRegistry(PLUGIN_API_VERSION)
 
 
 # codex-branding:start
@@ -3137,6 +3141,8 @@ def _config_defaults() -> dict:
         "config_version": CONFIG_VERSION,
         "recent": [],
         "locale": "system",
+        "plugin_dir": "",
+        "enabled_plugins": [],
         "theme": "Catppuccin Mocha",
         "last_output_dir": str(Path.home() / "Desktop"),
         "export_format": "PNG",
@@ -3196,6 +3202,16 @@ def load_config() -> dict:
 
 def save_config(cfg: dict) -> None:
     atomic_write_json(CONFIG_PATH, normalize_config(cfg))
+
+
+def load_configured_plugins(config: dict | None = None):
+    """Load only plugin ids explicitly enabled in local configuration."""
+    active_config = config if config is not None else load_config()
+    directory = str(active_config.get("plugin_dir", "")).strip()
+    enabled = active_config.get("enabled_plugins", [])
+    if not directory or not isinstance(enabled, (list, tuple, set)):
+        return []
+    return PLUGIN_REGISTRY.load_opt_in(directory, enabled)
 
 
 # ── Frame Cache ───────────────────────────────────────────────────────────────
@@ -7381,6 +7397,18 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         "--no-resume", action="store_true",
         help="Ignore completed records in an existing export manifest.",
     )
+    parser.add_argument(
+        "--plugins-dir", default="",
+        help="Directory containing local FrameSnap plugin manifests.",
+    )
+    parser.add_argument(
+        "--list-plugins", action="store_true",
+        help="Inspect plugin manifests without executing plugin code.",
+    )
+    parser.add_argument(
+        "--load-plugin", action="append", default=[], metavar="PLUGIN_ID",
+        help="Explicitly load a discovered plugin; may be repeated.",
+    )
     parser.add_argument("--version", action="version", version=f"FrameSnap {__version__}")
     return parser
 
@@ -7407,6 +7435,25 @@ def _run_batch_cli(args: argparse.Namespace) -> int:
     return 1 if result["failed"] else 0
 
 
+def _run_plugins_cli(args: argparse.Namespace) -> int:
+    if not args.plugins_dir:
+        print("Plugin commands require --plugins-dir.", file=sys.stderr)
+        return 2
+    registry = PluginRegistry()
+    try:
+        if args.list_plugins:
+            registry.discover(args.plugins_dir)
+        if args.load_plugin:
+            registry.load_opt_in(args.plugins_dir, args.load_plugin)
+        print(json.dumps(
+            registry.describe(args.plugins_dir), ensure_ascii=False, indent=2
+        ))
+    except (OSError, PluginError, ValueError) as exc:
+        print(f"Plugin command failed: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def main(argv: list[str] | None = None):
     argv = sys.argv[1:] if argv is None else argv
     if argv:
@@ -7417,6 +7464,8 @@ def main(argv: list[str] | None = None):
         parser = _build_cli_parser()
         args = parser.parse_args(argv)
         if not args.marker_path:
+            if args.list_plugins or args.load_plugin:
+                return _run_plugins_cli(args)
             parser.print_help()
             return 0
         return _run_batch_cli(args)
@@ -7429,6 +7478,10 @@ def main(argv: list[str] | None = None):
     app.setApplicationName("FrameSnap")
     app.setApplicationVersion(__version__)
     app.setStyleSheet(stylesheet_for_theme(THEME_NAMES[0]))
+    try:
+        load_configured_plugins()
+    except (OSError, PluginError, ValueError) as exc:
+        DIAGNOSTICS.record_exception("plugin_load_failed", exc, context="plugin")
 
     icon_path = Path(__file__).parent / "icon.svg"
     if icon_path.exists():
