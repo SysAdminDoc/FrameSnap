@@ -2,7 +2,7 @@
 
 > Browse any video, mark frames visually, and export precise screenshots — all in a dark, polished desktop app.
 
-![Version](https://img.shields.io/badge/version-2.2.0-cba6f7?style=flat-square)
+![Version](https://img.shields.io/badge/version-2.3.0-cba6f7?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.10%2B-89b4fa?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-a6e3a1?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-b4befe?style=flat-square)

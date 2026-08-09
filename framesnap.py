@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FrameSnap v2.2.0
+FrameSnap v2.3.0
 Browse any video, mark frames, and export screenshots — all formats, all features.
 """
 

@@ -12,6 +12,12 @@
   <url type="homepage">https://github.com/SysAdminDoc/FrameSnap</url>
   <launchable type="desktop-id">com.sysadmindoc.FrameSnap.desktop</launchable>
   <releases>
+    <release version="2.3.0" date="2026-08-08">
+      <description>
+        <p>Added internationalization, opt-in local extensions, and offline release verification
+        with cancellable update discovery.</p>
+      </description>
+    </release>
     <release version="2.2.0" date="2026-08-03">
       <description>
         <p>Added perceptual search, code detection, configurable scrubber steps, and

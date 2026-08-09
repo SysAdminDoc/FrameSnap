@@ -2,7 +2,7 @@
 
 All notable changes to FrameSnap will be documented in this file.
 
-## [Unreleased] - 2026-08-08
+## [v2.3.0] - 2026-08-08
 
 - Changed: removed first-run package installation and added explicit dependency diagnostics.
 - Added: pyproject metadata, a single version source, and a hash-locked Windows CPython 3.12
