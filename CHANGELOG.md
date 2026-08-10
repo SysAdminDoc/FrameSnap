@@ -79,3 +79,73 @@ All notable changes to FrameSnap will be documented in this file.
 - Fixed: Fix NameError: add missing SAPPHIRE palette constant
 - v2.1.0: bug fixes, all-format support, power features
 - Initial release: FrameSnap v2.0.0
+
+## Roadmap archive — 2026-08-10 — ROADMAP.md
+
+<details>
+<summary>Original roadmap snapshot</summary>
+
+```markdown
+# ROADMAP
+
+Backlog for FrameSnap. Stays a single-window, mouse-first, Catppuccin-themed desktop app for
+browsing video and exporting precise frames.
+
+## Planned Features
+
+### Playback engine
+
+### Frame precision
+
+### Marking
+
+### Export
+
+### Sessions
+
+### UI / UX
+
+### Distribution
+
+## Competitive Research
+
+- **VideoProc Converter AI** — "extract frames" wizard + AI upscale. FrameSnap should not chase
+  the AI angle; differentiate on precision + session portability.
+- **ScreenToGif** — open-source, Windows-only; its frame editor is a model for granular per-frame
+  edit workflows.
+- **Shotcut / DaVinci Resolve** — full NLEs with frame export. FrameSnap stays in the "I only want
+  stills and a few GIFs" niche rather than competing.
+- **Kreatli / VideoToJPG.com / Teamz Converter** — rising browser-based, WASM-powered
+  competitors. Desktop edge: >2GB files, local processing, no upload cap.
+- **VLC "Save video snapshot"** — the 1-click baseline everyone compares to; match its speed for
+  single-shot extractions.
+
+## Open-Source Research (Round 2)
+
+### Related OSS Projects
+- **KimSource/video-frame-extractor** — https://github.com/KimSource/video-frame-extractor — Python GUI wrapping ffmpeg; PyInstaller-built exe.
+- **noarche/FrameExtractor** — https://github.com/noarche/FrameExtractor — Portable exe; per-video count-based sampling.
+- **EnragedAntelope/youtube-screenshot-extractor** — https://github.com/EnragedAntelope/youtube-screenshot-extractor — yt-dlp-fed 1000-site extractor; scene detection + keyframe + aesthetic filter.
+- **Gifcurry** — https://github.com/lettier/gifcurry — Haskell GUI+CLI; powerful trim/crop/text-overlay pipeline worth mirroring.
+- **ScreenToGif** — https://github.com/NickeManarin/ScreenToGif — C#/WPF; live frame-editor with per-frame annotate/delete.
+- **Video Frame Extractor Pro** (Qt+OpenCV topic entry) — https://github.com/topics/frame-extraction — Qt frame extractor worth studying for scrubber UX.
+
+### Features to Borrow
+- yt-dlp-fed input (`EnragedAntelope`) — accept a YouTube/Vimeo/TikTok URL, resolve best stream, scrub in place. Removes manual download step.
+- PySceneDetect content/adaptive detection (`EnragedAntelope`) — "snap to scene boundary" button that finds nearest cut.
+- Blur/aesthetic filter at export (`EnragedAntelope` — CLIP/LAION scorer) — discard out-of-focus candidates in batch runs.
+- Per-frame annotate (ScreenToGif) — reuse its frame-list + undo stack model for exported contact sheets.
+- Batch-sampling presets from `noarche/FrameExtractor` — "every N seconds" / "N uniform frames" / "all I-frames".
+- GIF + MP4 export in addition to stills (`Gifcurry`) — reuse ffmpeg already in the project.
+- Text overlay with timing (`Gifcurry`) — watermark/label stills at export.
+
+### Patterns & Architectures Worth Studying
+- **OpenCV `VideoCapture.set(CAP_PROP_POS_FRAMES)` vs ffmpeg `-ss` seek** — OpenCV is accurate-per-frame but slow; ffmpeg `-ss` before `-i` is fast but keyframe-only. Most extractors pick one; the good ones implement "fast seek + fine adjust" (ffmpeg for rough, OpenCV for exact).
+- **Decoupled producer/consumer queue**: decoder thread fills a bounded frame queue; GUI thread consumes. Keeps UI at 60fps during scrub. Used in the Qt+OpenCV topic entry.
+- **PyAV over subprocess ffmpeg**: libavformat bindings give per-frame PTS without parsing stderr; cleaner than spawning ffmpeg per export.
+- **MediaInfo sidecar** (`EnragedAntelope`): probe codec/framerate/HDR flags once, cache in sqlite keyed by file hash — skip re-probe on re-open.
+
+## Research-Driven Additions
+```
+
+</details>
