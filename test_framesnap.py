@@ -307,7 +307,7 @@ def test_json_persistence_is_atomic_and_keeps_one_backup(tmp_path):
 
 def test_diagnostics_are_classified_bounded_and_redacted(tmp_path):
     recorder = DiagnosticRecorder(max_events=2)
-    source = r"C:\Users\--\Videos\private clip.mp4"
+    source = r"C:\Users\dev\Videos\private clip.mp4"
     assert redact_diagnostic_path(source).startswith("<path:")
     assert classify_diagnostic_error(PermissionError("access is denied")) == "permission"
     assert classify_diagnostic_error(OSError(28, "No space left on device")) == "disk"
